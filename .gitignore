@@ -1,0 +1,8 @@
+# Adobe's SDK: download it separately (see README)
+/AfterEffectsSDK/
+
+# Build output
+/Build/
+
+# macOS
+.DS_Store
