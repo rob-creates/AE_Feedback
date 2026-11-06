@@ -35,8 +35,6 @@ inline float luma(float3 bgr)
 // Returns the 0-1 channel value, weighted so transparent map pixels cause no shift.
 inline float mapShift(float4 m, int channel, bool isStraight)
 {
-    if (channel == MAP_CHANNEL_ALPHA)
-        return (m.w - 0.5f) * 2.0f;
     float3 c = isStraight ? m.xyz : (m.w > 1e-5f ? m.xyz / m.w : float3(0.0));
     float v;
     switch (channel)
@@ -44,6 +42,7 @@ inline float mapShift(float4 m, int channel, bool isStraight)
     case MAP_CHANNEL_RED: v = c.z; break;
     case MAP_CHANNEL_GREEN: v = c.y; break;
     case MAP_CHANNEL_BLUE: v = c.x; break;
+    case MAP_CHANNEL_ALPHA: v = m.w; break;
     default: v = luma(c); break;
     }
     return (v - 0.5f) * 2.0f * m.w;

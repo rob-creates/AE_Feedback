@@ -24,6 +24,7 @@
 #include <mutex>
 #include <numeric>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "AEConfig.h"
@@ -116,11 +117,6 @@ void Log(const char* fmt, ...)
 void Log(const char*, ...) {}
 #endif
 
-struct MetalData
-{
-    std::unique_ptr<FeedbackRenderer> renderer;
-};
-
 // A moment in time, precise enough to fall between frames.
 struct SampleTime
 {
@@ -151,7 +147,74 @@ struct PreRenderData
     CanvasKey canvas;
     PF_LRect outputRect;
     int samplesPerFrame; // the frame's own moment plus any sub-steps
+    int windowFrames; // how many frames the history reaches back, including the current one
     std::vector<FrameCheckout> frames; // [0] is the current frame, [k] is k frames earlier
+
+    // The cached image to resume from, held here so it can't be evicted before the render. Only
+    // frames newer than this one were checked out, so the render has no other way to rebuild it.
+    id<MTLBuffer> resumeImage;
+    CanvasKey resumeCanvas;
+    int resumeK; // how many frames before the current one the image is, or -1 for no image
+};
+
+// What PreRender needs to know about a frame. Asking AE is slow when multiplied by a long trail and
+// by the many PreRender calls AE makes per render, while the answers only change with the history.
+struct SampleFacts
+{
+    SampleTime time;
+    PF_LRect inputRect;
+    PF_LRect mapRect;
+};
+
+struct FrameFacts
+{
+    float alpha, blurRadius, amountX, amountY;
+    bool fromLayer;
+    std::vector<SampleFacts> samples; // oldest first; the last one is at the frame's own time
+};
+
+// Remembered frame facts, trusted only while AE reports the same history as when they were read.
+// Checking out a layer can run PreRender for another instance of this effect further up the stack,
+// so a run stays alive and in place for whoever is using it while the list changes around it. AE
+// lets one thread in at a time, so this needs a lock before enabling MFR.
+class FrameFactsMemo
+{
+public:
+    struct Key
+    {
+        A_long step;
+        A_u_long scale;
+        A_long downsampleXNum;
+        A_u_long downsampleXDen;
+        A_long downsampleYNum;
+        A_u_long downsampleYDen;
+        int samplesPerFrame;
+
+        bool operator==(const Key& o) const
+        {
+            return step == o.step && scale == o.scale && downsampleXNum == o.downsampleXNum &&
+                   downsampleXDen == o.downsampleXDen && downsampleYNum == o.downsampleYNum &&
+                   downsampleYDen == o.downsampleYDen && samplesPerFrame == o.samplesPerFrame;
+        }
+    };
+
+    struct Run
+    {
+        Key key;
+        A_long endExclusive = 0;
+        PF_State history{};
+        std::unordered_map<A_long, FrameFacts> frames;
+    };
+
+    std::vector<std::shared_ptr<Run>> runs; // most recently used first
+};
+
+const size_t kMaxFactRuns = 8;
+
+struct MetalData
+{
+    std::unique_ptr<FeedbackRenderer> renderer;
+    FrameFactsMemo memo;
 };
 
 void DisposePreRenderData(void* p)
@@ -487,195 +550,43 @@ inline void TrimAxis(A_long* lo, A_long* hi, A_long focus, A_long side)
 }
 
 // Everything a layer can show at a moment, however little AE wants from this effect. A shape
-// layer's bounds follow its contents, so this differs from moment to moment.
+// layer's bounds follow its contents, so this differs from moment to moment. An empty request
+// returns them without rendering anything.
+PF_Err LayerBounds(
+    PF_InData* in_data,
+    PF_PreRenderExtra* extra,
+    PF_RenderRequest request,
+    int param,
+    const SampleTime& time,
+    A_long* nextId,
+    PF_LRect* bounds)
+{
+    PF_CheckoutResult result;
+    AEFX_CLR_STRUCT(result);
+    request.rect = PF_LRect{0, 0, 0, 0};
+    PF_Err err = extra->cb->checkout_layer(
+        in_data->effect_ref, param, (*nextId)++, &request, time.value, time.step, time.scale, &result);
+    *bounds = result.max_result_rect;
+    return err;
+}
+
+// Requests pixels that the render can fetch. Nothing renders unless it actually does.
 PF_Err CheckoutWholeLayer(
     PF_InData* in_data,
     PF_PreRenderExtra* extra,
     PF_RenderRequest request,
     int param,
-    A_long id,
-    A_long* nextUnusedId,
     const SampleTime& time,
+    const PF_LRect& bounds,
+    A_long id,
     PF_LRect* rect)
 {
     PF_CheckoutResult result;
     AEFX_CLR_STRUCT(result);
-    // An empty request returns the layer's full size without rendering anything.
-    request.rect = PF_LRect{0, 0, 0, 0};
+    request.rect = bounds;
     PF_Err err = extra->cb->checkout_layer(
-        in_data->effect_ref, param, (*nextUnusedId)++, &request, time.value, time.step, time.scale, &result);
-    if (err)
-        return err;
-    request.rect = result.max_result_rect;
-    AEFX_CLR_STRUCT(result);
-    err = extra->cb->checkout_layer(
         in_data->effect_ref, param, id, &request, time.value, time.step, time.scale, &result);
     *rect = result.result_rect;
-    return err;
-}
-
-PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* extra)
-{
-    PF_Err err = PF_Err_NONE;
-    extra->output->flags |= PF_RenderOutputFlag_GPU_RENDER_POSSIBLE;
-    auto preRenderStart = std::chrono::steady_clock::now();
-
-    const A_long now = in_data->current_time;
-    const A_long step = in_data->time_step;
-
-    // Every earlier frame affects this one, so AE's cached copy is only valid if they're unchanged.
-    {
-        AEFX_SuiteScoper<PF_ParamUtilsSuite3> utils(in_data, kPFParamUtilsSuite, kPFParamUtilsSuiteVersion3, out_data);
-        PF_State history;
-        AEFX_CLR_STRUCT(history);
-        // AE requires this call on every PreRender. With no earlier frames, the zeroed state goes in.
-        ReadHistory(in_data, *utils.operator->(), now, &history);
-        ERR(extra->cb->GuidMixInPtr(in_data->effect_ref, sizeof(history), &history));
-    }
-
-    PF_RenderRequest request = extra->input->output_request;
-    request.channel_mask = PF_ChannelMask_ARGB;
-
-    int samplesPerFrame = 1;
-    {
-        ParamReader r{in_data, FrameSample(in_data, now)};
-        samplesPerFrame = r.integer(PARAM_SUBSTEPS) + 1;
-        ERR(r.err);
-    }
-
-    const float scaleX = float(in_data->downsample_x.num) / float(std::max<A_long>(in_data->downsample_x.den, 1));
-    const float scaleY = float(in_data->downsample_y.num) / float(std::max<A_long>(in_data->downsample_y.den, 1));
-    const A_long frameLimit = step > 0 ? std::min<A_long>(kMaxFramesBack, std::max<A_long>(now / step, 0)) : 0;
-
-    auto data = std::make_unique<PreRenderData>();
-    data->samplesPerFrame = samplesPerFrame;
-
-    // Walk back until earlier frames have faded to nothing or the layer begins. The canvas is
-    // whatever this reaches: each input's bounds, plus how far later frames can have spread it.
-    // Checking out a frame costs almost nothing; it's only rendered if a rebuild fetches it.
-    A_long nextId = 0;
-    bool hasArea = false;
-    PF_LRect area{};
-    A_long focusX = 0, focusY = 0;
-    double remaining = 1.0;
-    float varianceX = 0.0f, varianceY = 0.0f; // blurs add by variance
-    float shiftX = 0.0f, shiftY = 0.0f;
-    bool oldest = false;
-
-    for (int k = 0; !err && !oldest; k++)
-    {
-        FrameCheckout frame{};
-        frame.time = now - k * step;
-
-        ParamReader r{in_data, FrameSample(in_data, frame.time)};
-        remaining *= r.slider(PARAM_ALPHA);
-        const float blurRadius = r.slider(PARAM_BLUR);
-        const float amountX = r.slider(PARAM_AMOUNT_X);
-        const float amountY = r.slider(PARAM_AMOUNT_Y);
-        const bool fromLayer = r.popup(PARAM_DISPLACE_SOURCE) == SOURCE_LAYER;
-        ERR(r.err);
-        oldest = remaining < kInvisibleContribution || k >= frameLimit;
-
-        // The oldest frame in the window starts from blank, so only its final moment is used.
-        const int count = oldest ? 1 : samplesPerFrame;
-        bool hasFrameArea = false, hasMap = false;
-        PF_LRect frameArea{};
-
-        for (int before = count - 1; !err && before >= 0; before--)
-        {
-            SubstepCheckout sub{};
-            if (!MakeSampleTime(in_data, frame.time, before, samplesPerFrame, &sub.time))
-                sub.time = FrameSample(in_data, frame.time - before * step / samplesPerFrame);
-
-            sub.inputId = nextId++;
-            ERR(CheckoutWholeLayer(in_data, extra, request, PARAM_INPUT, sub.inputId, &nextId, sub.time, &sub.inputRect));
-            sub.hasInput = !IsEmpty(sub.inputRect);
-            if (sub.hasInput)
-            {
-                frameArea = hasFrameArea ? Union(frameArea, sub.inputRect) : sub.inputRect;
-                hasFrameArea = true;
-            }
-
-            if (!err && fromLayer)
-            {
-                sub.mapId = nextId++;
-                ERR(CheckoutWholeLayer(
-                    in_data, extra, request, PARAM_DISPLACE_LAYER, sub.mapId, &nextId, sub.time, &sub.mapRect));
-                sub.hasMap = !IsEmpty(sub.mapRect);
-                hasMap = hasMap || sub.hasMap;
-            }
-            frame.substeps.push_back(sub);
-        }
-        data->frames.push_back(std::move(frame));
-
-        const float sigmaX = blurRadius * 0.5f * scaleX;
-        const float sigmaY = blurRadius * 0.5f * scaleY;
-        varianceX += sigmaX * sigmaX;
-        varianceY += sigmaY * sigmaY;
-        if (!fromLayer || hasMap)
-        {
-            shiftX += std::abs(amountX) * scaleX;
-            shiftY += std::abs(amountY) * scaleY;
-        }
-
-        if (hasFrameArea)
-        {
-            // Three sigma of blur, plus a pixel for displacement's filtering.
-            const float limitX = kMaxSpread * scaleX, limitY = kMaxSpread * scaleY;
-            const A_long padX = A_long(std::ceil(std::min(3.0f * std::sqrt(varianceX) + shiftX, limitX))) + 1;
-            const A_long padY = A_long(std::ceil(std::min(3.0f * std::sqrt(varianceY) + shiftY, limitY))) + 1;
-            frameArea.left -= padX;
-            frameArea.top -= padY;
-            frameArea.right += padX;
-            frameArea.bottom += padY;
-            if (!hasArea)
-            {
-                focusX = (frameArea.left + frameArea.right) / 2;
-                focusY = (frameArea.top + frameArea.bottom) / 2;
-            }
-            area = hasArea ? Union(area, frameArea) : frameArea;
-            hasArea = true;
-        }
-    }
-
-    if (!hasArea)
-        area = extra->input->output_request.rect;
-
-    // Rounding out means a slowly moving trail reuses the same canvas for many frames.
-    area.left = (area.left >> kCanvasSnapBits) << kCanvasSnapBits;
-    area.top = (area.top >> kCanvasSnapBits) << kCanvasSnapBits;
-    area.right = ((area.right + (1 << kCanvasSnapBits) - 1) >> kCanvasSnapBits) << kCanvasSnapBits;
-    area.bottom = ((area.bottom + (1 << kCanvasSnapBits) - 1) >> kCanvasSnapBits) << kCanvasSnapBits;
-    TrimAxis(&area.left, &area.right, focusX, kMaxCanvasSide);
-    TrimAxis(&area.top, &area.bottom, focusY, kMaxCanvasSide);
-
-    extra->output->max_result_rect = area;
-    extra->output->result_rect = Intersect(extra->input->output_request.rect, area);
-
-    data->outputRect = extra->output->result_rect;
-    data->canvas.left = area.left;
-    data->canvas.top = area.top;
-    data->canvas.width = area.right - area.left;
-    data->canvas.height = area.bottom - area.top;
-    data->canvas.downsampleXNum = in_data->downsample_x.num;
-    data->canvas.downsampleXDen = in_data->downsample_x.den;
-    data->canvas.downsampleYNum = in_data->downsample_y.num;
-    data->canvas.downsampleYDen = in_data->downsample_y.den;
-
-    Log("prerender frame=%d window=%d samples=%d checkouts=%d canvas=%dx%d ms=%.2f",
-        step > 0 ? now / step : 0,
-        int(data->frames.size()) - 1,
-        samplesPerFrame,
-        nextId,
-        data->canvas.width,
-        data->canvas.height,
-        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - preRenderStart).count());
-
-    if (!err)
-    {
-        extra->output->pre_render_data = data.release();
-        extra->output->delete_pre_render_data_func = DisposePreRenderData;
-    }
     return err;
 }
 
@@ -720,6 +631,307 @@ id<MTLBuffer> FindCached(
         }
     }
     return nil;
+}
+
+// Finds the remembered facts for this history, making room for a new set if there are none.
+std::shared_ptr<FrameFactsMemo::Run> FindFacts(
+    PF_InData* in_data, const PF_ParamUtilsSuite3& utils, FrameFactsMemo& memo, const FrameFactsMemo::Key& key)
+{
+    for (size_t i = 0; i < memo.runs.size(); i++)
+    {
+        const std::shared_ptr<FrameFactsMemo::Run> run = memo.runs[i];
+        if (!(run->key == key))
+            continue;
+        PF_State history;
+        AEFX_CLR_STRUCT(history);
+        A_Boolean same = 0;
+        if (ReadHistory(in_data, utils, run->endExclusive, &history))
+            utils.PF_AreStatesIdentical(in_data->effect_ref, &run->history, &history, &same);
+        if (same)
+        {
+            std::rotate(memo.runs.begin(), memo.runs.begin() + i, memo.runs.begin() + i + 1);
+            return run;
+        }
+    }
+    auto run = std::make_shared<FrameFactsMemo::Run>();
+    run->key = key;
+    memo.runs.insert(memo.runs.begin(), run);
+    if (memo.runs.size() > kMaxFactRuns)
+        memo.runs.pop_back();
+    return run;
+}
+
+// Asks AE about one frame in the history.
+PF_Err ReadFrameFacts(
+    PF_InData* in_data,
+    PF_PreRenderExtra* extra,
+    const PF_RenderRequest& request,
+    A_long time,
+    int samplesPerFrame,
+    A_long* nextId,
+    FrameFacts* facts)
+{
+    ParamReader r{in_data, FrameSample(in_data, time)};
+    facts->alpha = r.slider(PARAM_ALPHA);
+    facts->blurRadius = r.slider(PARAM_BLUR);
+    facts->amountX = r.slider(PARAM_AMOUNT_X);
+    facts->amountY = r.slider(PARAM_AMOUNT_Y);
+    facts->fromLayer = r.popup(PARAM_DISPLACE_SOURCE) == SOURCE_LAYER;
+    PF_Err err = r.err;
+
+    for (int before = samplesPerFrame - 1; !err && before >= 0; before--)
+    {
+        SampleFacts sample{};
+        if (!MakeSampleTime(in_data, time, before, samplesPerFrame, &sample.time))
+            sample.time = FrameSample(in_data, time - before * in_data->time_step / samplesPerFrame);
+        ERR(LayerBounds(in_data, extra, request, PARAM_INPUT, sample.time, nextId, &sample.inputRect));
+        if (!err && facts->fromLayer)
+            ERR(LayerBounds(in_data, extra, request, PARAM_DISPLACE_LAYER, sample.time, nextId, &sample.mapRect));
+        facts->samples.push_back(sample);
+    }
+    return err;
+}
+
+PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* extra)
+{
+    PF_Err err = PF_Err_NONE;
+    extra->output->flags |= PF_RenderOutputFlag_GPU_RENDER_POSSIBLE;
+    auto preRenderStart = std::chrono::steady_clock::now();
+
+    const A_long now = in_data->current_time;
+    const A_long step = in_data->time_step;
+
+    // Every earlier frame affects this one, so AE's cached copy is only valid if they're unchanged.
+    {
+        AEFX_SuiteScoper<PF_ParamUtilsSuite3> utils(in_data, kPFParamUtilsSuite, kPFParamUtilsSuiteVersion3, out_data);
+        PF_State history;
+        AEFX_CLR_STRUCT(history);
+        // AE requires this call on every PreRender. With no earlier frames, the zeroed state goes in.
+        ReadHistory(in_data, *utils.operator->(), now, &history);
+        ERR(extra->cb->GuidMixInPtr(in_data->effect_ref, sizeof(history), &history));
+    }
+
+    PF_RenderRequest request = extra->input->output_request;
+    request.channel_mask = PF_ChannelMask_ARGB;
+
+    int samplesPerFrame = 1;
+    {
+        ParamReader r{in_data, FrameSample(in_data, now)};
+        samplesPerFrame = r.integer(PARAM_SUBSTEPS) + 1;
+        ERR(r.err);
+    }
+
+    const float scaleX = float(in_data->downsample_x.num) / float(std::max<A_long>(in_data->downsample_x.den, 1));
+    const float scaleY = float(in_data->downsample_y.num) / float(std::max<A_long>(in_data->downsample_y.den, 1));
+    const A_long frameLimit = step > 0 ? std::min<A_long>(kMaxFramesBack, std::max<A_long>(now / step, 0)) : 0;
+
+    auto data = std::make_unique<PreRenderData>();
+    data->samplesPerFrame = samplesPerFrame;
+    data->resumeK = -1;
+
+    AEFX_SuiteScoper<PF_ParamUtilsSuite3> utils(in_data, kPFParamUtilsSuite, kPFParamUtilsSuiteVersion3, out_data);
+    auto* metal = const_cast<MetalData*>(static_cast<const MetalData*>(extra->input->gpu_data));
+
+    // Without a GPU there's nothing to remember facts in, or to resume from.
+    FrameFactsMemo localMemo;
+    FrameFactsMemo& memo = metal ? metal->memo : localMemo;
+    const FrameFactsMemo::Key factsKey{
+        step,
+        static_cast<A_u_long>(in_data->time_scale),
+        in_data->downsample_x.num,
+        static_cast<A_u_long>(in_data->downsample_x.den),
+        in_data->downsample_y.num,
+        static_cast<A_u_long>(in_data->downsample_y.den),
+        samplesPerFrame};
+    std::shared_ptr<FrameFactsMemo::Run> run;
+    if (!err)
+        run = FindFacts(in_data, *utils.operator->(), memo, factsKey);
+
+    // Walk back until earlier frames have faded to nothing or the layer begins. The canvas is
+    // whatever this reaches: each input's bounds, plus how far later frames can have spread it.
+    A_long nextId = 0;
+    int framesRead = 0;
+    std::vector<const FrameFacts*> window;
+    bool hasArea = false;
+    PF_LRect area{};
+    A_long focusX = 0, focusY = 0;
+    double remaining = 1.0;
+    float varianceX = 0.0f, varianceY = 0.0f; // blurs add by variance
+    float shiftX = 0.0f, shiftY = 0.0f;
+    bool oldest = false;
+
+    for (int k = 0; !err && !oldest; k++)
+    {
+        const A_long time = now - k * step;
+        auto found = run->frames.find(time);
+        if (found == run->frames.end())
+        {
+            FrameFacts read{};
+            ERR(ReadFrameFacts(in_data, extra, request, time, samplesPerFrame, &nextId, &read));
+            if (err)
+                break;
+            found = run->frames.emplace(time, std::move(read)).first;
+            framesRead++;
+        }
+        const FrameFacts& facts = found->second;
+        window.push_back(&facts);
+
+        remaining *= facts.alpha;
+        oldest = remaining < kInvisibleContribution || k >= frameLimit;
+
+        // The oldest frame in the window starts from blank, so only its final moment is used.
+        const size_t firstSample = oldest ? facts.samples.size() - 1 : 0;
+        bool hasFrameArea = false, hasMap = false;
+        PF_LRect frameArea{};
+        for (size_t i = firstSample; i < facts.samples.size(); i++)
+        {
+            const SampleFacts& sample = facts.samples[i];
+            if (!IsEmpty(sample.inputRect))
+            {
+                frameArea = hasFrameArea ? Union(frameArea, sample.inputRect) : sample.inputRect;
+                hasFrameArea = true;
+            }
+            hasMap = hasMap || (facts.fromLayer && !IsEmpty(sample.mapRect));
+        }
+
+        const float sigmaX = facts.blurRadius * 0.5f * scaleX;
+        const float sigmaY = facts.blurRadius * 0.5f * scaleY;
+        varianceX += sigmaX * sigmaX;
+        varianceY += sigmaY * sigmaY;
+        if (!facts.fromLayer || hasMap)
+        {
+            shiftX += std::abs(facts.amountX) * scaleX;
+            shiftY += std::abs(facts.amountY) * scaleY;
+        }
+
+        if (hasFrameArea)
+        {
+            // Three sigma of blur, plus a pixel for displacement's filtering.
+            const float limitX = kMaxSpread * scaleX, limitY = kMaxSpread * scaleY;
+            const A_long padX = A_long(std::ceil(std::min(3.0f * std::sqrt(varianceX) + shiftX, limitX))) + 1;
+            const A_long padY = A_long(std::ceil(std::min(3.0f * std::sqrt(varianceY) + shiftY, limitY))) + 1;
+            frameArea.left -= padX;
+            frameArea.top -= padY;
+            frameArea.right += padX;
+            frameArea.bottom += padY;
+            if (!hasArea)
+            {
+                focusX = (frameArea.left + frameArea.right) / 2;
+                focusY = (frameArea.top + frameArea.bottom) / 2;
+            }
+            area = hasArea ? Union(area, frameArea) : frameArea;
+            hasArea = true;
+        }
+    }
+
+    // The history now vouches for everything read so far. If it can't be read, keep nothing.
+    if (!err && (framesRead > 0 || now + step > run->endExclusive))
+    {
+        run->endExclusive = std::max(run->endExclusive, now + step);
+        AEFX_CLR_STRUCT(run->history);
+        if (!ReadHistory(in_data, *utils.operator->(), run->endExclusive, &run->history))
+            run->endExclusive = 0; // never matches, so the next call starts again
+    }
+
+    if (!hasArea)
+        area = extra->input->output_request.rect;
+
+    // Rounding out means a slowly moving trail reuses the same canvas for many frames.
+    area.left = (area.left >> kCanvasSnapBits) << kCanvasSnapBits;
+    area.top = (area.top >> kCanvasSnapBits) << kCanvasSnapBits;
+    area.right = ((area.right + (1 << kCanvasSnapBits) - 1) >> kCanvasSnapBits) << kCanvasSnapBits;
+    area.bottom = ((area.bottom + (1 << kCanvasSnapBits) - 1) >> kCanvasSnapBits) << kCanvasSnapBits;
+    TrimAxis(&area.left, &area.right, focusX, kMaxCanvasSide);
+    TrimAxis(&area.top, &area.bottom, focusY, kMaxCanvasSide);
+
+    extra->output->max_result_rect = area;
+    extra->output->result_rect = Intersect(extra->input->output_request.rect, area);
+
+    data->outputRect = extra->output->result_rect;
+    data->canvas.left = area.left;
+    data->canvas.top = area.top;
+    data->canvas.width = area.right - area.left;
+    data->canvas.height = area.bottom - area.top;
+    data->canvas.downsampleXNum = in_data->downsample_x.num;
+    data->canvas.downsampleXDen = in_data->downsample_x.den;
+    data->canvas.downsampleYNum = in_data->downsample_y.num;
+    data->canvas.downsampleYDen = in_data->downsample_y.den;
+    data->windowFrames = int(window.size());
+
+    // Only frames newer than the newest usable image need their pixels.
+    int checkoutFrames = int(window.size());
+    if (metal && !err)
+    {
+        FeedbackCache& cache = metal->renderer->cache();
+        for (int k = 0; k < int(window.size()); k++)
+        {
+            CacheResult result = CACHE_NO_ENTRY;
+            id<MTLBuffer> image = FindCached(
+                in_data, *utils.operator->(), cache, data->canvas, now - k * step, step, &data->resumeCanvas, &result);
+            if (image)
+            {
+                data->resumeImage = image;
+                data->resumeK = k;
+                checkoutFrames = std::max(k, 1); // AE won't give out the output without the current input
+                break;
+            }
+        }
+    }
+
+    for (int k = 0; !err && k < checkoutFrames; k++)
+    {
+        const FrameFacts& facts = *window[k];
+        FrameCheckout frame{};
+        frame.time = now - k * step;
+
+        // Beyond what's computed, the current input is all that's asked for.
+        const bool computed = k < data->resumeK || data->resumeK < 0;
+        const bool oldestFrame = data->resumeK < 0 && k == int(window.size()) - 1;
+        const size_t firstSample = computed && !oldestFrame ? 0 : facts.samples.size() - 1;
+
+        for (size_t i = firstSample; !err && i < facts.samples.size(); i++)
+        {
+            const SampleFacts& sample = facts.samples[i];
+            SubstepCheckout sub{};
+            sub.time = sample.time;
+            sub.hasInput = !IsEmpty(sample.inputRect);
+            if (sub.hasInput)
+            {
+                sub.inputId = nextId++;
+                ERR(CheckoutWholeLayer(
+                    in_data, extra, request, PARAM_INPUT, sample.time, sample.inputRect, sub.inputId, &sub.inputRect));
+                sub.hasInput = !IsEmpty(sub.inputRect);
+            }
+            sub.hasMap = !err && facts.fromLayer && !IsEmpty(sample.mapRect);
+            if (sub.hasMap)
+            {
+                sub.mapId = nextId++;
+                ERR(CheckoutWholeLayer(
+                    in_data, extra, request, PARAM_DISPLACE_LAYER, sample.time, sample.mapRect, sub.mapId, &sub.mapRect));
+                sub.hasMap = !IsEmpty(sub.mapRect);
+            }
+            frame.substeps.push_back(sub);
+        }
+        data->frames.push_back(std::move(frame));
+    }
+
+    Log("prerender frame=%d window=%d samples=%d read=%d resume=%d checkouts=%d canvas=%dx%d ms=%.2f",
+        step > 0 ? now / step : 0,
+        data->windowFrames - 1,
+        samplesPerFrame,
+        framesRead,
+        data->resumeK,
+        nextId,
+        data->canvas.width,
+        data->canvas.height,
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - preRenderStart).count());
+
+    if (!err)
+    {
+        extra->output->pre_render_data = data.release();
+        extra->output->delete_pre_render_data_func = DisposePreRenderData;
+    }
+    return err;
 }
 
 PF_Err RenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* extra)
@@ -809,6 +1021,14 @@ PF_Err RenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* 
                 break;
             }
         }
+        if (!image && data->resumeImage)
+        {
+            image = data->resumeImage;
+            imageCanvas = data->resumeCanvas;
+            resumeK = data->resumeK;
+        }
+        if (data->resumeK == 1)
+            previousFrameResult = CACHE_HIT;
         framesComputed = resumeK;
 
         // Set while `image` is a scratch buffer of ours rather than one the cache owns.
@@ -943,7 +1163,7 @@ PF_Err RenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* 
     Log("frame=%d window=%d computed=%d samples=%d prev=%d fetched=%d fetchMs=%.1f gpuMs=%.1f %dx%d out=%dx%d "
         "took=%.1fms err=%d",
         step > 0 ? in_data->current_time / step : 0,
-        frameCount - 1,
+        data->windowFrames - 1,
         framesComputed,
         data->samplesPerFrame,
         previousFrameResult,
