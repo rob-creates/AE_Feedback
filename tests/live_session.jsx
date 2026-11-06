@@ -75,6 +75,16 @@
     shape.setValueAtKey(2, moved);
     queue(trail, 60, "mask_after");
 
+    // Changing the Layer control's stage must take effect right away.
+    var masked = comp("map_solid_masked");
+    queue(masked, 60, "stage_all");
+
+    // A duplicate keeps the setting of the original.
+    queue(masked.duplicate(), 60, "stage_duplicate");
+
+    find(masked.layer("dot").property("Effects").property(1), "Layer").setLayerInputStage(0);
+    queue(masked, 60, "stage_source");
+
     // Saved so that a fresh aerender can show what those last frames should be.
     app.project.save(new File(OUT + "/feedback_live_edited.aep"));
     app.endSuppressDialogs(false);

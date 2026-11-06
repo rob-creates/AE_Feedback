@@ -70,6 +70,7 @@ enum
     PARAM_AMOUNT_Y,
     PARAM_DISPLACE_END,
     PARAM_SUBSTEPS,
+    PARAM_MAX_PREROLL,
     PARAM_COUNT
 };
 
@@ -81,9 +82,11 @@ enum
 
 const int kMaxSubsteps = 15;
 
-// A rebuild never starts further back than this. Alpha 0.99 fades out within it; anything higher
-// loses what's older.
-const int kMaxFramesBack = 600;
+// A rebuild starts no further back than Max Pre-roll Frames. By default, Alpha 0.99 fades out within
+// it; anything higher loses what's older. Playing forward keeps older trail in the image, but only
+// where it's still on the canvas, which covers just these frames.
+const int kDefaultMaxPreroll = 600;
+const int kLongestMaxPreroll = 100000;
 
 // Limits on the canvas, at full resolution for the spread and as actual pixels for the side. These
 // only bite on extreme settings, such as large displacement, and trim what lies furthest out.
@@ -480,6 +483,7 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
     endTopic(PARAM_DISPLACE_END);
 
     fixedInteger("Sub-steps", 0, kMaxSubsteps, kMaxSubsteps, 0, PARAM_SUBSTEPS);
+    fixedInteger("Max Pre-roll Frames", 1, kLongestMaxPreroll, 3000, kDefaultMaxPreroll, PARAM_MAX_PREROLL);
 
     out_data->num_params = PARAM_COUNT;
     return err;
@@ -715,15 +719,17 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
     request.channel_mask = PF_ChannelMask_ARGB;
 
     int samplesPerFrame = 1;
+    int maxPreroll = kDefaultMaxPreroll;
     {
         ParamReader r{in_data, FrameSample(in_data, now)};
         samplesPerFrame = r.integer(PARAM_SUBSTEPS) + 1;
+        maxPreroll = r.integer(PARAM_MAX_PREROLL);
         ERR(r.err);
     }
 
     const float scaleX = float(in_data->downsample_x.num) / float(std::max<A_long>(in_data->downsample_x.den, 1));
     const float scaleY = float(in_data->downsample_y.num) / float(std::max<A_long>(in_data->downsample_y.den, 1));
-    const A_long frameLimit = step > 0 ? std::min<A_long>(kMaxFramesBack, std::max<A_long>(now / step, 0)) : 0;
+    const A_long frameLimit = step > 0 ? std::min<A_long>(maxPreroll, std::max<A_long>(now / step, 0)) : 0;
 
     auto data = std::make_unique<PreRenderData>();
     data->samplesPerFrame = samplesPerFrame;

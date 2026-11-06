@@ -28,6 +28,14 @@
         return s;
     }
 
+    function comp(name) {
+        for (var i = 1; i <= app.project.numItems; i++) {
+            var it = app.project.item(i);
+            if (it instanceof CompItem && it.name === name) return it;
+        }
+        throw new Error("No comp " + name);
+    }
+
     function newComp(name, frames, w, h) {
         return app.project.items.addComp(name, w || W, h || H, 1, frames / FPS, FPS);
     }
@@ -123,19 +131,34 @@
         mapped("neutral_alpha_transparent", precompMap(100, 2), 4);
         mapped("neutral_alpha_half", precompMap(50, 0), 4);
 
-        // Does the Layer picker see a layer's masks? If it doesn't, these two come out the same.
-        mapped("map_solid_opaque", greySolidRed, 4);
-        mapped("map_solid_masked", function (comp) {
+        // The Layer control's stage. At Effects & Masks, a mask leaves the map almost all transparent
+        // and Fill turns its red to the neutral 50%, so neither should shift anything.
+        function maskedSolid(comp) {
             var s = greySolidRed(comp);
             s.Masks.addProperty("Mask").property("maskShape").setValue(dot(5, 5, 2));
             return s;
-        }, 4);
+        }
+        function setStage(name, stage) {
+            find(comp(name).layer("dot").property("Effects").property(1), "Layer").setLayerInputStage(stage);
+        }
+        mapped("map_solid_opaque", greySolidRed, 4);
+        mapped("map_source_default", maskedSolid, 4); // left at Source, which ignores the mask
+        mapped("map_solid_masked", maskedSolid, 4);
+        setStage("map_solid_masked", -1);
+        mapped("map_effects", function (comp) {
+            var s = greySolidRed(comp);
+            s.property("Effects").addProperty("ADBE Fill").property("Color").setValue(GREY);
+            return s;
+        }, 1);
+        setStage("map_effects", -1);
 
         // Long trails, for PreRender cost and the 600-frame limit.
         var perf = newComp("perf_long", 300, 1920, 1080);
         var perfLayer = movingDot(perf, "dot", RED, 1920, 1080, [100, 100], [1800, 980], 60);
         feedback(perfLayer, { "Alpha": 0.98, "Sub-steps": 2 });
         dotComp("limit_700", 700, { "Alpha": 1 });
+        dotComp("preroll_800", 700, { "Alpha": 1, "Max Pre-roll Frames": 800 });
+        dotComp("preroll_100", 300, { "Alpha": 1, "Max Pre-roll Frames": 100 });
     }
 
     app.beginSuppressDialogs();

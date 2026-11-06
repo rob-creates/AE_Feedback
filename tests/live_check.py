@@ -52,6 +52,16 @@ def main(label):
     changed = np.abs(live("mask_before", 60) - edited).max()
     print(f"INFO  the edit itself changed the frame by a peak of {changed}/255")
 
+    print("Changing the Layer control's stage during the session:")
+    check("Effects & Masks@60 shifts nothing", live("stage_all", 60), ref("neutral_ref", 60))
+    check("Source@60 ignores the mask", live("stage_source", 60), ref("map_solid_opaque", 60))
+    check("a duplicate keeps Effects & Masks@60", live("stage_duplicate", 60), ref("neutral_ref", 60))
+
+    print("A project saved before this default existed:")
+    folder = OUT / label / "old_project"
+    render("old_project.aep", "trail", folder, 0, 60)
+    check("opens and renders the same@60", read_tiff(folder / "f_00060.tif"), ref("trail", 60))
+
     print(f"\n{failures} failed" if failures else "\nAll live checks passed")
     sys.exit(1 if failures else 0)
 

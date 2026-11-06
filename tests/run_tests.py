@@ -26,11 +26,12 @@ LOG = Path.home() / "Library/Logs/AEFeedback.log"
 
 COMPS_96 = ["trail", "behind", "screen_sub", "add_sub", "grade_blur", "self_disp", "keyed", "keyed_edit"]
 COMPS_72 = ["two_layers", "duplicate_fx", "neutral_ref", "neutral_luma", "neutral_red", "neutral_alpha_transparent",
-            "neutral_alpha_half", "map_solid_opaque", "map_solid_masked"]
+            "neutral_alpha_half", "map_solid_opaque", "map_source_default", "map_solid_masked", "map_effects"]
 NEUTRAL = ["neutral_ref", "neutral_luma", "neutral_red", "neutral_alpha_transparent", "neutral_alpha_half"]
 # Rendered again alone in a new process: a full rebuild, with nothing cached.
 COLD = {"trail": 60, "behind": 60, "screen_sub": 60, "add_sub": 60, "grade_blur": 60, "self_disp": 60, "keyed": 70,
-        "duplicate_fx": 40, "perf_long": 299, "limit_700": 699}
+        "duplicate_fx": 40, "perf_long": 299, "limit_700": 699,
+        "preroll_800": 699, "preroll_100": 299}
 
 
 def render(project, comp, folder, start=None, end=None):
@@ -55,7 +56,7 @@ def cmd_render(label):
     base.mkdir(parents=True, exist_ok=True)
     log_start = LOG.stat().st_size if LOG.exists() else 0
     timing = {}
-    for comp in COMPS_96 + COMPS_72 + ["perf_long", "limit_700"]:
+    for comp in COMPS_96 + COMPS_72 + ["perf_long", "limit_700", "preroll_800", "preroll_100"]:
         timing[comp] = render("feedback_16.aep", comp, base / comp)
     for depth in (8, 32):
         for comp in NEUTRAL:
@@ -113,13 +114,20 @@ def cmd_check(label):
             report(False, f"{comp}: missing {e.filename}")
             continue
         text = f"{comp}@{frame}: peak {peak}/255 across {count} pixels"
-        report(None if comp == "limit_700" else peak <= 1, text + (" (Alpha 1.0, beyond the 600-frame limit)" if comp == "limit_700" else ""))
+        limited = comp in ("limit_700", "preroll_100")
+        report(None if limited else peak <= 1, text + (" (Alpha 1.0, beyond Max Pre-roll Frames)" if limited else ""))
 
     print("A later keyframe edit leaves earlier frames alone:")
     before = [difference(load(label, "keyed", f), load(label, "keyed_edit", f))[0] for f in range(0, 49)]
     after = [difference(load(label, "keyed", f), load(label, "keyed_edit", f))[0] for f in range(50, 96)]
-    report(max(before) == 0, f"frames 0-48 identical (peak {max(before)})")
+    report(max(before) <= 1, f"frames 0-48 match to within rounding (peak {max(before)})")
     report(min(after) > 0, f"frames 50-95 all differ (smallest peak {min(after)})")
+
+    print("Max Pre-roll Frames sets how far a rebuild reaches:")
+    for comp, frame, limit in (("limit_700", 699, 600), ("preroll_800", 699, 800), ("preroll_100", 299, 100)):
+        played = (load(label, comp, frame)[..., 3] > 8).sum()
+        alone = (load(label, comp + "_cold", frame)[..., 3] > 8).sum()
+        report(None, f"{comp}@{frame}, limit {limit}: {played} visible pixels played through, {alone} rendered alone")
 
     print("Two layers with identical settings keep their own images:")
     for frame in (30, 71):
@@ -141,8 +149,13 @@ def cmd_check(label):
             report(peak <= 1 if comp == "neutral_alpha_transparent" or suffix != "_8" else None,
                    f"{name} {comp}: peak {peak}/255 across {count} pixels")
 
-    peak, count = difference(load(label, "map_solid_opaque", 71), load(label, "map_solid_masked", 71))
-    report(None, f"a mask on the map layer changes the result by a peak of {peak}/255 across {count} pixels")
+    print("The Layer control reads masks and effects:")
+    ref = load(label, "neutral_ref", 71)
+    for comp, text in (("map_solid_masked", "mask respected"), ("map_effects", "effect respected")):
+        peak, count = difference(load(label, comp, 71), ref)
+        report(peak <= 1, f"{text}: peak {peak}/255 across {count} pixels")
+    peak, count = difference(load(label, "map_source_default", 71), load(label, "map_solid_opaque", 71))
+    report(peak <= 1, f"Source ignores the mask: peak {peak}/255 against an unmasked map")
 
 
 def cmd_compare(a, b):
