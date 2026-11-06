@@ -9,3 +9,6 @@
 
 # Test renders
 /tests/out/
+
+# Python
+__pycache__/
