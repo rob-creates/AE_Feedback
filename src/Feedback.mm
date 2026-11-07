@@ -159,8 +159,9 @@ struct FrameFacts
 // some PreRender calls report a shape layer's bounds at full scale and others scaled, though nothing
 // else about the calls differs. Each kind ends up with a run of its own.
 // Checking out a layer can run PreRender for another instance of this effect further up the stack,
-// so a run stays alive and in place for whoever is using it while the list changes around it. AE
-// lets one thread in at a time, so this needs a lock before enabling MFR.
+// so a run stays alive and in place for whoever is using it while the list changes around it.
+// AE renders several frames at once, so everything here is read and written under the lock, which
+// is never held while calling AE: AE can call back in, from this thread or another.
 class FrameFactsMemo
 {
 public:
@@ -189,6 +190,7 @@ public:
     };
 
     std::vector<std::shared_ptr<Run>> runs; // most recently used first
+    std::mutex lock;
 };
 
 const size_t kMaxFactRuns = 8;
@@ -436,7 +438,7 @@ PF_Err GlobalSetup(PF_OutData* out_data)
     out_data->out_flags = PF_OutFlag_WIDE_TIME_INPUT | PF_OutFlag_I_EXPAND_BUFFER | PF_OutFlag_DEEP_COLOR_AWARE;
     out_data->out_flags2 = PF_OutFlag2_SUPPORTS_SMART_RENDER | PF_OutFlag2_FLOAT_COLOR_AWARE |
                            PF_OutFlag2_AUTOMATIC_WIDE_TIME_INPUT | PF_OutFlag2_I_MIX_GUID_DEPENDENCIES |
-                           PF_OutFlag2_SUPPORTS_GPU_RENDER_F32;
+                           PF_OutFlag2_SUPPORTS_GPU_RENDER_F32 | PF_OutFlag2_SUPPORTS_THREADED_RENDERING;
     return PF_Err_NONE;
 }
 
@@ -703,31 +705,50 @@ std::shared_ptr<FrameFactsMemo::Run> FindFacts(
     A_long* nextId,
     PF_Err* err)
 {
-    for (size_t i = 0; i < memo.runs.size(); i++)
+    std::vector<std::shared_ptr<FrameFactsMemo::Run>> runs;
     {
-        const std::shared_ptr<FrameFactsMemo::Run> run = memo.runs[i];
+        std::lock_guard<std::mutex> guard(memo.lock);
+        runs = memo.runs;
+    }
+    for (const auto& run : runs)
+    {
         if (!(run->key == key))
             continue;
+        A_long endExclusive;
+        PF_State remembered;
+        bool hasProbe;
+        SampleFacts probe;
+        {
+            std::lock_guard<std::mutex> guard(memo.lock);
+            endExclusive = run->endExclusive;
+            remembered = run->history;
+            hasProbe = run->hasProbe;
+            probe = run->probe;
+        }
         PF_State history;
         A_Boolean same = 0;
-        if (ReadHistory(in_data, utils, run->endExclusive, &history))
-            utils.PF_AreStatesIdentical(in_data->effect_ref, &run->history, &history, &same);
+        if (ReadHistory(in_data, utils, endExclusive, &history))
+            utils.PF_AreStatesIdentical(in_data->effect_ref, &remembered, &history, &same);
         if (!same)
             continue;
-        if (run->hasProbe)
+        if (hasProbe)
         {
             PF_LRect bounds{};
-            *err = LayerBounds(in_data, extra, request, PARAM_INPUT, run->probe.time, nextId, &bounds);
+            *err = LayerBounds(in_data, extra, request, PARAM_INPUT, probe.time, nextId, &bounds);
             if (*err)
                 return run;
-            if (!SameRect(bounds, run->probe.inputRect))
+            if (!SameRect(bounds, probe.inputRect))
                 continue;
         }
-        std::rotate(memo.runs.begin(), memo.runs.begin() + i, memo.runs.begin() + i + 1);
+        std::lock_guard<std::mutex> guard(memo.lock);
+        auto at = std::find(memo.runs.begin(), memo.runs.end(), run);
+        if (at != memo.runs.end())
+            std::rotate(memo.runs.begin(), at, at + 1);
         return run;
     }
     auto run = std::make_shared<FrameFactsMemo::Run>();
     run->key = key;
+    std::lock_guard<std::mutex> guard(memo.lock);
     memo.runs.insert(memo.runs.begin(), run);
     if (memo.runs.size() > kMaxFactRuns)
         memo.runs.pop_back();
@@ -778,8 +799,13 @@ bool MapLayerIsPicked(PF_InData* in_data, PF_OutData* out_data)
         AEFX_SuiteScoper<AEGP_EffectSuite5> effects(in_data, kAEGPEffectSuite, kAEGPEffectSuiteVersion5, out_data);
         AEFX_SuiteScoper<AEGP_StreamSuite7> streams(in_data, kAEGPStreamSuite, kAEGPStreamSuiteVersion7, out_data);
 
-        static AEGP_PluginID pluginId = 0;
-        if (!pluginId && util->AEGP_RegisterWithAEGP(nullptr, "Feedback", &pluginId))
+        static const AEGP_PluginID pluginId = [&]
+        {
+            AEGP_PluginID id = 0;
+            util->AEGP_RegisterWithAEGP(nullptr, "Feedback", &id);
+            return id;
+        }();
+        if (!pluginId)
             return true;
 
         AEGP_EffectRefH effect = nullptr;
@@ -833,7 +859,7 @@ A_long TrailStart(PF_InData* in_data, PF_OutData* out_data)
 // How far a trail reaches: the frames a rebuild would replay, and the canvas to hold it all.
 struct TrailWalk
 {
-    std::vector<FrameFacts*> window; // [k] is k frames before the current one
+    std::vector<const FrameFacts*> window; // [k] is k frames before the current one
     bool hasArea = false;
     PF_LRect area{};
     A_long focusX = 0, focusY = 0; // the centre of the newest area, which matters most if trimmed
@@ -847,6 +873,7 @@ PF_Err WalkTrail(
     PF_InData* in_data,
     PF_PreRenderExtra* extra,
     const PF_RenderRequest& request,
+    FrameFactsMemo& memo,
     FrameFactsMemo::Run& run,
     int samplesPerFrame,
     int rebuildLimit,
@@ -870,17 +897,26 @@ PF_Err WalkTrail(
     for (int k = 0; !err && !oldest; k++)
     {
         const A_long time = now - k * step;
-        auto found = run.frames.find(time);
-        if (found == run.frames.end())
+        FrameFacts* known = nullptr;
+        {
+            std::lock_guard<std::mutex> guard(memo.lock);
+            auto found = run.frames.find(time);
+            if (found != run.frames.end())
+                known = &found->second;
+        }
+        if (!known)
         {
             FrameFacts read{};
             ERR(ReadFrameFacts(in_data, extra, request, time, samplesPerFrame, fromLayer, nextId, &read));
             if (err)
                 break;
-            found = run.frames.emplace(time, std::move(read)).first;
+            // Another render may have read the same frame meanwhile. Either copy will do.
+            std::lock_guard<std::mutex> guard(memo.lock);
+            known = &run.frames.emplace(time, std::move(read)).first->second;
             walk->framesRead++;
         }
-        FrameFacts& facts = found->second;
+        // Nothing changes a frame's facts once they're in, and the map keeps them in place.
+        const FrameFacts& facts = *known;
         if (k <= rebuildLimit)
             walk->window.push_back(&facts);
 
@@ -898,6 +934,7 @@ PF_Err WalkTrail(
             {
                 frameArea = hasFrameArea ? Union(frameArea, sample.inputRect) : sample.inputRect;
                 hasFrameArea = true;
+                std::lock_guard<std::mutex> guard(memo.lock);
                 if (!run.hasProbe)
                 {
                     run.hasProbe = true;
@@ -964,7 +1001,7 @@ PF_Err CheckOutFrames(
     const bool startsBlank = !data->resumeImage;
     for (int k = 0; !err && k < frames; k++)
     {
-        FrameFacts& facts = *walk.window[k];
+        const FrameFacts& facts = *walk.window[k];
         FrameCheckout frame{};
         frame.time = in_data->current_time - k * in_data->time_step;
 
@@ -1068,14 +1105,32 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
         TrailWalk walk;
         if (!err)
             ERR(WalkTrail(
-                in_data, extra, request, *run, data->samplesPerFrame, rebuildLimit, data->displaceFromLayer, firstTime, &nextId, &walk));
+                in_data, extra, request, metal->memo, *run, data->samplesPerFrame, rebuildLimit, data->displaceFromLayer, firstTime, &nextId, &walk));
 
         // The history now vouches for everything read so far. If it can't be read, keep nothing.
-        if (!err && (walk.framesRead > 0 || now + step > run->endExclusive))
+        if (!err)
         {
-            run->endExclusive = std::max(run->endExclusive, now + step);
-            if (!ReadHistory(in_data, utils, run->endExclusive, &run->history))
-                run->endExclusive = 0; // never matches, so the next call starts again
+            A_long endExclusive;
+            {
+                std::lock_guard<std::mutex> guard(metal->memo.lock);
+                endExclusive = run->endExclusive;
+            }
+            if (walk.framesRead > 0 || now + step > endExclusive)
+            {
+                endExclusive = std::max(endExclusive, now + step);
+                PF_State history;
+                const bool read = ReadHistory(in_data, utils, endExclusive, &history);
+                std::lock_guard<std::mutex> guard(metal->memo.lock);
+                // Never matches if unread, so the next call starts again. A render that has
+                // meanwhile vouched for more of the history is left alone.
+                if (!read)
+                    run->endExclusive = 0;
+                else if (endExclusive >= run->endExclusive)
+                {
+                    run->endExclusive = endExclusive;
+                    run->history = history;
+                }
+            }
         }
 
         PF_LRect area = walk.hasArea ? walk.area : extra->input->output_request.rect;
