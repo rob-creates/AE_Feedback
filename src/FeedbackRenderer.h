@@ -23,6 +23,13 @@ struct FrameParams
     float stepAlpha;
 };
 
+// A radius covers about two sigma, the way most blur tools work. The canvas has to allow for what this
+// produces, so PreRender and the renderer share it.
+inline float BlurSigma(float radius)
+{
+    return radius * 0.5f;
+}
+
 // A buffer plus where it sits on the canvas. A null buffer means nothing is there.
 struct PlacedImage
 {
@@ -64,16 +71,7 @@ public:
         const PlacedImage& input,
         int compositeMode);
 
-    bool copyOut(
-        id<MTLCommandQueue> queue,
-        const CanvasKey& canvas,
-        id<MTLBuffer> image,
-        id<MTLBuffer> output,
-        int outputPitch,
-        int outputWidth,
-        int outputHeight,
-        int offsetX,
-        int offsetY);
+    bool copyOut(id<MTLCommandQueue> queue, const CanvasKey& canvas, id<MTLBuffer> image, const PlacedImage& output);
 
 private:
     FeedbackRenderer() = default;
@@ -86,7 +84,6 @@ private:
         float sigmaY,
         std::vector<id<MTLBuffer>>& scratch);
 
-    id<MTLDevice> mDevice;
     id<MTLComputePipelineState> mDisplace, mBlurDown, mBlurAxis, mBlurUp, mGrade, mComposite, mReframe, mCopyOut;
     id<MTLBuffer> mEmpty; // bound wherever a kernel's optional buffer is absent
     std::unique_ptr<FeedbackCache> mCache;

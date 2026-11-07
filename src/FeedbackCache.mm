@@ -6,7 +6,8 @@ namespace
 {
 // Holds about 30 frames at 4K or 120 at 1080p across all instances of the effect.
 const size_t kBudgetBytes = size_t(4) * 1024 * 1024 * 1024;
-const size_t kMaxScratchBuffers = 6;
+// A step with displacement and a downsampled blur has seven free at rest.
+const size_t kMaxScratchBuffers = 8;
 } // namespace
 
 FeedbackCache::FeedbackCache(id<MTLDevice> device)
@@ -22,13 +23,6 @@ std::vector<FeedbackCache::Candidate> FeedbackCache::candidates(const CanvasKey&
         if (e.time == time && e.key.sameResolution(key))
             out.push_back({e.key, e.history, e.buffer});
     return out;
-}
-
-bool FeedbackCache::hasFrame(const CanvasKey& key, A_long time)
-{
-    std::lock_guard<std::mutex> lock(mMutex);
-    return std::any_of(
-        mEntries.begin(), mEntries.end(), [&](const Entry& e) { return e.time == time && e.key.sameResolution(key); });
 }
 
 void FeedbackCache::touch(id<MTLBuffer> buffer)

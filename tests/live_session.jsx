@@ -1,18 +1,11 @@
 // Renders frames out of order within one After Effects session, editing the project part way
 // through, so the effect's caches are in play. live_check.py compares the results with aerender's.
 // Output folders tests/out/live/<step> must already exist; run with a project closed or empty.
+#include "common.jsx"
+
 (function () {
     var HERE = new File($.fileName).parent.fsName;
     var OUT = HERE + "/out";
-    var FPS = 24;
-
-    function comp(name) {
-        for (var i = 1; i <= app.project.numItems; i++) {
-            var it = app.project.item(i);
-            if (it instanceof CompItem && it.name === name) return it;
-        }
-        throw new Error("No comp " + name);
-    }
 
     function queue(c, frame, step, settings, frames) {
         var rq = app.project.renderQueue;
@@ -26,18 +19,6 @@
         om.applyTemplate("TIFF Sequence with Alpha");
         om.file = new File(OUT + "/live/" + step + "/f_[#####].tif");
         rq.render();
-    }
-
-    function find(group, name) {
-        for (var i = 1; i <= group.numProperties; i++) {
-            var p = group.property(i);
-            if (p.name === name) return p;
-            if (p.propertyType !== PropertyType.PROPERTY) {
-                var q = find(p, name);
-                if (q) return q;
-            }
-        }
-        return null;
     }
 
     app.beginSuppressDialogs();
@@ -82,14 +63,14 @@
     shape.setValueAtKey(2, moved);
     queue(trail, 60, "mask_after");
 
-    // Changing the Layer control's stage must take effect right away.
+    // Changing Map Layer's stage must take effect right away.
     var masked = comp("map_solid_masked");
     queue(masked, 60, "stage_all");
 
     // A duplicate keeps the setting of the original.
     queue(masked.duplicate(), 60, "stage_duplicate");
 
-    find(masked.layer("dot").property("Effects").property(1), "Map Layer (None = Trail)").setLayerInputStage(0);
+    find(masked.layer("dot").property("Effects").property(1), MAP_LAYER).setLayerInputStage(0);
     queue(masked, 60, "stage_source");
 
     // Saved so that a fresh aerender can show what those last frames should be.

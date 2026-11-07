@@ -9,7 +9,6 @@
 Needs numpy, and a plugin built with -DFEEDBACK_LOG=ON for the log-based results.
 """
 import json
-import os
 import re
 import statistics
 import subprocess
@@ -24,17 +23,19 @@ OUT = HERE / "out"
 AERENDER = "/Applications/Adobe After Effects 2026/aerender"
 LOG = Path.home() / "Library/Logs/AEFeedback.log"
 
-COMPS_96 = ["trail", "behind", "screen_sub", "add_sub", "grade_blur", "self_disp", "keyed", "keyed_edit",
-            "alpha_min", "alpha_min_ref", "alpha_min_fade", "alpha_min_sub", "empties_midway",
-            "shape_trail", "shape_sub", "shape_mapped", "shape_as_map"]
-COMPS_72 = ["two_layers", "duplicate_fx", "neutral_ref", "neutral_luma", "neutral_red", "neutral_alpha_transparent",
-            "neutral_alpha_half", "map_solid_opaque", "map_source_default", "map_solid_masked", "map_effects", "empty_layer", "empty_mapped", "layer_own", "layer_none"]
+COMPS = ["trail", "behind", "screen_sub", "add_sub", "grade_blur", "self_disp", "keyed", "keyed_edit",
+         "alpha_min", "alpha_min_ref", "alpha_min_fade", "alpha_min_sub", "empties_midway",
+         "shape_trail", "shape_sub", "shape_mapped", "shape_as_map",
+         "two_layers", "duplicate_fx", "neutral_ref", "neutral_luma", "neutral_red", "neutral_alpha_transparent",
+         "neutral_alpha_half", "map_solid_opaque", "map_source_default", "map_solid_masked", "map_effects",
+         "empty_layer", "empty_mapped", "layer_own", "layer_none",
+         "perf_long", "limit_600", "limit_800", "limit_100"]
 NEUTRAL = ["neutral_ref", "neutral_luma", "neutral_red", "neutral_alpha_transparent", "neutral_alpha_half"]
 # Rendered again alone in a new process: a full rebuild, with nothing cached.
 COLD = {"trail": 60, "behind": 60, "screen_sub": 60, "add_sub": 60, "grade_blur": 60, "self_disp": 60, "keyed": 70,
         "alpha_min": 60, "alpha_min_fade": 60, "alpha_min_sub": 60,
-        "duplicate_fx": 40, "perf_long": 299, "limit_700": 699,
-        "preroll_800": 699, "preroll_100": 299}
+        "duplicate_fx": 40, "perf_long": 299, "limit_600": 699,
+        "limit_800": 699, "limit_100": 299}
 
 
 def render(project, comp, folder, start=None, end=None):
@@ -59,7 +60,7 @@ def cmd_render(label):
     base.mkdir(parents=True, exist_ok=True)
     log_start = LOG.stat().st_size if LOG.exists() else 0
     timing = {}
-    for comp in COMPS_96 + COMPS_72 + ["perf_long", "limit_700", "preroll_800", "preroll_100"]:
+    for comp in COMPS:
         timing[comp] = render("feedback_16.aep", comp, base / comp)
     for depth in (8, 32):
         for comp in NEUTRAL:
@@ -95,6 +96,11 @@ def load(label, comp, frame):
     return read_tiff(OUT / label / comp / f"f_{frame:05d}.tif")
 
 
+def visible(image):
+    """How many pixels can be seen."""
+    return int((image[..., 3] > 8).sum())
+
+
 def difference(a, b):
     d = np.abs(a - b)
     return int(d.max()), int((d.max(axis=-1) > 0).sum())
@@ -117,7 +123,7 @@ def cmd_check(label):
             report(False, f"{comp}: missing {e.filename}")
             continue
         text = f"{comp}@{frame}: peak {peak}/255 across {count} pixels"
-        limited = comp in ("limit_700", "preroll_100")
+        limited = comp in ("limit_600", "limit_100")
         report(None if limited else peak <= 1, text + (" (Alpha Max 1.0, beyond Trail Rebuild Limit)" if limited else ""))
 
     print("A later keyframe edit leaves earlier frames alone:")
@@ -127,13 +133,13 @@ def cmd_check(label):
     report(min(after) > 0, f"frames 50-95 all differ (smallest peak {min(after)})")
 
     print("Trail Rebuild Limit sets how far a rebuild reaches:")
-    for comp, frame, limit in (("limit_700", 699, 600), ("preroll_800", 699, 800), ("preroll_100", 299, 100)):
-        played = (load(label, comp, frame)[..., 3] > 8).sum()
-        alone = (load(label, comp + "_cold", frame)[..., 3] > 8).sum()
+    for comp, frame, limit in (("limit_600", 699, 600), ("limit_800", 699, 800), ("limit_100", 299, 100)):
+        played = visible(load(label, comp, frame))
+        alone = visible(load(label, comp + "_cold", frame))
         report(None, f"{comp}@{frame}, limit {limit}: {played} visible pixels played through, {alone} rendered alone")
 
     # Not the last frame, which AE's disk cache can serve from the earlier run that rendered it alone.
-    counts = [int((load(label, "preroll_100", f)[..., 3] > 8).sum()) for f in range(299)]
+    counts = [visible(load(label, "limit_100", f)) for f in range(299)]
     worst = min(b / a for a, b in zip(counts, counts[1:]) if a)
     report(worst > 0.99, f"playing forward, the limit doesn't cut the trail: worst frame-to-frame change x{worst:.3f}")
 
@@ -141,8 +147,8 @@ def cmd_check(label):
     for frame in (30, 71):
         im = load(label, "two_layers", frame)
         w = im.shape[1] // 2
-        visible = im[..., 3] > 8
-        left, right = visible[:, :w], visible[:, w:]
+        shown = im[..., 3] > 8
+        left, right = shown[:, :w], shown[:, w:]
         lb = im[:, :w][left].mean(axis=0) if left.any() else np.zeros(4)
         rb = im[:, w:][right].mean(axis=0) if right.any() else np.zeros(4)
         report(bool(lb[0] > lb[2] and rb[2] > rb[0]),
@@ -157,7 +163,7 @@ def cmd_check(label):
             report(peak <= 1 if comp == "neutral_alpha_transparent" or suffix != "_8" else None,
                    f"{name} {comp}: peak {peak}/255 across {count} pixels")
 
-    print("The Layer control reads masks and effects:")
+    print("Map Layer reads masks and effects:")
     ref = load(label, "neutral_ref", 71)
     for comp, text in (("map_solid_masked", "mask respected"), ("map_effects", "effect respected")):
         peak, count = difference(load(label, comp, 71), ref)
@@ -178,7 +184,7 @@ def cmd_check(label):
         report(bool(frames == last + 1 and load(label, comp, last)[..., 3].max() == 0),
                f"{comp}: {frames} of {last + 1} frames rendered, all transparent")
     # Before the layer empties, soon after, and once the trail has faded.
-    seen = [int((load(label, "empties_midway", f)[..., 3] > 8).sum()) for f in (29, 35, 95)]
+    seen = [visible(load(label, "empties_midway", f)) for f in (29, 35, 95)]
     report(seen[0] > seen[1] > 0 and seen[2] == 0, f"empties_midway: the trail fades after the input stops: {seen} visible pixels")
 
     print("Alpha Min:")
@@ -191,9 +197,9 @@ def cmd_check(label):
     report(worst <= 2 and seen[-1] == 0, f"fades along the curve to nothing: worst {worst:.1f}/255, {seen}")
     peak, count = difference(load(label, "alpha_min_fade", 95), load(label, "alpha_min_sub", 95))
     report(None, f"sub-steps against none: peak {peak}/255 across {count} pixels")
-    choked = (load(label, "alpha_min", 95)[..., 3] > 8).sum()
-    loose = (load(label, "alpha_min_ref", 95)[..., 3] > 8).sum()
-    report(bool(0 < choked < loose), f"chokes a blurred trail: {choked} visible pixels against {loose}")
+    choked = visible(load(label, "alpha_min", 95))
+    loose = visible(load(label, "alpha_min_ref", 95))
+    report(0 < choked < loose, f"chokes a blurred trail: {choked} visible pixels against {loose}")
 
 
 def cmd_compare(a, b):
@@ -226,17 +232,21 @@ def cmd_perf(label):
             print(f"  window {lo}-{hi}: {len(q)} calls, median {statistics.median(p[1] for p in q):.2f} ms, "
                   f"median {statistics.median(p[2] for p in q)} checkouts")
     t = info["timing"]
-    print("  wall clock: " + ", ".join(f"{k} {t[k]:.1f}s" for k in ("trail", "perf_long", "limit_700", "perf_long_cold")))
+    print("  wall clock: " + ", ".join(f"{k} {t[k]:.1f}s" for k in ("trail", "perf_long", "limit_600", "perf_long_cold")))
 
 
-def main():
-    action = sys.argv[1]
-    {"render": cmd_render, "check": cmd_check, "compare": cmd_compare, "perf": cmd_perf}[action](*sys.argv[2:])
+def summarize():
     if False in RESULTS:
         print(f"\n{RESULTS.count(False)} failed, {RESULTS.count(True)} passed")
         sys.exit(1)
     if RESULTS:
         print(f"\nAll {RESULTS.count(True)} checks passed")
+
+
+def main():
+    action = sys.argv[1]
+    {"render": cmd_render, "check": cmd_check, "compare": cmd_compare, "perf": cmd_perf}[action](*sys.argv[2:])
+    summarize()
 
 
 if __name__ == "__main__":

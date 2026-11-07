@@ -1,20 +1,10 @@
 // Builds the test projects in tests/out/ (which must exist), one per bit depth. Run inside After Effects:
 //   osascript -e 'tell application "Adobe After Effects 2026" to DoScriptFile "<path to this file>"'
-(function () {
-    var W = 640, H = 360, FPS = 24;
-    var OUT = new File($.fileName).parent.fsName + "/out";
+#include "common.jsx"
 
-    function find(group, name) {
-        for (var i = 1; i <= group.numProperties; i++) {
-            var p = group.property(i);
-            if (p.name === name) return p;
-            if (p.propertyType !== PropertyType.PROPERTY) {
-                var q = find(p, name);
-                if (q) return q;
-            }
-        }
-        return null;
-    }
+(function () {
+    var W = 640, H = 360;
+    var OUT = new File($.fileName).parent.fsName + "/out";
 
     function dot(cx, cy, r) {
         var verts = [];
@@ -26,14 +16,6 @@
         s.vertices = verts;
         s.closed = true;
         return s;
-    }
-
-    function comp(name) {
-        for (var i = 1; i <= app.project.numItems; i++) {
-            var it = app.project.item(i);
-            if (it instanceof CompItem && it.name === name) return it;
-        }
-        throw new Error("No comp " + name);
     }
 
     function newComp(name, frames, w, h) {
@@ -50,6 +32,16 @@
         return layer;
     }
 
+    function useMap(fx, layer) {
+        find(fx, MAP_LAYER).setValue(layer.index);
+    }
+
+    function addEllipse(layer, size) {
+        var contents = layer.property("Contents").addProperty("ADBE Vector Group").property("Contents");
+        contents.addProperty("ADBE Vector Shape - Ellipse").property("Size").setValue([size, size]);
+        contents.addProperty("ADBE Vector Graphic - Fill").property("Color").setValue(RED);
+    }
+
     function feedback(layer, values) {
         var fx = layer.property("Effects").addProperty("RPAY Feedback");
         for (var k in values) {
@@ -63,9 +55,9 @@
     var RED = [1, 0.1, 0.1], BLUE = [0.1, 0.2, 1], GREY = [0.5, 0.5, 0.5];
     var ACROSS = [[80, 100], [560, 260]];
 
-    function dotComp(name, frames, settings, colour) {
+    function dotComp(name, frames, settings) {
         var comp = newComp(name, frames);
-        var layer = movingDot(comp, "dot", colour || RED, W, H, ACROSS[0], ACROSS[1], 30);
+        var layer = movingDot(comp, "dot", RED, W, H, ACROSS[0], ACROSS[1], 30);
         return { comp: comp, layer: layer, fx: feedback(layer, settings) };
     }
 
@@ -112,10 +104,10 @@
             });
             var map = makeMap(d.comp);
             map.enabled = false;
-            find(d.fx, "Map Layer (None = Trail)").setValue(map.index);
+            useMap(d.fx, map);
         }
         function greySolid(comp) { return comp.layers.addSolid(GREY, "map", W, H, 1, comp.duration); }
-        function greySolidRed(comp) { return comp.layers.addSolid(RED, "map", W, H, 1, comp.duration); }
+        function redSolid(comp) { return comp.layers.addSolid(RED, "map", W, H, 1, comp.duration); }
         // A map with real transparency: a layer's own masks don't reach the effect, a precomp's do.
         function precompMap(opacity, size) {
             return function (comp) {
@@ -131,22 +123,22 @@
         mapped("neutral_alpha_transparent", precompMap(100, 2), 4);
         mapped("neutral_alpha_half", precompMap(50, 0), 4);
 
-        // The Layer control's stage. At Effects & Masks, a mask leaves the map almost all transparent
+        // Map Layer's stage. At Effects & Masks, a mask leaves the map almost all transparent
         // and Fill turns its red to the neutral 50%, so neither should shift anything.
         function maskedSolid(comp) {
-            var s = greySolidRed(comp);
+            var s = redSolid(comp);
             s.Masks.addProperty("Mask").property("maskShape").setValue(dot(5, 5, 2));
             return s;
         }
         function setStage(name, stage) {
-            find(comp(name).layer("dot").property("Effects").property(1), "Map Layer (None = Trail)").setLayerInputStage(stage);
+            find(comp(name).layer("dot").property("Effects").property(1), MAP_LAYER).setLayerInputStage(stage);
         }
-        mapped("map_solid_opaque", greySolidRed, 4);
+        mapped("map_solid_opaque", redSolid, 4);
         mapped("map_source_default", maskedSolid, 4); // left at Source, which ignores the mask
         mapped("map_solid_masked", maskedSolid, 4);
         setStage("map_solid_masked", -1);
         mapped("map_effects", function (comp) {
-            var s = greySolidRed(comp);
+            var s = redSolid(comp);
             s.property("Effects").addProperty("ADBE Fill").property("Color").setValue(GREY);
             return s;
         }, 1);
@@ -156,9 +148,9 @@
         var perf = newComp("perf_long", 300, 1920, 1080);
         var perfLayer = movingDot(perf, "dot", RED, 1920, 1080, [100, 100], [1800, 980], 60);
         feedback(perfLayer, { "Alpha Max": 0.98, "Sub-steps": 2 });
-        dotComp("limit_700", 700, { "Alpha Max": 1 });
-        dotComp("preroll_800", 700, { "Alpha Max": 1, "Trail Rebuild Limit (Frames)": 800 });
-        dotComp("preroll_100", 300, { "Alpha Max": 1, "Trail Rebuild Limit (Frames)": 100 });
+        dotComp("limit_600", 700, { "Alpha Max": 1 });
+        dotComp("limit_800", 700, { "Alpha Max": 1, "Trail Rebuild Limit (Frames)": 800 });
+        dotComp("limit_100", 300, { "Alpha Max": 1, "Trail Rebuild Limit (Frames)": 100 });
 
         // Alpha Min: on its own, against the same blur without it, and split into sub-steps.
         dotComp("alpha_min", 96, { "Alpha Max": 1, "Alpha Min": 0.2, "Blur Radius": 3 });
@@ -177,7 +169,7 @@
         var emptyMapped = emptyLayer("empty_mapped", { "Alpha Max": 0.9, "Max Horizontal": 20 });
         var emptyMap = emptyMapped.comp.layers.addSolid(RED, "map", W, H, 1, emptyMapped.comp.duration);
         emptyMap.enabled = false;
-        find(emptyMapped.fx, "Map Layer (None = Trail)").setValue(emptyMap.index);
+        useMap(emptyMapped.fx, emptyMap);
         var emptying = dotComp("empties_midway", 96, { "Alpha Max": 0.9 });
         var emptyingShape = emptying.layer.Masks.property(1).property("maskShape");
         emptyingShape.removeKey(2);
@@ -187,7 +179,7 @@
 
         // Map Layer pointed at the effect's own layer reads that layer, rather than the trail.
         var own = dotComp("layer_own", 72, { "Alpha Max": 0.9, "Max Horizontal": 100, "Horizontal Channel": 4 });
-        find(own.fx, "Map Layer (None = Trail)").setValue(own.layer.index);
+        useMap(own.fx, own.layer);
         dotComp("layer_none", 72, { "Alpha Max": 0.9, "Max Horizontal": 100, "Horizontal Channel": 4 });
 
         // Shape layers rasterise continuously, unlike the solids above: a moving ellipse, alone,
@@ -195,9 +187,7 @@
         function shapeComp(name, settings, withMap) {
             var c = newComp(name, 96);
             var layer = c.layers.addShape();
-            var group = layer.property("Contents").addProperty("ADBE Vector Group");
-            group.property("Contents").addProperty("ADBE Vector Shape - Ellipse").property("Size").setValue([60, 60]);
-            group.property("Contents").addProperty("ADBE Vector Graphic - Fill").property("Color").setValue(RED);
+            addEllipse(layer, 60);
             var position = layer.property("Position");
             position.setValueAtTime(0, ACROSS[0]);
             position.setValueAtTime(c.duration, ACROSS[1]);
@@ -205,7 +195,7 @@
             if (withMap) {
                 var map = c.layers.addSolid([0.8, 0.2, 0.5], "map", W, H, 1, c.duration);
                 map.enabled = false;
-                find(fx, "Map Layer (None = Trail)").setValue(map.index);
+                useMap(fx, map);
             }
         }
         shapeComp("shape_trail", { "Alpha Max": 0.9 });
@@ -213,12 +203,10 @@
         // A shape layer as the map instead, on a solid.
         var shapeMap = dotComp("shape_as_map", 96, { "Alpha Max": 0.9, "Max Horizontal": 30, "Horizontal Channel": 4 });
         var mapShape = shapeMap.comp.layers.addShape();
-        var mapGroup = mapShape.property("Contents").addProperty("ADBE Vector Group");
-        mapGroup.property("Contents").addProperty("ADBE Vector Shape - Ellipse").property("Size").setValue([400, 400]);
-        mapGroup.property("Contents").addProperty("ADBE Vector Graphic - Fill").property("Color").setValue(RED);
+        addEllipse(mapShape, 400);
         mapShape.property("Position").setValue([W / 2, H / 2]);
         mapShape.enabled = false;
-        find(shapeMap.fx, "Map Layer (None = Trail)").setValue(mapShape.index);
+        useMap(shapeMap.fx, mapShape);
         shapeComp("shape_mapped", { "Alpha Max": 0.9, "Sub-steps": 2, "Max Horizontal": 6, "Max Vertical": 6, "Horizontal Channel": 1, "Vertical Channel": 2 }, true);
     }
 

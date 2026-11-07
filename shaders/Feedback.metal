@@ -27,6 +27,12 @@ inline float4 bilinearClamped(device const float4* src, int pitch, int w, int h,
     return mix(top, bottom, f.y);
 }
 
+// Straight colour from a premultiplied pixel; nothing where it's transparent.
+inline float3 unpremultiply(float4 c)
+{
+    return c.w > 1e-5f ? c.xyz / c.w : float3(0.0);
+}
+
 inline float luma(float3 bgr)
 {
     return dot(bgr, float3(0.0722, 0.7152, 0.2126));
@@ -35,7 +41,7 @@ inline float luma(float3 bgr)
 // Returns the 0-1 channel value, weighted so transparent map pixels cause no shift.
 inline float mapShift(float4 m, int channel, bool isStraight)
 {
-    float3 c = isStraight ? m.xyz : (m.w > 1e-5f ? m.xyz / m.w : float3(0.0));
+    float3 c = isStraight ? m.xyz : unpremultiply(m);
     float v;
     switch (channel)
     {
@@ -50,8 +56,8 @@ inline float mapShift(float4 m, int channel, bool isStraight)
 
 inline float3 rgbToHsl(float3 rgb)
 {
-    float hi = max(rgb.r, max(rgb.g, rgb.b));
-    float lo = min(rgb.r, min(rgb.g, rgb.b));
+    float hi = max3(rgb.r, rgb.g, rgb.b);
+    float lo = min3(rgb.r, rgb.g, rgb.b);
     float l = (hi + lo) * 0.5f;
     float d = hi - lo;
     if (d < 1e-6f)
@@ -104,7 +110,7 @@ kernel void displace(
 kernel void blurDown(
     device const float4* src [[buffer(0)]],
     device float4* dst [[buffer(1)]],
-    constant BlurDownParams& p [[buffer(2)]],
+    constant BlurResizeParams& p [[buffer(2)]],
     uint2 xy [[thread_position_in_grid]])
 {
     int2 start = int2(xy) * p.factor;
@@ -143,7 +149,7 @@ kernel void blurAxis(
 kernel void blurUp(
     device const float4* src [[buffer(0)]],
     device float4* dst [[buffer(1)]],
-    constant BlurUpParams& p [[buffer(2)]],
+    constant BlurResizeParams& p [[buffer(2)]],
     uint2 xy [[thread_position_in_grid]])
 {
     float2 pos = (float2(xy) + 0.5f) / float(p.factor) - 0.5f;
@@ -175,7 +181,7 @@ kernel void grade(
         {
             // HSL is only defined on 0-1, so HDR values are scaled into range and back.
             rgb = max(rgb, 0.0f);
-            float scale = max(max(rgb.r, max(rgb.g, rgb.b)), 1.0f);
+            float scale = max(max3(rgb.r, rgb.g, rgb.b), 1.0f);
             float3 hsl = rgbToHsl(rgb / scale);
             hsl.x = fract(hsl.x + p.hueShift);
             hsl.y = saturate(hsl.y * p.saturation);
@@ -256,6 +262,6 @@ kernel void copyOut(
 {
     int2 c = int2(xy) + int2(p.offsetX, p.offsetY);
     float4 v = src[c.y * p.srcPitch + c.x];
-    v.xyz = v.w > 1e-5f ? v.xyz / v.w : float3(0.0);
+    v.xyz = unpremultiply(v);
     dst[xy.y * p.dstPitch + xy.x] = v;
 }

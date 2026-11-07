@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <initializer_list>
 
 #include "ShaderTypes.h"
 
@@ -10,60 +11,23 @@ namespace
 const float kMinSigma = 0.05f;
 const float kMaxDirectSigma = FEEDBACK_BLUR_MAX_RADIUS / 3.0f;
 
-void Dispatch(id<MTLComputeCommandEncoder> encoder, id<MTLComputePipelineState> pipeline, int width, int height)
+// The buffers bind in order from index 0, followed by the parameters.
+template <typename Params>
+void Encode(
+    id<MTLComputeCommandEncoder> encoder,
+    id<MTLComputePipelineState> pipeline,
+    std::initializer_list<id<MTLBuffer>> buffers,
+    const Params& params,
+    int width,
+    int height)
 {
+    NSUInteger index = 0;
+    for (id<MTLBuffer> buffer : buffers)
+        [encoder setBuffer:buffer offset:0 atIndex:index++];
+    [encoder setBytes:&params length:sizeof(params) atIndex:index];
     [encoder setComputePipelineState:pipeline];
     [encoder dispatchThreads:MTLSizeMake(width, height, 1)
         threadsPerThreadgroup:MTLSizeMake(pipeline.threadExecutionWidth, 1, 1)];
-}
-
-void FillWeights(BlurAxisParams& p, float sigma)
-{
-    // Sampling a Gaussian this narrow would lose almost all of it, and sub-steps rely on many small
-    // blurs adding up. Three taps with the exact variance do that.
-    if (sigma > 0.0f && sigma < 0.5f)
-    {
-        p.radius = 1;
-        p.weights[0] = 1.0f - sigma * sigma;
-        p.weights[1] = 0.5f * sigma * sigma;
-        return;
-    }
-
-    p.radius = std::clamp(int(std::ceil(sigma * 3.0f)), 0, FEEDBACK_BLUR_MAX_RADIUS);
-    float total = 0.0f;
-    for (int i = 0; i <= FEEDBACK_BLUR_MAX_RADIUS; i++)
-    {
-        float w = (sigma > 0.0f && i <= p.radius) ? std::exp(-0.5f * float(i * i) / (sigma * sigma)) : 0.0f;
-        p.weights[i] = w;
-        total += i == 0 ? w : 2.0f * w;
-    }
-    if (total <= 0.0f)
-    {
-        p.weights[0] = 1.0f;
-        return;
-    }
-    for (int i = 0; i <= FEEDBACK_BLUR_MAX_RADIUS; i++)
-        p.weights[i] /= total;
-}
-
-CompositeParams MakeCompositeParams(const CanvasKey& canvas, const PlacedImage& input, int mode)
-{
-    CompositeParams p{};
-    p.prevPitch = canvas.width;
-    p.dstPitch = canvas.width;
-    p.width = canvas.width;
-    p.height = canvas.height;
-    p.mode = mode;
-    p.inputGain = 1.0f;
-    if (input.buffer)
-    {
-        p.inputPitch = input.pitch;
-        p.inputOffsetX = input.offsetX;
-        p.inputOffsetY = input.offsetY;
-        p.inputWidth = input.width;
-        p.inputHeight = input.height;
-    }
-    return p;
 }
 
 bool Succeeded(id<MTLCommandBuffer> commands)
@@ -72,12 +36,67 @@ bool Succeeded(id<MTLCommandBuffer> commands)
     [commands waitUntilCompleted];
     return commands.status == MTLCommandBufferStatusCompleted;
 }
+
+// One kernel on its own, waited for.
+template <typename Params>
+bool RunOnce(
+    id<MTLCommandQueue> queue,
+    id<MTLComputePipelineState> pipeline,
+    std::initializer_list<id<MTLBuffer>> buffers,
+    const Params& params,
+    int width,
+    int height)
+{
+    id<MTLCommandBuffer> commands = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [commands computeCommandEncoder];
+    Encode(encoder, pipeline, buffers, params, width, height);
+    [encoder endEncoding];
+    return Succeeded(commands);
+}
+
+void FillWeights(BlurAxisParams& p, float sigma)
+{
+    // Sampling a Gaussian this narrow would lose almost all of it, and sub-steps rely on many small
+    // blurs adding up. Three taps with the exact variance do that.
+    if (sigma < 0.5f)
+    {
+        p.radius = 1;
+        p.weights[0] = 1.0f - sigma * sigma;
+        p.weights[1] = 0.5f * sigma * sigma;
+        return;
+    }
+
+    p.radius = std::min(int(std::ceil(sigma * 3.0f)), FEEDBACK_BLUR_MAX_RADIUS);
+    float total = 0.0f;
+    for (int i = 0; i <= p.radius; i++)
+    {
+        p.weights[i] = std::exp(-0.5f * float(i * i) / (sigma * sigma));
+        total += i == 0 ? p.weights[i] : 2.0f * p.weights[i];
+    }
+    for (int i = 0; i <= p.radius; i++)
+        p.weights[i] /= total;
+}
+
+// A missing input has zero size, so the kernel never reads it.
+CompositeParams MakeCompositeParams(const CanvasKey& canvas, const PlacedImage& input, int mode)
+{
+    CompositeParams p{};
+    p.prevPitch = canvas.width;
+    p.dstPitch = canvas.width;
+    p.mode = mode;
+    p.inputGain = 1.0f;
+    p.inputPitch = input.pitch;
+    p.inputOffsetX = input.offsetX;
+    p.inputOffsetY = input.offsetY;
+    p.inputWidth = input.width;
+    p.inputHeight = input.height;
+    return p;
+}
 } // namespace
 
 std::unique_ptr<FeedbackRenderer> FeedbackRenderer::create(id<MTLDevice> device, id<MTLLibrary> library)
 {
     std::unique_ptr<FeedbackRenderer> r(new FeedbackRenderer());
-    r->mDevice = device;
 
     auto pipeline = [&](NSString* name) -> id<MTLComputePipelineState>
     {
@@ -134,18 +153,13 @@ id<MTLBuffer> FeedbackRenderer::encodeBlur(
     const size_t lowBytes = size_t(w) * size_t(h) * 16;
 
     id<MTLBuffer> current = source;
-    int currentPitch = canvas.width;
 
     if (factor > 1)
     {
-        BlurDownParams p{canvas.width, w, canvas.width, canvas.height, w, h, factor};
+        BlurResizeParams p{canvas.width, w, canvas.width, canvas.height, factor};
         id<MTLBuffer> low = acquire(lowBytes);
-        [encoder setBuffer:current offset:0 atIndex:0];
-        [encoder setBuffer:low offset:0 atIndex:1];
-        [encoder setBytes:&p length:sizeof(p) atIndex:2];
-        Dispatch(encoder, mBlurDown, w, h);
+        Encode(encoder, mBlurDown, {current, low}, p, w, h);
         current = low;
-        currentPitch = w;
     }
 
     for (int axis = 0; axis < 2; axis++)
@@ -154,7 +168,7 @@ id<MTLBuffer> FeedbackRenderer::encodeBlur(
         if (sigma < kMinSigma)
             continue;
         BlurAxisParams p{};
-        p.srcPitch = currentPitch;
+        p.srcPitch = w;
         p.dstPitch = w;
         p.width = w;
         p.height = h;
@@ -162,22 +176,15 @@ id<MTLBuffer> FeedbackRenderer::encodeBlur(
         p.dirY = axis == 0 ? 0 : 1;
         FillWeights(p, sigma);
         id<MTLBuffer> next = acquire(lowBytes);
-        [encoder setBuffer:current offset:0 atIndex:0];
-        [encoder setBuffer:next offset:0 atIndex:1];
-        [encoder setBytes:&p length:sizeof(p) atIndex:2];
-        Dispatch(encoder, mBlurAxis, w, h);
+        Encode(encoder, mBlurAxis, {current, next}, p, w, h);
         current = next;
-        currentPitch = w;
     }
 
     if (factor > 1)
     {
-        BlurUpParams p{w, canvas.width, w, h, canvas.width, canvas.height, factor};
+        BlurResizeParams p{w, canvas.width, w, h, factor};
         id<MTLBuffer> full = acquire(canvas.bytes());
-        [encoder setBuffer:current offset:0 atIndex:0];
-        [encoder setBuffer:full offset:0 atIndex:1];
-        [encoder setBytes:&p length:sizeof(p) atIndex:2];
-        Dispatch(encoder, mBlurUp, canvas.width, canvas.height);
+        Encode(encoder, mBlurUp, {current, full}, p, canvas.width, canvas.height);
         current = full;
     }
     return current;
@@ -193,10 +200,16 @@ id<MTLBuffer> FeedbackRenderer::step(
 {
     const int width = canvas.width;
     const int height = canvas.height;
-    const float scaleX = float(canvas.downsampleXNum) / float(std::max<A_u_long>(canvas.downsampleXDen, 1));
-    const float scaleY = float(canvas.downsampleYNum) / float(std::max<A_u_long>(canvas.downsampleYDen, 1));
+    const float scaleX = ScaleValue(canvas.downsampleX);
+    const float scaleY = ScaleValue(canvas.downsampleY);
 
     std::vector<id<MTLBuffer>> scratch;
+    auto acquire = [&]
+    {
+        id<MTLBuffer> buffer = mCache->acquireScratch(canvas.bytes());
+        scratch.push_back(buffer);
+        return buffer;
+    };
     id<MTLBuffer> result = mCache->acquireScratch(canvas.bytes());
 
     id<MTLCommandBuffer> commands = [queue commandBuffer];
@@ -204,8 +217,7 @@ id<MTLBuffer> FeedbackRenderer::step(
 
     if (!current)
     {
-        current = mCache->acquireScratch(canvas.bytes());
-        scratch.push_back(current);
+        current = acquire();
         id<MTLBlitCommandEncoder> blit = [commands blitCommandEncoder];
         [blit fillBuffer:current range:NSMakeRange(0, canvas.bytes()) value:0];
         [blit endEncoding];
@@ -245,19 +257,14 @@ id<MTLBuffer> FeedbackRenderer::step(
             p.mapWidth = width;
             p.mapHeight = height;
         }
-        id<MTLBuffer> next = mCache->acquireScratch(canvas.bytes());
-        scratch.push_back(next);
-        [encoder setBuffer:current offset:0 atIndex:0];
-        [encoder setBuffer:mapBuffer offset:0 atIndex:1];
-        [encoder setBuffer:next offset:0 atIndex:2];
-        [encoder setBytes:&p length:sizeof(p) atIndex:3];
-        Dispatch(encoder, mDisplace, width, height);
+        id<MTLBuffer> next = acquire();
+        Encode(encoder, mDisplace, {current, mapBuffer, next}, p, width, height);
         current = next;
     }
 
-    // Blur. Radius maps to sigma the way most blur tools do: a radius covers about two sigma.
-    const float sigmaX = f.blurRadius * 0.5f * scaleX;
-    const float sigmaY = f.blurRadius * 0.5f * scaleY;
+    // Blur
+    const float sigmaX = BlurSigma(f.blurRadius) * scaleX;
+    const float sigmaY = BlurSigma(f.blurRadius) * scaleY;
     if (std::max(sigmaX, sigmaY) >= kMinSigma)
         current = encodeBlur(encoder, current, canvas, sigmaX, sigmaY, scratch);
 
@@ -265,8 +272,6 @@ id<MTLBuffer> FeedbackRenderer::step(
     GradeParams grade{};
     grade.srcPitch = width;
     grade.dstPitch = width;
-    grade.width = width;
-    grade.height = height;
     grade.applyLevels = !(f.inputBlack == 0.0f && f.inputWhite == 1.0f && f.gamma == 1.0f &&
                           f.outputBlack == 0.0f && f.outputWhite == 1.0f);
     grade.applyHSL = !(f.hueDegrees == 0.0f && f.saturation == 1.0f && f.lightness == 0.0f);
@@ -281,12 +286,8 @@ id<MTLBuffer> FeedbackRenderer::step(
     grade.alphaSlope = f.alphaSlope;
     grade.alphaOffset = f.alphaOffset;
     {
-        id<MTLBuffer> next = mCache->acquireScratch(canvas.bytes());
-        scratch.push_back(next);
-        [encoder setBuffer:current offset:0 atIndex:0];
-        [encoder setBuffer:next offset:0 atIndex:1];
-        [encoder setBytes:&grade length:sizeof(grade) atIndex:2];
-        Dispatch(encoder, mGrade, width, height);
+        id<MTLBuffer> next = acquire();
+        Encode(encoder, mGrade, {current, next}, grade, width, height);
         current = next;
     }
 
@@ -297,11 +298,7 @@ id<MTLBuffer> FeedbackRenderer::step(
         p.screenGain = f.screenGain;
         p.frameAlpha = f.frameAlpha;
         p.stepAlpha = f.stepAlpha;
-        [encoder setBuffer:current offset:0 atIndex:0];
-        [encoder setBuffer:(input.buffer ? input.buffer : mEmpty) offset:0 atIndex:1];
-        [encoder setBuffer:result offset:0 atIndex:2];
-        [encoder setBytes:&p length:sizeof(p) atIndex:3];
-        Dispatch(encoder, mComposite, width, height);
+        Encode(encoder, mComposite, {current, input.buffer ? input.buffer : mEmpty, result}, p, width, height);
     }
 
     [encoder endEncoding];
@@ -326,14 +323,7 @@ id<MTLBuffer> FeedbackRenderer::reframe(
 {
     id<MTLBuffer> result = mCache->acquireScratch(to.bytes());
     ReframeParams p{from.width, to.width, from.width, from.height, to.left - from.left, to.top - from.top};
-    id<MTLCommandBuffer> commands = [queue commandBuffer];
-    id<MTLComputeCommandEncoder> encoder = [commands computeCommandEncoder];
-    [encoder setBuffer:image offset:0 atIndex:0];
-    [encoder setBuffer:result offset:0 atIndex:1];
-    [encoder setBytes:&p length:sizeof(p) atIndex:2];
-    Dispatch(encoder, mReframe, to.width, to.height);
-    [encoder endEncoding];
-    if (!Succeeded(commands))
+    if (!RunOnce(queue, mReframe, {image, result}, p, to.width, to.height))
     {
         mCache->releaseScratch(result);
         return nil;
@@ -350,15 +340,7 @@ id<MTLBuffer> FeedbackRenderer::compositeInput(
 {
     id<MTLBuffer> result = mCache->acquireScratch(canvas.bytes());
     CompositeParams p = MakeCompositeParams(canvas, input, compositeMode);
-    id<MTLCommandBuffer> commands = [queue commandBuffer];
-    id<MTLComputeCommandEncoder> encoder = [commands computeCommandEncoder];
-    [encoder setBuffer:image offset:0 atIndex:0];
-    [encoder setBuffer:(input.buffer ? input.buffer : mEmpty) offset:0 atIndex:1];
-    [encoder setBuffer:result offset:0 atIndex:2];
-    [encoder setBytes:&p length:sizeof(p) atIndex:3];
-    Dispatch(encoder, mComposite, canvas.width, canvas.height);
-    [encoder endEncoding];
-    if (!Succeeded(commands))
+    if (!RunOnce(queue, mComposite, {image, input.buffer ? input.buffer : mEmpty, result}, p, canvas.width, canvas.height))
     {
         mCache->releaseScratch(result);
         return nil;
@@ -367,28 +349,13 @@ id<MTLBuffer> FeedbackRenderer::compositeInput(
 }
 
 bool FeedbackRenderer::copyOut(
-    id<MTLCommandQueue> queue,
-    const CanvasKey& canvas,
-    id<MTLBuffer> image,
-    id<MTLBuffer> output,
-    int outputPitch,
-    int outputWidth,
-    int outputHeight,
-    int offsetX,
-    int offsetY)
+    id<MTLCommandQueue> queue, const CanvasKey& canvas, id<MTLBuffer> image, const PlacedImage& output)
 {
-    const int width = std::min(outputWidth, canvas.width - offsetX);
-    const int height = std::min(outputHeight, canvas.height - offsetY);
+    const int width = std::min(output.width, canvas.width - output.offsetX);
+    const int height = std::min(output.height, canvas.height - output.offsetY);
     if (width <= 0 || height <= 0)
         return true;
 
-    CopyOutParams p{canvas.width, outputPitch, offsetX, offsetY};
-    id<MTLCommandBuffer> commands = [queue commandBuffer];
-    id<MTLComputeCommandEncoder> encoder = [commands computeCommandEncoder];
-    [encoder setBuffer:image offset:0 atIndex:0];
-    [encoder setBuffer:output offset:0 atIndex:1];
-    [encoder setBytes:&p length:sizeof(p) atIndex:2];
-    Dispatch(encoder, mCopyOut, width, height);
-    [encoder endEncoding];
-    return Succeeded(commands);
+    CopyOutParams p{canvas.width, output.pitch, output.offsetX, output.offsetY};
+    return RunOnce(queue, mCopyOut, {image, output.buffer}, p, width, height);
 }

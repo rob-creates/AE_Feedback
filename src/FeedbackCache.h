@@ -4,33 +4,38 @@
 #pragma once
 
 #import <Metal/Metal.h>
+#include <algorithm>
 #include <cstdint>
 #include <mutex>
 #include <vector>
 
 #include "AE_EffectSuites.h"
 
+inline bool SameScale(const PF_RationalScale& a, const PF_RationalScale& b)
+{
+    return a.num == b.num && a.den == b.den;
+}
+
+inline float ScaleValue(const PF_RationalScale& r)
+{
+    return float(r.num) / float(std::max<A_u_long>(r.den, 1));
+}
+
 // Where an image sits, and at what resolution. Canvases follow the trail, so consecutive frames
 // usually differ in position; only images of the same resolution can be used together.
 struct CanvasKey
 {
     A_long left, top, width, height;
-    A_long downsampleXNum;
-    A_u_long downsampleXDen;
-    A_long downsampleYNum;
-    A_u_long downsampleYDen;
-
-    bool operator==(const CanvasKey& o) const
-    {
-        return left == o.left && top == o.top && width == o.width && height == o.height &&
-               downsampleXNum == o.downsampleXNum && downsampleXDen == o.downsampleXDen &&
-               downsampleYNum == o.downsampleYNum && downsampleYDen == o.downsampleYDen;
-    }
+    PF_RationalScale downsampleX, downsampleY;
 
     bool sameResolution(const CanvasKey& o) const
     {
-        return downsampleXNum == o.downsampleXNum && downsampleXDen == o.downsampleXDen &&
-               downsampleYNum == o.downsampleYNum && downsampleYDen == o.downsampleYDen;
+        return SameScale(downsampleX, o.downsampleX) && SameScale(downsampleY, o.downsampleY);
+    }
+
+    bool operator==(const CanvasKey& o) const
+    {
+        return left == o.left && top == o.top && width == o.width && height == o.height && sameResolution(o);
     }
 
     size_t bytes() const { return size_t(width) * size_t(height) * 16; }
@@ -50,7 +55,6 @@ public:
 
     // All images for this frame; the caller decides which, if any, matches the current history.
     std::vector<Candidate> candidates(const CanvasKey& key, A_long time);
-    bool hasFrame(const CanvasKey& key, A_long time);
     void touch(id<MTLBuffer> buffer);
 
     // Takes ownership of the buffer. Evicted buffers are dropped rather than recycled, because

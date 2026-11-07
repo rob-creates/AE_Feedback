@@ -41,14 +41,13 @@ struct DisplaceParams
     float amountY;
 };
 
-struct BlurDownParams
+// Moving to and from the smaller image that wide blurs run on.
+struct BlurResizeParams
 {
     int srcPitch;
     int dstPitch;
     int srcWidth;
     int srcHeight;
-    int dstWidth;
-    int dstHeight;
     int factor;
 };
 
@@ -64,23 +63,10 @@ struct BlurAxisParams
     float weights[FEEDBACK_BLUR_MAX_RADIUS + 1];
 };
 
-struct BlurUpParams
-{
-    int srcPitch;
-    int dstPitch;
-    int srcWidth;
-    int srcHeight;
-    int dstWidth;
-    int dstHeight;
-    int factor;
-};
-
 struct GradeParams
 {
     int srcPitch;
     int dstPitch;
-    int width;
-    int height;
     int applyLevels;
     int applyHSL;
     float inputBlack;
@@ -100,8 +86,6 @@ struct CompositeParams
     int prevPitch;
     int inputPitch;
     int dstPitch;
-    int width;
-    int height;
     int inputOffsetX; // input pixel = canvas pixel - offset
     int inputOffsetY;
     int inputWidth;
