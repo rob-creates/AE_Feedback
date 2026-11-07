@@ -39,6 +39,7 @@
 #include "AEFX_SuiteHelper.h"
 #include "Param_Utils.h"
 
+#include "BuildStamp.h"
 #include "FeedbackRenderer.h"
 #include "ShaderTypes.h"
 
@@ -182,8 +183,11 @@ public:
     struct Run
     {
         Key key;
+        // Every frame in `frames` before endExclusive was read with this history. Facts go in only
+        // once a history covering them has been read, and `version` counts each change to it.
         A_long endExclusive = 0;
         PF_State history{};
+        unsigned version = 0;
         std::unordered_map<A_long, FrameFacts> frames;
         bool hasProbe = false; // one frame's bounds, set once the run knows of a layer with any
         SampleFacts probe{};
@@ -300,15 +304,18 @@ struct ParamReader
     SampleTime time;
     PF_Err err = PF_Err_NONE;
 
+    // After a failed checkout, this and later reads return zeros, and nothing is checked in.
     template <typename Get>
     auto read(int index, Get get)
     {
         PF_ParamDef def;
         AEFX_CLR_STRUCT(def);
-        if (!err)
-            err = PF_CHECKOUT_PARAM(in_data, index, time.value, time.step, time.scale, &def);
+        if (err)
+            return get(def);
+        err = PF_CHECKOUT_PARAM(in_data, index, time.value, time.step, time.scale, &def);
         auto value = get(def);
-        PF_CHECKIN_PARAM(in_data, &def);
+        if (!err)
+            PF_CHECKIN_PARAM(in_data, &def);
         return value;
     }
 
@@ -385,8 +392,9 @@ bool BuildsUpInput(int compositeMode)
 }
 
 // Each control describes what happens per frame. With n sub-steps, each one applies an nth of that,
-// so changing the sub-step count smooths the trail without changing its overall look.
-FrameParams DivideIntoSubsteps(FrameParams f, int n)
+// so changing the sub-step count smooths the trail without changing its overall look. `frameEnd` is
+// the sub-step at the frame's own moment, which is where Levels that can't be divided goes.
+FrameParams DivideIntoSubsteps(FrameParams f, int n, bool frameEnd)
 {
     if (n <= 1)
         return f;
@@ -406,17 +414,27 @@ FrameParams DivideIntoSubsteps(FrameParams f, int n)
     f.saturation = std::pow(f.saturation, share);
     f.lightness *= share;
 
-    // Levels is a linear map plus a gamma. Exact roots of each stand in for the combination.
+    // Levels is a linear map plus a gamma. Exact roots of each stand in for the combination. A flat or
+    // inverted map has no root that keeps its look, so it's applied whole once a frame instead.
     const float range = std::max(f.inputWhite - f.inputBlack, 1e-5f);
     const float slope = (f.outputWhite - f.outputBlack) / range;
-    const float offset = f.outputBlack - slope * f.inputBlack;
-    const float subSlope = slope > 0.0f ? std::pow(slope, share) : 1.0f + (slope - 1.0f) * share;
-    const float subOffset = RootOffset(offset, slope, subSlope, share);
-    f.gamma = std::pow(f.gamma, share);
-    f.inputBlack = 0.0f;
-    f.inputWhite = 1.0f;
-    f.outputBlack = subOffset;
-    f.outputWhite = subSlope + subOffset;
+    if (slope > 0.0f)
+    {
+        const float offset = f.outputBlack - slope * f.inputBlack;
+        const float subSlope = std::pow(slope, share);
+        const float subOffset = RootOffset(offset, slope, subSlope, share);
+        f.gamma = std::pow(f.gamma, share);
+        f.inputBlack = 0.0f;
+        f.inputWhite = 1.0f;
+        f.outputBlack = subOffset;
+        f.outputWhite = subSlope + subOffset;
+    }
+    else if (!frameEnd)
+    {
+        f.gamma = 1.0f;
+        f.inputBlack = f.outputBlack = 0.0f;
+        f.inputWhite = f.outputWhite = 1.0f;
+    }
 
     // Each step adds only enough for still content to settle where one step per frame would, and the
     // current frame is laid over the finished trail at full strength when it's displayed. Just below
@@ -694,8 +712,16 @@ bool SameRect(const PF_LRect& a, const PF_LRect& b)
     return a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom;
 }
 
+// What a render may take from a run: frames before trustedEnd, which its own history matched.
+struct RunView
+{
+    std::shared_ptr<FrameFactsMemo::Run> run;
+    A_long trustedEnd = 0;
+    unsigned version = 0;
+};
+
 // Finds the remembered facts for this history, making room for a new set if there are none.
-std::shared_ptr<FrameFactsMemo::Run> FindFacts(
+RunView FindFacts(
     PF_InData* in_data,
     PF_PreRenderExtra* extra,
     const PF_RenderRequest& request,
@@ -715,12 +741,14 @@ std::shared_ptr<FrameFactsMemo::Run> FindFacts(
         if (!(run->key == key))
             continue;
         A_long endExclusive;
+        unsigned version;
         PF_State remembered;
         bool hasProbe;
         SampleFacts probe;
         {
             std::lock_guard<std::mutex> guard(memo.lock);
             endExclusive = run->endExclusive;
+            version = run->version;
             remembered = run->history;
             hasProbe = run->hasProbe;
             probe = run->probe;
@@ -736,7 +764,7 @@ std::shared_ptr<FrameFactsMemo::Run> FindFacts(
             PF_LRect bounds{};
             *err = LayerBounds(in_data, extra, request, PARAM_INPUT, probe.time, nextId, &bounds);
             if (*err)
-                return run;
+                return {};
             if (!SameRect(bounds, probe.inputRect))
                 continue;
         }
@@ -744,7 +772,7 @@ std::shared_ptr<FrameFactsMemo::Run> FindFacts(
         auto at = std::find(memo.runs.begin(), memo.runs.end(), run);
         if (at != memo.runs.end())
             std::rotate(memo.runs.begin(), at, at + 1);
-        return run;
+        return {run, endExclusive, version};
     }
     auto run = std::make_shared<FrameFactsMemo::Run>();
     run->key = key;
@@ -752,7 +780,7 @@ std::shared_ptr<FrameFactsMemo::Run> FindFacts(
     memo.runs.insert(memo.runs.begin(), run);
     if (memo.runs.size() > kMaxFactRuns)
         memo.runs.pop_back();
-    return run;
+    return {run, 0, run->version};
 }
 
 // Asks AE about one frame in the history.
@@ -876,8 +904,58 @@ struct TrailWalk
     bool hasArea = false;
     PF_LRect area{};
     A_long focusX = 0, focusY = 0; // the centre of the newest area, which matters most if trimmed
-    int framesRead = 0;
+    // Facts this render read itself, kept apart from the run until a history vouches for them.
+    std::unordered_map<A_long, FrameFacts> read;
+    bool hasProbe = false;
+    SampleFacts probe{};
 };
+
+// Adds what a walk read to its run, under a history read afterwards that covers it. If another render
+// has changed the run meanwhile, only the frames both histories agree on go in.
+void KeepFacts(
+    PF_InData* in_data, const PF_ParamUtilsSuite3& utils, FrameFactsMemo& memo, const RunView& view, TrailWalk& walk)
+{
+    FrameFactsMemo::Run& run = *view.run;
+    A_long endExclusive = in_data->current_time + in_data->time_step;
+    {
+        std::lock_guard<std::mutex> guard(memo.lock);
+        if (walk.read.empty() && endExclusive <= run.endExclusive)
+            return;
+        endExclusive = std::max(endExclusive, run.endExclusive);
+    }
+    for (const auto& [time, facts] : walk.read)
+        endExclusive = std::max(endExclusive, time + in_data->time_step);
+
+    PF_State history;
+    const bool readable = ReadHistory(in_data, utils, endExclusive, &history);
+
+    std::lock_guard<std::mutex> guard(memo.lock);
+    const bool unchanged = run.version == view.version;
+    if (!readable)
+    {
+        // Never matches again, so the next call starts a new run.
+        if (unchanged)
+        {
+            run.endExclusive = 0;
+            run.version++;
+        }
+        return;
+    }
+    // Copied, as the walk's window still points at its own.
+    for (const auto& [time, facts] : walk.read)
+        if (unchanged || time < view.trustedEnd)
+            run.frames.emplace(time, facts);
+    if (!unchanged)
+        return;
+    run.endExclusive = endExclusive;
+    run.history = history;
+    run.version++;
+    if (!run.hasProbe && walk.hasProbe)
+    {
+        run.hasProbe = true;
+        run.probe = walk.probe;
+    }
+}
 
 // Walks back until earlier frames have faded to nothing or the trail's start. The canvas is whatever
 // this reaches: each input's bounds, plus how far later frames can have spread it. It goes past the
@@ -887,7 +965,7 @@ PF_Err WalkTrail(
     PF_PreRenderExtra* extra,
     const PF_RenderRequest& request,
     FrameFactsMemo& memo,
-    FrameFactsMemo::Run& run,
+    const RunView& view,
     int samplesPerFrame,
     int rebuildLimit,
     bool fromLayer,
@@ -910,11 +988,12 @@ PF_Err WalkTrail(
     for (int k = 0; !err && !oldest; k++)
     {
         const A_long time = now - k * step;
-        FrameFacts* known = nullptr;
+        const FrameFacts* known = nullptr;
+        if (time < view.trustedEnd)
         {
             std::lock_guard<std::mutex> guard(memo.lock);
-            auto found = run.frames.find(time);
-            if (found != run.frames.end())
+            auto found = view.run->frames.find(time);
+            if (found != view.run->frames.end())
                 known = &found->second;
         }
         if (!known)
@@ -923,12 +1002,9 @@ PF_Err WalkTrail(
             ERR(ReadFrameFacts(in_data, extra, request, time, samplesPerFrame, fromLayer, nextId, &read));
             if (err)
                 break;
-            // Another render may have read the same frame meanwhile. Either copy will do.
-            std::lock_guard<std::mutex> guard(memo.lock);
-            known = &run.frames.emplace(time, std::move(read)).first->second;
-            walk->framesRead++;
+            known = &walk->read.emplace(time, std::move(read)).first->second;
         }
-        // Nothing changes a frame's facts once they're in, and the map keeps them in place.
+        // Nothing changes a frame's facts once they're in, and the maps keep them in place.
         const FrameFacts& facts = *known;
         if (k <= rebuildLimit)
             walk->window.push_back(&facts);
@@ -947,11 +1023,10 @@ PF_Err WalkTrail(
             {
                 frameArea = hasFrameArea ? Union(frameArea, sample.inputRect) : sample.inputRect;
                 hasFrameArea = true;
-                std::lock_guard<std::mutex> guard(memo.lock);
-                if (!run.hasProbe)
+                if (!walk->hasProbe)
                 {
-                    run.hasProbe = true;
-                    run.probe = sample;
+                    walk->hasProbe = true;
+                    walk->probe = sample;
                 }
             }
             hasMap = hasMap || (fromLayer && !IsEmpty(sample.mapRect));
@@ -1073,8 +1148,18 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
         ERR(extra->cb->GuidMixInPtr(in_data->effect_ref, sizeof(firstTime), &firstTime));
 
         // AE's disk cache outlives the plugin, so frames saved by a different build mustn't be reused.
-        static const char kBuild[] = __DATE__ " " __TIME__;
+        static const char kBuild[] = FEEDBACK_BUILD_STAMP;
         ERR(extra->cb->GuidMixInPtr(in_data->effect_ref, sizeof(kBuild), kBuild));
+#ifdef FEEDBACK_LOG
+        // Tests set this for each render, so none is served frames an earlier one saved.
+        static const std::string salt = [] {
+            const char* given = getenv("FEEDBACK_GUID_SALT");
+            Log("guid salt=%s", given ? given : "");
+            return std::string(given ? given : "");
+        }();
+        if (!salt.empty())
+            ERR(extra->cb->GuidMixInPtr(in_data->effect_ref, A_u_long(salt.size()), salt.data()));
+#endif
     }
 
     PF_RenderRequest request = extra->input->output_request;
@@ -1084,8 +1169,11 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
     A_long nextId = 0;
     data->currentInputId = nextId++;
 
-    // Without a GPU, the layer only passes through, so its own pixels are all that matter.
-    auto* metal = const_cast<MetalData*>(static_cast<const MetalData*>(extra->input->gpu_data));
+    // Without a GPU, the layer only passes through, so its own pixels are all that matter. AE says
+    // which it will use in what_gpu, which can be NONE even when there's GPU data.
+    auto* metal = extra->input->what_gpu == PF_GPU_Framework_METAL
+                      ? const_cast<MetalData*>(static_cast<const MetalData*>(extra->input->gpu_data))
+                      : nullptr;
     if (!metal)
     {
         const SampleTime time = FrameSample(in_data, now);
@@ -1111,40 +1199,18 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             in_data->downsample_x,
             in_data->downsample_y,
             data->samplesPerFrame};
-        std::shared_ptr<FrameFactsMemo::Run> run;
+        RunView view;
         if (!err)
-            run = FindFacts(in_data, extra, request, utils, metal->memo, factsKey, &nextId, &err);
+            view = FindFacts(in_data, extra, request, utils, metal->memo, factsKey, &nextId, &err);
 
         TrailWalk walk;
         if (!err)
             ERR(WalkTrail(
-                in_data, extra, request, metal->memo, *run, data->samplesPerFrame, rebuildLimit, data->displaceFromLayer, firstTime, &nextId, &walk));
+                in_data, extra, request, metal->memo, view, data->samplesPerFrame, rebuildLimit, data->displaceFromLayer, firstTime, &nextId, &walk));
 
-        // The history now vouches for everything read so far. If it can't be read, keep nothing.
+        // A failed walk keeps nothing, as what it read may not match any history.
         if (!err)
-        {
-            A_long endExclusive;
-            {
-                std::lock_guard<std::mutex> guard(metal->memo.lock);
-                endExclusive = run->endExclusive;
-            }
-            if (walk.framesRead > 0 || now + step > endExclusive)
-            {
-                endExclusive = std::max(endExclusive, now + step);
-                PF_State history;
-                const bool read = ReadHistory(in_data, utils, endExclusive, &history);
-                std::lock_guard<std::mutex> guard(metal->memo.lock);
-                // Never matches if unread, so the next call starts again. A render that has
-                // meanwhile vouched for more of the history is left alone.
-                if (!read)
-                    run->endExclusive = 0;
-                else if (endExclusive >= run->endExclusive)
-                {
-                    run->endExclusive = endExclusive;
-                    run->history = history;
-                }
-            }
-        }
+            KeepFacts(in_data, utils, metal->memo, view, walk);
 
         PF_LRect area = walk.hasArea ? walk.area : extra->input->output_request.rect;
         SnapCanvas(walk, &area);
@@ -1182,7 +1248,7 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             step > 0 ? now / step : 0,
             int(walk.window.size()) - 1,
             data->samplesPerFrame,
-            walk.framesRead,
+            int(walk.read.size()),
             resumeK,
             nextId,
             data->canvas.width,
@@ -1264,7 +1330,12 @@ PF_Err FlushSteps(GpuRender& render)
 
 // Queues one step of the loop. Sets `next` to the image it will produce.
 PF_Err ComputeSample(
-    GpuRender& render, const SubstepCheckout& sub, bool isCurrent, id<MTLBuffer> image, __strong id<MTLBuffer>* next)
+    GpuRender& render,
+    const SubstepCheckout& sub,
+    bool frameEnd,
+    bool isCurrent,
+    id<MTLBuffer> image,
+    __strong id<MTLBuffer>* next)
 {
     PF_Err err = PF_Err_NONE;
     PF_InData* in_data = render.in_data;
@@ -1274,7 +1345,7 @@ PF_Err ComputeSample(
 
     FrameParams params{};
     if (!err)
-        params = DivideIntoSubsteps(ReadFrameParams(in_data, sub.time, &err), render.data.samplesPerFrame);
+        params = DivideIntoSubsteps(ReadFrameParams(in_data, sub.time, &err), render.data.samplesPerFrame, frameEnd);
     params.displaceFromLayer = render.data.displaceFromLayer;
 
     auto fetchStart = std::chrono::steady_clock::now();
@@ -1432,7 +1503,7 @@ PF_Err RenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* 
                 @autoreleasepool
                 {
                     id<MTLBuffer> next = nil;
-                    ERR(ComputeSample(render, sub, isCurrent, image, &next));
+                    ERR(ComputeSample(render, sub, s == subCount - 1, isCurrent, image, &next));
                     if (next)
                     {
                         if (imageIsScratch)

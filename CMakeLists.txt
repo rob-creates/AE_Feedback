@@ -32,6 +32,21 @@ add_custom_command(
     DEPENDS "${CMAKE_SOURCE_DIR}/shaders/Feedback.metal" "${CMAKE_SOURCE_DIR}/src/ShaderTypes.h"
     COMMENT "metal: compiling shaders")
 
+# --- Build stamp ---------------------------------------------------------------
+# AE's disk cache outlives the plugin, so frames from a different build mustn't be reused.
+# The effect mixes this hash of everything that shapes its pixels into each frame's GUID.
+file(GLOB STAMPED_SOURCES CONFIGURE_DEPENDS
+    "${CMAKE_SOURCE_DIR}/src/*.mm" "${CMAKE_SOURCE_DIR}/src/*.h" "${CMAKE_SOURCE_DIR}/shaders/*.metal")
+set(BUILD_STAMP "${GEN}/BuildStamp.h")
+string(REPLACE ";" "|" STAMPED_LIST "${STAMPED_SOURCES}") # a ; would split the command
+add_custom_command(
+    OUTPUT "${BUILD_STAMP}"
+    COMMAND ${CMAKE_COMMAND} "-DSOURCES=${STAMPED_LIST}" "-DOUT=${BUILD_STAMP}"
+            -P "${CMAKE_SOURCE_DIR}/cmake/BuildStamp.cmake"
+    DEPENDS ${STAMPED_SOURCES} "${CMAKE_SOURCE_DIR}/cmake/BuildStamp.cmake"
+    COMMENT "Stamping the build"
+    VERBATIM)
+
 # --- Plugin bundle -----------------------------------------------------------
 add_library(Feedback MODULE
     src/Feedback.mm
@@ -39,10 +54,12 @@ add_library(Feedback MODULE
     src/FeedbackRenderer.mm
     "${SDK}/Util/AEFX_SuiteHelper.c"
     "${PIPL_RSRC}"
-    "${METALLIB}")
+    "${METALLIB}"
+    "${BUILD_STAMP}")
 
 target_include_directories(Feedback PRIVATE
     src
+    "${GEN}"
     "${SDK}/Headers"
     "${SDK}/Headers/SP"
     "${SDK}/Util"

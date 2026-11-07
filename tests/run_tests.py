@@ -9,6 +9,7 @@
 Needs numpy, and a plugin built with -DFEEDBACK_LOG=ON for the log-based results.
 """
 import json
+import os
 import re
 import statistics
 import subprocess
@@ -23,7 +24,8 @@ OUT = HERE / "out"
 AERENDER = "/Applications/Adobe After Effects 2026/aerender"
 LOG = Path.home() / "Library/Logs/AEFeedback.log"
 
-COMPS = ["trail", "behind", "screen_sub", "add_sub", "grade_blur", "self_disp", "keyed", "keyed_edit",
+COMPS = ["trail", "behind", "screen_sub", "add_sub", "grade_blur", "self_disp", "levels_inverted",
+         "levels_inverted_sub", "keyed", "keyed_edit",
          "alpha_min", "alpha_min_ref", "alpha_min_fade", "alpha_min_sub", "empties_midway",
          "shape_trail", "shape_sub", "shape_mapped", "shape_as_map",
          "two_layers", "duplicate_fx", "neutral_ref", "neutral_luma", "neutral_red", "neutral_alpha_transparent",
@@ -38,6 +40,7 @@ COLD = {"trail": 60, "behind": 60, "screen_sub": 60, "add_sub": 60, "grade_blur"
         "alpha_min": 60, "alpha_min_fade": 60, "alpha_min_sub": 60,
         "duplicate_fx": 40, "perf_long": 299, "limit_600": 699,
         "limit_800": 699, "limit_100": 299, "trim_48": 60, "trim_start": 60, "trim_stretch": 60}
+DEEP = 3999  # deep_alpha1's last frame
 
 
 def render(project, comp, folder, start=None, end=None):
@@ -46,8 +49,10 @@ def render(project, comp, folder, start=None, end=None):
            "-OMtemplate", "TIFF Sequence with Alpha", "-output", str(folder / "f_[#####].tif")]
     if start is not None:
         cmd += ["-s", str(start), "-e", str(end)]
+    # A logging build mixes this into its GUIDs, so AE's disk cache can't serve an earlier render's frames.
+    env = dict(os.environ, FEEDBACK_GUID_SALT=str(time.time_ns()))
     began = time.time()
-    done = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    done = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=env)
     took = time.time() - began
     frames = len(list(folder.glob("f_*.tif")))
     print(f"  {project} {comp} {start if start is not None else 'all'}: {took:.1f}s, {frames} files, exit {done.returncode}",
@@ -71,6 +76,7 @@ def cmd_render(label):
             timing[f"{comp}_{depth}"] = render(f"feedback_{depth}.aep", comp, base / f"{comp}_{depth}")
     for comp, frame in COLD.items():
         timing[f"{comp}_cold"] = render("feedback_16.aep", comp, base / f"{comp}_cold", frame, frame)
+    timing["deep_alpha1"] = render("feedback_16.aep", "deep_alpha1", base / "deep_alpha1", DEEP, DEEP)
     (base / "timing.json").write_text(json.dumps(
         {"timing": timing, "log": [log_start, LOG.stat().st_size if LOG.exists() else 0]}, indent=1))
 
@@ -127,8 +133,15 @@ def cmd_check(label):
             report(False, f"{comp}: missing {e.filename}")
             continue
         text = f"{comp}@{frame}: peak {peak}/255 across {count} pixels"
-        limited = comp in ("limit_600", "limit_100")
-        report(None if limited else peak <= 1, text + (" (Alpha Max 1.0, beyond Trail Rebuild Limit)" if limited else ""))
+        if comp in ("limit_600", "limit_100"):
+            report(None, text + " (Alpha Max 1.0, beyond Trail Rebuild Limit)")
+        elif comp == "duplicate_fx":
+            # A rebuild stops once the effect's own Alpha has faded older frames to nothing, but the
+            # second copy's input is a trail already, which fades slower. The faintest tail differs.
+            report(None, text + " (fed by another trail, so a rebuild drops a sliver of the oldest tail)")
+        else:
+            # Add sums the same steps in another order, which can round a pixel the other way.
+            report(peak <= (2 if comp == "add_sub" else 1), text)
 
     print("A later keyframe edit leaves earlier frames alone:")
     before = [difference(load(label, "keyed", f), load(label, "keyed_edit", f))[0] for f in range(0, 49)]
@@ -142,10 +155,17 @@ def cmd_check(label):
         alone = visible(load(label, comp + "_cold", frame))
         report(None, f"{comp}@{frame}, limit {limit}: {played} visible pixels played through, {alone} rendered alone")
 
-    # Not the last frame, which AE's disk cache can serve from the earlier run that rendered it alone.
     counts = [visible(load(label, "limit_100", f)) for f in range(299)]
     worst = min(b / a for a, b in zip(counts, counts[1:]) if a)
     report(worst > 0.99, f"playing forward, the limit doesn't cut the trail: worst frame-to-frame change x{worst:.3f}")
+
+    print("Alpha Max 1.0, 4000 frames in, rendered alone:")
+    took = json.loads((OUT / label / "timing.json").read_text())["timing"]["deep_alpha1"]
+    try:
+        seen = visible(load(label, "deep_alpha1", DEEP))
+        report(seen > 0, f"rendered in {took:.1f}s with {seen} visible pixels")
+    except FileNotFoundError:
+        report(False, f"no frame after {took:.1f}s")
 
     print("Two layers with identical settings keep their own images:")
     for frame in (30, 71):
@@ -205,6 +225,14 @@ def cmd_check(label):
     # Before the layer empties, soon after, and once the trail has faded.
     seen = [visible(load(label, "empties_midway", f)) for f in (29, 35, 95)]
     report(seen[0] > seen[1] > 0 and seen[2] == 0, f"empties_midway: the trail fades after the input stops: {seen} visible pixels")
+
+    print("Inverted Levels, with and without sub-steps:")
+    centre = lambda comp, f: load(label, comp, f)[170:190, 310:330, :3].reshape(-1, 3).mean(axis=0)
+    # Dividing an inverted Levels into sub-steps used to flatten the trail to grey.
+    for f in (60, 61):
+        whole, split = centre("levels_inverted", f), centre("levels_inverted_sub", f)
+        report(bool(np.abs(whole - split).max() < 25 and abs(split[0] - split[1]) > 100),
+               f"frame {f}: centre RGB {whole.round(0)} without, {split.round(0)} with")
 
     print("Alpha Min:")
     # A pixel the dot has left follows the curve exactly: Max 0.9, Min 0.1.

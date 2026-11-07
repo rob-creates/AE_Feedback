@@ -87,6 +87,15 @@
         });
         dotComp("self_disp", 96, { "Alpha Max": 0.9, "Max Horizontal": 12, "Max Vertical": -8 });
 
+        // Inverted Levels on a still dot, behind the trail so the trail shows: it flips every frame,
+        // with or without sub-steps.
+        for (var sub = 0; sub < 2; sub++) {
+            var inv = newComp(sub ? "levels_inverted_sub" : "levels_inverted", 72);
+            feedback(movingDot(inv, "dot", RED, W, H, [W / 2, H / 2], [W / 2, H / 2], 30), {
+                "Alpha Max": 0.9, "Composite": 2, "Output Black": 1, "Output White": 0, "Sub-steps": sub
+            });
+        }
+
         // Keyframes: `keyed` and `keyed_edit` agree up to frame 48 and differ after it.
         var keyed = dotComp("keyed", 96, {});
         var keyedEdit = dotComp("keyed_edit", 96, {});
@@ -167,6 +176,9 @@
         dotComp("limit_600", 700, { "Alpha Max": 1 });
         dotComp("limit_800", 700, { "Alpha Max": 1, "Trail Rebuild Limit (Frames)": 800 });
         dotComp("limit_100", 300, { "Alpha Max": 1, "Trail Rebuild Limit (Frames)": 100 });
+        // Nothing fades, so a frame deep into it looks back over the whole comp. Rendered alone.
+        var deep = newComp("deep_alpha1", 4000, 1920, 1080);
+        feedback(movingDot(deep, "dot", RED, 1920, 1080, [100, 100], [1800, 980], 60), { "Alpha Max": 1, "Sub-steps": 7 });
 
         // Alpha Min: on its own, against the same blur without it, and split into sub-steps.
         dotComp("alpha_min", 96, { "Alpha Max": 1, "Alpha Min": 0.2, "Blur Radius": 3 });

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Measures speed on bench.aep from bench_project.jsx.  bench.py run LABEL | compare A B | canvas
 
-Needs a plugin built with -DFEEDBACK_LOG=ON. Each build must differ, or AE's disk cache serves the
-frames and nothing renders. A plugin's build stamp comes from compiling Feedback.mm.
+Needs a plugin built with -DFEEDBACK_LOG=ON, which takes a fresh GUID salt from each render, so AE's
+disk cache never serves frames and everything is measured.
 """
 import json
 import re

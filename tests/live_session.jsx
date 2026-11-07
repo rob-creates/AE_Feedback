@@ -82,6 +82,16 @@
     find(pickFx, MAP_LAYER).setValue(0);
     queue(pick, 60, "pick_none_after");
 
+    // Its own layer reads the trail at Effects & Masks and the layer at Source, so switching the
+    // stage alone changes whether there's a map.
+    var own = comp("layer_own_effects");
+    var ownLayer = find(own.layer("dot").property("Effects").property(1), MAP_LAYER);
+    queue(own, 60, "own_effects");
+    ownLayer.setLayerInputStage(0);
+    queue(own, 60, "own_source");
+    ownLayer.setLayerInputStage(-1);
+    queue(own, 60, "own_effects_again");
+
     // Moving an in-point changes every frame after it, though nothing in the layer's history did.
     var trimmed = comp("trim_48");
     queue(trimmed, 60, "trim_before");
