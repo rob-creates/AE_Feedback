@@ -278,7 +278,8 @@ id<MTLBuffer> FeedbackRenderer::step(
     grade.hueShift = f.hueDegrees / 360.0f;
     grade.saturation = f.saturation;
     grade.lightness = f.lightness;
-    grade.alpha = f.alpha;
+    grade.alphaSlope = f.alphaSlope;
+    grade.alphaOffset = f.alphaOffset;
     {
         id<MTLBuffer> next = mCache->acquireScratch(canvas.bytes());
         scratch.push_back(next);

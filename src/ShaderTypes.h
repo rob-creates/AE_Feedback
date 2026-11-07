@@ -91,7 +91,8 @@ struct GradeParams
     float hueShift; // turns
     float saturation; // multiplier
     float lightness; // offset
-    float alpha;
+    float alphaSlope; // new alpha = slope * alpha + offset
+    float alphaOffset;
 };
 
 struct CompositeParams

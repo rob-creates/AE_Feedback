@@ -38,6 +38,21 @@ def main(label):
     print(f"INFO  half-resolution frame {w}x{h}: mean difference from a shrunk full frame "
           f"{np.abs(half - shrunk).mean():.2f}/255, peak {np.abs(half - shrunk).max():.0f}")
 
+    print("Reduced resolution, against a shrunk full-resolution frame:")
+    for step, comp, factor in [("half_" + c, c, 2) for c in ("shape_trail", "shape_sub", "shape_mapped", "shape_as_map",
+                                                             "screen_sub", "map_solid_opaque", "alpha_min")] + [
+            ("third_shape_trail", "shape_trail", 3), ("half_run_shape_sub", "shape_sub", 2)]:
+        small = live(step, 60)
+        full = ref(comp, 60)
+        h, w = full.shape[0] // factor, full.shape[1] // factor # a partial pixel at the edge is left out
+        small = small[:h, :w]
+        shrunk = full[: h * factor, : w * factor].reshape(h, factor, w, factor, 4).mean(axis=(1, 3))
+        seen, expected = (small[..., 3] > 8).sum(), (shrunk[..., 3] > 8).sum()
+        ok = bool(expected > 0 and abs(int(seen) - int(expected)) < 0.15 * expected)
+        failures += not ok
+        print(("PASS  " if ok else "FAIL  ") + f"{step}: {seen} visible pixels, expected about {expected}, "
+              f"mean difference {np.abs(small - shrunk).mean():.2f}/255")
+
     print("Editing a keyframe during the session:")
     check("before the edit@70", live("keyed_before", 70), ref("keyed", 70))
     check("after the edit@70", live("keyed_after", 70), ref("keyed_edit", 70))

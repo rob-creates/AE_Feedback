@@ -8,7 +8,8 @@
 
 struct FrameParams
 {
-    float alpha;
+    float alpha; // the fade alone, which the input's strength in Add is worked out from
+    float alphaSlope, alphaOffset; // the whole alpha curve: slope * alpha + offset
     float blurRadius; // full-resolution pixels
     float inputBlack, inputWhite, gamma, outputBlack, outputWhite;
     float hueDegrees, saturation, lightness;

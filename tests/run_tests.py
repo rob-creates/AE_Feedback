@@ -24,12 +24,15 @@ OUT = HERE / "out"
 AERENDER = "/Applications/Adobe After Effects 2026/aerender"
 LOG = Path.home() / "Library/Logs/AEFeedback.log"
 
-COMPS_96 = ["trail", "behind", "screen_sub", "add_sub", "grade_blur", "self_disp", "keyed", "keyed_edit"]
+COMPS_96 = ["trail", "behind", "screen_sub", "add_sub", "grade_blur", "self_disp", "keyed", "keyed_edit",
+            "alpha_min", "alpha_min_ref", "alpha_min_fade", "alpha_min_sub", "empties_midway",
+            "shape_trail", "shape_sub", "shape_mapped", "shape_as_map"]
 COMPS_72 = ["two_layers", "duplicate_fx", "neutral_ref", "neutral_luma", "neutral_red", "neutral_alpha_transparent",
-            "neutral_alpha_half", "map_solid_opaque", "map_source_default", "map_solid_masked", "map_effects"]
+            "neutral_alpha_half", "map_solid_opaque", "map_source_default", "map_solid_masked", "map_effects", "empty_layer", "empty_mapped", "layer_own", "layer_none"]
 NEUTRAL = ["neutral_ref", "neutral_luma", "neutral_red", "neutral_alpha_transparent", "neutral_alpha_half"]
 # Rendered again alone in a new process: a full rebuild, with nothing cached.
 COLD = {"trail": 60, "behind": 60, "screen_sub": 60, "add_sub": 60, "grade_blur": 60, "self_disp": 60, "keyed": 70,
+        "alpha_min": 60, "alpha_min_fade": 60, "alpha_min_sub": 60,
         "duplicate_fx": 40, "perf_long": 299, "limit_700": 699,
         "preroll_800": 699, "preroll_100": 299}
 
@@ -115,7 +118,7 @@ def cmd_check(label):
             continue
         text = f"{comp}@{frame}: peak {peak}/255 across {count} pixels"
         limited = comp in ("limit_700", "preroll_100")
-        report(None if limited else peak <= 1, text + (" (Alpha 1.0, beyond Max Pre-roll Frames)" if limited else ""))
+        report(None if limited else peak <= 1, text + (" (Alpha Max 1.0, beyond Trail Rebuild Limit)" if limited else ""))
 
     print("A later keyframe edit leaves earlier frames alone:")
     before = [difference(load(label, "keyed", f), load(label, "keyed_edit", f))[0] for f in range(0, 49)]
@@ -123,11 +126,16 @@ def cmd_check(label):
     report(max(before) <= 1, f"frames 0-48 match to within rounding (peak {max(before)})")
     report(min(after) > 0, f"frames 50-95 all differ (smallest peak {min(after)})")
 
-    print("Max Pre-roll Frames sets how far a rebuild reaches:")
+    print("Trail Rebuild Limit sets how far a rebuild reaches:")
     for comp, frame, limit in (("limit_700", 699, 600), ("preroll_800", 699, 800), ("preroll_100", 299, 100)):
         played = (load(label, comp, frame)[..., 3] > 8).sum()
         alone = (load(label, comp + "_cold", frame)[..., 3] > 8).sum()
         report(None, f"{comp}@{frame}, limit {limit}: {played} visible pixels played through, {alone} rendered alone")
+
+    # Not the last frame, which AE's disk cache can serve from the earlier run that rendered it alone.
+    counts = [int((load(label, "preroll_100", f)[..., 3] > 8).sum()) for f in range(299)]
+    worst = min(b / a for a, b in zip(counts, counts[1:]) if a)
+    report(worst > 0.99, f"playing forward, the limit doesn't cut the trail: worst frame-to-frame change x{worst:.3f}")
 
     print("Two layers with identical settings keep their own images:")
     for frame in (30, 71):
@@ -156,6 +164,36 @@ def cmd_check(label):
         report(peak <= 1, f"{text}: peak {peak}/255 across {count} pixels")
     peak, count = difference(load(label, "map_source_default", 71), load(label, "map_solid_opaque", 71))
     report(peak <= 1, f"Source ignores the mask: peak {peak}/255 against an unmasked map")
+
+    print("Map Layer:")
+    # A trail displaced by its own alpha differs from one displaced by the layer's image.
+    peak, count = difference(load(label, "layer_own", 71), load(label, "layer_none", 71))
+    report(peak > 8, f"its own layer reads the layer, None reads the trail: differ by peak {peak}/255 across {count} pixels")
+    peak, _ = difference(load(label, "layer_none", 71), load(label, "neutral_ref", 71))
+    report(peak > 8, f"None still displaces, using the trail: differs from no shift by peak {peak}/255")
+
+    print("A layer with nothing in it:")
+    for comp, last in (("empty_layer", 47), ("empty_mapped", 47)):
+        frames = len(list((OUT / label / comp).glob("f_*.tif")))
+        report(bool(frames == last + 1 and load(label, comp, last)[..., 3].max() == 0),
+               f"{comp}: {frames} of {last + 1} frames rendered, all transparent")
+    # Before the layer empties, soon after, and once the trail has faded.
+    seen = [int((load(label, "empties_midway", f)[..., 3] > 8).sum()) for f in (29, 35, 95)]
+    report(seen[0] > seen[1] > 0 and seen[2] == 0, f"empties_midway: the trail fades after the input stops: {seen} visible pixels")
+
+    print("Alpha Min:")
+    # A pixel the dot has left follows the curve exactly: Max 0.9, Min 0.1.
+    seen = [int(load(label, "alpha_min_fade", f)[180, 320, 3]) for f in range(56, 72)]
+    expected = [seen[0] / 255]
+    for _ in seen[1:]:
+        expected.append(max(min(expected[-1] * 0.81 / 0.8 - 0.09 / 0.8, 1), 0))
+    worst = max(abs(a - b * 255) for a, b in zip(seen, expected))
+    report(worst <= 2 and seen[-1] == 0, f"fades along the curve to nothing: worst {worst:.1f}/255, {seen}")
+    peak, count = difference(load(label, "alpha_min_fade", 95), load(label, "alpha_min_sub", 95))
+    report(None, f"sub-steps against none: peak {peak}/255 across {count} pixels")
+    choked = (load(label, "alpha_min", 95)[..., 3] > 8).sum()
+    loose = (load(label, "alpha_min_ref", 95)[..., 3] > 8).sum()
+    report(bool(0 < choked < loose), f"chokes a blurred trail: {choked} visible pixels against {loose}")
 
 
 def cmd_compare(a, b):

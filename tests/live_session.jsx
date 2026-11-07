@@ -14,14 +14,14 @@
         throw new Error("No comp " + name);
     }
 
-    function queue(c, frame, step, settings) {
+    function queue(c, frame, step, settings, frames) {
         var rq = app.project.renderQueue;
         while (rq.numItems > 0) rq.item(1).remove();
         var item = rq.items.add(c);
         item.applyTemplate("Best Settings");
         if (settings) item.setSettings(settings);
-        item.timeSpanStart = frame / FPS;
-        item.timeSpanDuration = 1 / FPS;
+        item.timeSpanStart = (frame - (frames || 1) + 1) / FPS;
+        item.timeSpanDuration = (frames || 1) / FPS;
         var om = item.outputModule(1);
         om.applyTemplate("TIFF Sequence with Alpha");
         om.file = new File(OUT + "/live/" + step + "/f_[#####].tif");
@@ -57,6 +57,13 @@
     queue(trail, 60, "half", { "Resolution": [2, 2] });
     queue(trail, 60, "full_again");
 
+    // Half resolution with sub-steps, maps and shape layers.
+    var halves = ["shape_trail", "shape_sub", "shape_mapped", "shape_as_map", "screen_sub", "map_solid_opaque", "alpha_min"];
+    for (var h = 0; h < halves.length; h++) queue(comp(halves[h]), 60, "half_" + halves[h], { "Resolution": [2, 2] });
+    queue(comp("shape_trail"), 60, "third_shape_trail", { "Resolution": [3, 3] });
+    // From the start and playing through, so that frames resume from one another.
+    queue(comp("shape_sub"), 60, "half_run_shape_sub", { "Resolution": [2, 2] }, 61);
+
     // Editing a keyframe must change later frames only, right away.
     var keyed = comp("keyed");
     queue(keyed, 70, "keyed_before");
@@ -82,7 +89,7 @@
     // A duplicate keeps the setting of the original.
     queue(masked.duplicate(), 60, "stage_duplicate");
 
-    find(masked.layer("dot").property("Effects").property(1), "Layer").setLayerInputStage(0);
+    find(masked.layer("dot").property("Effects").property(1), "Map Layer (None = Trail)").setLayerInputStage(0);
     queue(masked, 60, "stage_source");
 
     // Saved so that a fresh aerender can show what those last frames should be.

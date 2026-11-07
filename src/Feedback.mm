@@ -30,6 +30,7 @@
 #include "AEConfig.h"
 #include "entry.h"
 #include "AE_Effect.h"
+#include "AE_GeneralPlug.h"
 #include "AE_EffectCB.h"
 #include "AE_EffectCBSuites.h"
 #include "AE_EffectGPUSuites.h"
@@ -47,8 +48,13 @@ enum
 {
     PARAM_INPUT = 0,
     PARAM_COMPOSITE,
-    PARAM_ALPHA,
+    PARAM_ALPHA_START,
+    PARAM_ALPHA_MAX,
+    PARAM_ALPHA_MIN,
+    PARAM_ALPHA_END,
+    PARAM_BLUR_START,
     PARAM_BLUR,
+    PARAM_BLUR_END,
     PARAM_LEVELS_START,
     PARAM_INPUT_BLACK,
     PARAM_INPUT_WHITE,
@@ -62,7 +68,6 @@ enum
     PARAM_LIGHTNESS,
     PARAM_HSL_END,
     PARAM_DISPLACE_START,
-    PARAM_DISPLACE_SOURCE,
     PARAM_DISPLACE_LAYER,
     PARAM_CHANNEL_X,
     PARAM_AMOUNT_X,
@@ -70,23 +75,26 @@ enum
     PARAM_AMOUNT_Y,
     PARAM_DISPLACE_END,
     PARAM_SUBSTEPS,
-    PARAM_MAX_PREROLL,
+    PARAM_MAX_TRAIL,
     PARAM_COUNT
 };
 
-enum
+// Saved projects find each control by this ID, so a control keeps its ID wherever it moves. In the
+// order above. ID 17 belonged to a Source popup, and mustn't be reused.
+const int kDiskIds[PARAM_COUNT] = {0, 1, 27, 2, 26, 28, 29, 3, 30, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25};
+
+int DiskId(int param)
 {
-    SOURCE_SELF = 1,
-    SOURCE_LAYER = 2
-};
+    return kDiskIds[param];
+}
 
 const int kMaxSubsteps = 15;
 
-// A rebuild starts no further back than Max Pre-roll Frames. By default, Alpha 0.99 fades out within
-// it; anything higher loses what's older. Playing forward keeps older trail in the image, but only
-// where it's still on the canvas, which covers just these frames.
-const int kDefaultMaxPreroll = 600;
-const int kLongestMaxPreroll = 100000;
+// Jumping to a frame replays no more than this many frames, so older trail is missing until playback
+// passes through it. Playing forward carries the whole trail along in one image, so this doesn't
+// shorten it. By default, Alpha Max 0.99 fades out within the limit.
+const int kDefaultMaxTrail = 600;
+const int kLongestMaxTrail = 100000;
 
 // Limits on the canvas, at full resolution for the spread and as actual pixels for the side. These
 // only bite on extreme settings, such as large displacement, and trim what lies furthest out.
@@ -147,6 +155,7 @@ struct FrameCheckout
 
 struct PreRenderData
 {
+    bool displaceFromLayer = false;
     CanvasKey canvas;
     PF_LRect outputRect;
     int samplesPerFrame; // the frame's own moment plus any sub-steps
@@ -192,12 +201,13 @@ public:
         A_long downsampleYNum;
         A_u_long downsampleYDen;
         int samplesPerFrame;
+        int variant; // see FindFactsAtReducedResolution
 
         bool operator==(const Key& o) const
         {
             return step == o.step && scale == o.scale && downsampleXNum == o.downsampleXNum &&
                    downsampleXDen == o.downsampleXDen && downsampleYNum == o.downsampleYNum &&
-                   downsampleYDen == o.downsampleYDen && samplesPerFrame == o.samplesPerFrame;
+                   downsampleYDen == o.downsampleYDen && samplesPerFrame == o.samplesPerFrame && variant == o.variant;
         }
     };
 
@@ -329,6 +339,22 @@ inline SampleTime FrameSample(PF_InData* in_data, A_long time)
     return SampleTime{time, in_data->time_step, in_data->time_scale};
 }
 
+// new alpha = Max * clamp((alpha * Max - Min) / (Max - Min), 0, 1), as a slope and offset. Opaque pixels
+// land on Max, and anything that would land below Min after fading goes to nothing. With Min at 0,
+// this is a plain multiply by Max.
+void SetAlphaCurve(float maximum, float minimum, FrameParams* f)
+{
+    const float span = maximum - minimum;
+    f->alphaSlope = span > 1e-5f ? maximum * maximum / span : 0.0f;
+    f->alphaOffset = span > 1e-5f ? -maximum * minimum / span : (minimum > 0.0f ? -1.0f : 0.0f);
+}
+
+// The offset that, with the slope's nth root, gives the same result after n steps.
+float RootOffset(float offset, float slope, float subSlope, float share)
+{
+    return std::abs(slope - 1.0f) < 1e-5f ? offset * share : offset * (subSlope - 1.0f) / (slope - 1.0f);
+}
+
 FrameParams ReadFrameParams(PF_InData* in_data, const SampleTime& time, PF_Err* err)
 {
     ParamReader r{in_data, time};
@@ -336,7 +362,8 @@ FrameParams ReadFrameParams(PF_InData* in_data, const SampleTime& time, PF_Err* 
     f.compositeMode = r.popup(PARAM_COMPOSITE);
     f.inputGain = 1.0f;
     f.frameAlpha = f.stepAlpha = 1.0f;
-    f.alpha = r.slider(PARAM_ALPHA);
+    f.alpha = r.slider(PARAM_ALPHA_MAX);
+    SetAlphaCurve(f.alpha, r.slider(PARAM_ALPHA_MIN), &f);
     f.blurRadius = r.slider(PARAM_BLUR);
     f.inputBlack = r.slider(PARAM_INPUT_BLACK);
     f.inputWhite = r.slider(PARAM_INPUT_WHITE);
@@ -346,7 +373,6 @@ FrameParams ReadFrameParams(PF_InData* in_data, const SampleTime& time, PF_Err* 
     f.hueDegrees = r.angleDegrees(PARAM_HUE);
     f.saturation = r.slider(PARAM_SATURATION) / 100.0f;
     f.lightness = r.slider(PARAM_LIGHTNESS) / 100.0f;
-    f.displaceFromLayer = r.popup(PARAM_DISPLACE_SOURCE) == SOURCE_LAYER;
     f.channelX = r.popup(PARAM_CHANNEL_X);
     f.amountX = r.slider(PARAM_AMOUNT_X);
     f.channelY = r.popup(PARAM_CHANNEL_Y);
@@ -365,6 +391,12 @@ FrameParams DivideIntoSubsteps(FrameParams f, int n)
 
     const float frameAlpha = f.alpha;
     f.alpha = std::pow(f.alpha, share);
+    if (f.alphaSlope > 0.0f)
+    {
+        const float subSlope = std::pow(f.alphaSlope, share);
+        f.alphaOffset = RootOffset(f.alphaOffset, f.alphaSlope, subSlope, share);
+        f.alphaSlope = subSlope;
+    }
     // Blurs add by variance, so n small ones of radius r / sqrt(n) equal one of radius r.
     f.blurRadius *= std::sqrt(share);
     f.amountX *= share;
@@ -378,8 +410,7 @@ FrameParams DivideIntoSubsteps(FrameParams f, int n)
     const float slope = (f.outputWhite - f.outputBlack) / range;
     const float offset = f.outputBlack - slope * f.inputBlack;
     const float subSlope = slope > 0.0f ? std::pow(slope, share) : 1.0f + (slope - 1.0f) * share;
-    const float subOffset =
-        std::abs(slope - 1.0f) < 1e-5f ? offset * share : offset * (subSlope - 1.0f) / (slope - 1.0f);
+    const float subOffset = RootOffset(offset, slope, subSlope, share);
     f.gamma = std::pow(f.gamma, share);
     f.inputBlack = 0.0f;
     f.inputWhite = 1.0f;
@@ -423,25 +454,25 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
     auto slider = [&](const char* name, double min, double max, double sMin, double sMax, double dflt, int prec, int id)
     {
         AEFX_CLR_STRUCT(def);
-        PF_ADD_FLOAT_SLIDERX(name, min, max, sMin, sMax, dflt, prec, PF_ValueDisplayFlag_NONE, 0, id);
+        PF_ADD_FLOAT_SLIDERX(name, min, max, sMin, sMax, dflt, prec, PF_ValueDisplayFlag_NONE, 0, DiskId(id));
         return err;
     };
     auto topic = [&](const char* name, int id)
     {
         AEFX_CLR_STRUCT(def);
-        PF_ADD_TOPIC(name, id);
+        PF_ADD_TOPIC(name, DiskId(id));
         return err;
     };
     auto endTopic = [&](int id)
     {
         AEFX_CLR_STRUCT(def);
-        PF_END_TOPIC(id);
+        PF_END_TOPIC(DiskId(id));
         return err;
     };
     auto popup = [&](const char* name, int choices, int dflt, const char* items, int id)
     {
         AEFX_CLR_STRUCT(def);
-        PF_ADD_POPUP(name, choices, dflt, items, id);
+        PF_ADD_POPUP(name, choices, dflt, items, DiskId(id));
         return err;
     };
     // These describe the whole loop rather than a moment in it, so they can't be keyframed.
@@ -449,13 +480,20 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
     {
         AEFX_CLR_STRUCT(def);
         def.flags = PF_ParamFlag_CANNOT_TIME_VARY;
-        PF_ADD_SLIDER(name, min, max, min, sliderMax, dflt, id);
+        PF_ADD_SLIDER(name, min, max, min, sliderMax, dflt, DiskId(id));
         return err;
     };
 
     popup("Composite", 4, COMPOSITE_INPUT_IN_FRONT, "Input In Front|Input Behind|Add|Screen", PARAM_COMPOSITE);
-    slider("Alpha", 0, 1, 0, 1, 0.85, 3, PARAM_ALPHA);
+
+    topic("Alpha", PARAM_ALPHA_START);
+    slider("Alpha Max", 0, 1, 0, 1, 0.85, 3, PARAM_ALPHA_MAX);
+    slider("Alpha Min", 0, 1, 0, 1, 0, 3, PARAM_ALPHA_MIN);
+    endTopic(PARAM_ALPHA_END);
+
+    topic("Blur", PARAM_BLUR_START);
     slider("Blur Radius", 0, 500, 0, 50, 0, 2, PARAM_BLUR);
+    endTopic(PARAM_BLUR_END);
 
     topic("Levels", PARAM_LEVELS_START);
     slider("Input Black", -1, 2, 0, 1, 0, 3, PARAM_INPUT_BLACK);
@@ -467,15 +505,14 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
 
     topic("HSL", PARAM_HSL_START);
     AEFX_CLR_STRUCT(def);
-    PF_ADD_ANGLE("Hue Shift", 0, PARAM_HUE);
+    PF_ADD_ANGLE("Hue Shift", 0, DiskId(PARAM_HUE));
     slider("Saturation", 0, 400, 0, 200, 100, 1, PARAM_SATURATION);
     slider("Lightness", -100, 100, -10, 10, 0, 2, PARAM_LIGHTNESS);
     endTopic(PARAM_HSL_END);
 
     topic("Displacement", PARAM_DISPLACE_START);
-    popup("Source", 2, SOURCE_SELF, "Self|Layer", PARAM_DISPLACE_SOURCE);
     AEFX_CLR_STRUCT(def);
-    PF_ADD_LAYER("Layer", PF_LayerDefault_NONE, PARAM_DISPLACE_LAYER);
+    PF_ADD_LAYER("Map Layer (None = Trail)", PF_LayerDefault_NONE, DiskId(PARAM_DISPLACE_LAYER));
     popup("Horizontal Channel", 5, MAP_CHANNEL_LUMA, "Red|Green|Blue|Alpha|Luma", PARAM_CHANNEL_X);
     slider("Max Horizontal", -4000, 4000, -100, 100, 0, 2, PARAM_AMOUNT_X);
     popup("Vertical Channel", 5, MAP_CHANNEL_LUMA, "Red|Green|Blue|Alpha|Luma", PARAM_CHANNEL_Y);
@@ -483,7 +520,7 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
     endTopic(PARAM_DISPLACE_END);
 
     fixedInteger("Sub-steps", 0, kMaxSubsteps, kMaxSubsteps, 0, PARAM_SUBSTEPS);
-    fixedInteger("Max Pre-roll Frames", 1, kLongestMaxPreroll, 3000, kDefaultMaxPreroll, PARAM_MAX_PREROLL);
+    fixedInteger("Trail Rebuild Limit (Frames)", 1, kLongestMaxTrail, 3000, kDefaultMaxTrail, PARAM_MAX_TRAIL);
 
     out_data->num_params = PARAM_COUNT;
     return err;
@@ -574,6 +611,8 @@ PF_Err LayerBounds(
     return err;
 }
 
+const A_long kAnyLayer = 1000000;
+
 // Requests pixels that the render can fetch. Nothing renders unless it actually does.
 PF_Err CheckoutWholeLayer(
     PF_InData* in_data,
@@ -581,13 +620,13 @@ PF_Err CheckoutWholeLayer(
     PF_RenderRequest request,
     int param,
     const SampleTime& time,
-    const PF_LRect& bounds,
     A_long id,
     PF_LRect* rect)
 {
     PF_CheckoutResult result;
     AEFX_CLR_STRUCT(result);
-    request.rect = bounds;
+    // Far bigger than any layer, so this is the whole layer whatever its bounds are in this call.
+    request.rect = PF_LRect{-kAnyLayer, -kAnyLayer, kAnyLayer, kAnyLayer};
     PF_Err err = extra->cb->checkout_layer(
         in_data->effect_ref, param, id, &request, time.value, time.step, time.scale, &result);
     *rect = result.result_rect;
@@ -666,21 +705,65 @@ std::shared_ptr<FrameFactsMemo::Run> FindFacts(
 }
 
 // Asks AE about one frame in the history.
+// At reduced resolution, some PreRender calls report a shape layer's bounds at full scale and others
+// scaled, though nothing else about the calls differs. The bounds of the two can't share a memo, so
+// each gets a run of its own, and asking AE about one frame already in a run shows if it's this kind.
+std::shared_ptr<FrameFactsMemo::Run> FindFactsAtReducedResolution(
+    PF_InData* in_data,
+    PF_PreRenderExtra* extra,
+    const PF_RenderRequest& request,
+    const PF_ParamUtilsSuite3& utils,
+    FrameFactsMemo& memo,
+    FrameFactsMemo::Key key,
+    A_long* nextId,
+    PF_Err* err)
+{
+    std::shared_ptr<FrameFactsMemo::Run> run;
+    for (key.variant = 0; key.variant < 2; key.variant++)
+    {
+        run = FindFacts(in_data, utils, memo, key);
+        const SampleFacts* known = nullptr;
+        for (const auto& frame : run->frames)
+        {
+            for (const SampleFacts& sample : frame.second.samples)
+                if (!IsEmpty(sample.inputRect))
+                    known = &sample;
+            if (known)
+                break;
+        }
+        if (!known)
+            return run;
+
+        PF_LRect now{};
+        *err = LayerBounds(in_data, extra, request, PARAM_INPUT, known->time, nextId, &now);
+        if (*err)
+            return run;
+        const PF_LRect& was = known->inputRect;
+        if (now.left == was.left && now.top == was.top && now.right == was.right && now.bottom == was.bottom)
+            return run;
+    }
+    // Neither matches, so the layer has changed in a way the history doesn't show. Start again.
+    run->frames.clear();
+    run->endExclusive = 0;
+    return run;
+}
+
 PF_Err ReadFrameFacts(
     PF_InData* in_data,
     PF_PreRenderExtra* extra,
     const PF_RenderRequest& request,
     A_long time,
     int samplesPerFrame,
+    bool fromLayer,
     A_long* nextId,
     FrameFacts* facts)
 {
     ParamReader r{in_data, FrameSample(in_data, time)};
-    facts->alpha = r.slider(PARAM_ALPHA);
+    facts->alpha = r.slider(PARAM_ALPHA_MAX);
     facts->blurRadius = r.slider(PARAM_BLUR);
     facts->amountX = r.slider(PARAM_AMOUNT_X);
     facts->amountY = r.slider(PARAM_AMOUNT_Y);
-    facts->fromLayer = r.popup(PARAM_DISPLACE_SOURCE) == SOURCE_LAYER;
+    facts->fromLayer = fromLayer;
     PF_Err err = r.err;
 
     for (int before = samplesPerFrame - 1; !err && before >= 0; before--)
@@ -694,6 +777,47 @@ PF_Err ReadFrameFacts(
         facts->samples.push_back(sample);
     }
     return err;
+}
+
+// Whether the Map Layer control has a layer picked. Checking out the layer can't tell None apart from
+// a layer that's empty at the moment, which should shift nothing. If this can't be read, it reports a
+// layer, because a missing map displaces nothing, which is the safer way to be wrong.
+bool MapLayerIsPicked(PF_InData* in_data, PF_OutData* out_data)
+{
+    A_long picked = 1;
+    try
+    {
+        AEFX_SuiteScoper<AEGP_UtilitySuite6> util(in_data, kAEGPUtilitySuite, kAEGPUtilitySuiteVersion6, out_data);
+        AEFX_SuiteScoper<AEGP_PFInterfaceSuite1> face(in_data, kAEGPPFInterfaceSuite, kAEGPPFInterfaceSuiteVersion1, out_data);
+        AEFX_SuiteScoper<AEGP_EffectSuite5> effects(in_data, kAEGPEffectSuite, kAEGPEffectSuiteVersion5, out_data);
+        AEFX_SuiteScoper<AEGP_StreamSuite7> streams(in_data, kAEGPStreamSuite, kAEGPStreamSuiteVersion7, out_data);
+
+        static AEGP_PluginID pluginId = 0;
+        if (!pluginId && util->AEGP_RegisterWithAEGP(nullptr, "Feedback", &pluginId))
+            return true;
+
+        AEGP_EffectRefH effect = nullptr;
+        if (face->AEGP_GetNewEffectForEffect(pluginId, in_data->effect_ref, &effect))
+            return true;
+        AEGP_StreamRefH stream = nullptr;
+        if (!streams->AEGP_GetNewEffectStreamByIndex(pluginId, effect, PARAM_DISPLACE_LAYER, &stream))
+        {
+            AEGP_StreamValue2 value{};
+            A_Time time = {in_data->current_time, static_cast<A_u_long>(in_data->time_scale)};
+            if (!streams->AEGP_GetNewStreamValue(pluginId, stream, AEGP_LTimeMode_CompTime, &time, TRUE, &value))
+            {
+                picked = value.val.layer_id;
+                streams->AEGP_DisposeStreamValue(&value);
+            }
+            streams->AEGP_DisposeStream(stream);
+        }
+        effects->AEGP_DisposeEffect(effect);
+    }
+    catch (...)
+    {
+        return true;
+    }
+    return picked != AEGP_LayerIDVal_NONE;
 }
 
 PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* extra)
@@ -713,26 +837,31 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
         // AE requires this call on every PreRender. With no earlier frames, the zeroed state goes in.
         ReadHistory(in_data, *utils.operator->(), now, &history);
         ERR(extra->cb->GuidMixInPtr(in_data->effect_ref, sizeof(history), &history));
+
+        // AE's disk cache outlives the plugin, so frames saved by a different build mustn't be reused.
+        static const char kBuild[] = __DATE__ " " __TIME__;
+        ERR(extra->cb->GuidMixInPtr(in_data->effect_ref, sizeof(kBuild), kBuild));
     }
 
     PF_RenderRequest request = extra->input->output_request;
     request.channel_mask = PF_ChannelMask_ARGB;
 
     int samplesPerFrame = 1;
-    int maxPreroll = kDefaultMaxPreroll;
+    int maxTrail = kDefaultMaxTrail;
     {
         ParamReader r{in_data, FrameSample(in_data, now)};
         samplesPerFrame = r.integer(PARAM_SUBSTEPS) + 1;
-        maxPreroll = r.integer(PARAM_MAX_PREROLL);
+        maxTrail = r.integer(PARAM_MAX_TRAIL);
         ERR(r.err);
     }
 
     const float scaleX = float(in_data->downsample_x.num) / float(std::max<A_long>(in_data->downsample_x.den, 1));
     const float scaleY = float(in_data->downsample_y.num) / float(std::max<A_long>(in_data->downsample_y.den, 1));
-    const A_long frameLimit = step > 0 ? std::min<A_long>(maxPreroll, std::max<A_long>(now / step, 0)) : 0;
+    const A_long framesBefore = step > 0 ? std::max<A_long>(now / step, 0) : 0;
 
     auto data = std::make_unique<PreRenderData>();
     data->samplesPerFrame = samplesPerFrame;
+    data->displaceFromLayer = MapLayerIsPicked(in_data, out_data);
     data->resumeK = -1;
 
     AEFX_SuiteScoper<PF_ParamUtilsSuite3> utils(in_data, kPFParamUtilsSuite, kPFParamUtilsSuiteVersion3, out_data);
@@ -741,21 +870,25 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
     // Without a GPU there's nothing to remember facts in, or to resume from.
     FrameFactsMemo localMemo;
     FrameFactsMemo& memo = metal ? metal->memo : localMemo;
-    const FrameFactsMemo::Key factsKey{
+    FrameFactsMemo::Key factsKey{
         step,
         static_cast<A_u_long>(in_data->time_scale),
         in_data->downsample_x.num,
         static_cast<A_u_long>(in_data->downsample_x.den),
         in_data->downsample_y.num,
         static_cast<A_u_long>(in_data->downsample_y.den),
-        samplesPerFrame};
+        samplesPerFrame,
+        0};
+    A_long nextId = 0;
     std::shared_ptr<FrameFactsMemo::Run> run;
-    if (!err)
+    if (!err && (in_data->downsample_x.den > 1 || in_data->downsample_y.den > 1))
+        run = FindFactsAtReducedResolution(in_data, extra, request, *utils.operator->(), memo, factsKey, &nextId, &err);
+    else if (!err)
         run = FindFacts(in_data, *utils.operator->(), memo, factsKey);
 
     // Walk back until earlier frames have faded to nothing or the layer begins. The canvas is
-    // whatever this reaches: each input's bounds, plus how far later frames can have spread it.
-    A_long nextId = 0;
+    // whatever this reaches: each input's bounds, plus how far later frames can have spread it. It
+    // goes past the rebuild limit, because playing forward can still be carrying what's older.
     int framesRead = 0;
     std::vector<const FrameFacts*> window;
     bool hasArea = false;
@@ -773,17 +906,18 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
         if (found == run->frames.end())
         {
             FrameFacts read{};
-            ERR(ReadFrameFacts(in_data, extra, request, time, samplesPerFrame, &nextId, &read));
+            ERR(ReadFrameFacts(in_data, extra, request, time, samplesPerFrame, data->displaceFromLayer, &nextId, &read));
             if (err)
                 break;
             found = run->frames.emplace(time, std::move(read)).first;
             framesRead++;
         }
         const FrameFacts& facts = found->second;
-        window.push_back(&facts);
+        if (k <= maxTrail)
+            window.push_back(&facts);
 
         remaining *= facts.alpha;
-        oldest = remaining < kInvisibleContribution || k >= frameLimit;
+        oldest = remaining < kInvisibleContribution || k >= framesBefore;
 
         // The oldest frame in the window starts from blank, so only its final moment is used.
         const size_t firstSample = oldest ? facts.samples.size() - 1 : 0;
@@ -901,11 +1035,14 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             SubstepCheckout sub{};
             sub.time = sample.time;
             sub.hasInput = !IsEmpty(sample.inputRect);
-            if (sub.hasInput)
+            // AE only hands out the output after an input has been checked out, so the current
+            // frame's always is, even when the layer is empty.
+            const bool isCurrent = k == 0 && i + 1 == facts.samples.size();
+            if (sub.hasInput || isCurrent)
             {
                 sub.inputId = nextId++;
                 ERR(CheckoutWholeLayer(
-                    in_data, extra, request, PARAM_INPUT, sample.time, sample.inputRect, sub.inputId, &sub.inputRect));
+                    in_data, extra, request, PARAM_INPUT, sample.time, sub.inputId, &sub.inputRect));
                 sub.hasInput = !IsEmpty(sub.inputRect);
             }
             sub.hasMap = !err && facts.fromLayer && !IsEmpty(sample.mapRect);
@@ -913,7 +1050,7 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             {
                 sub.mapId = nextId++;
                 ERR(CheckoutWholeLayer(
-                    in_data, extra, request, PARAM_DISPLACE_LAYER, sample.time, sample.mapRect, sub.mapId, &sub.mapRect));
+                    in_data, extra, request, PARAM_DISPLACE_LAYER, sample.time, sub.mapId, &sub.mapRect));
                 sub.hasMap = !IsEmpty(sub.mapRect);
             }
             frame.substeps.push_back(sub);
@@ -1003,13 +1140,13 @@ PF_Err RenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* 
 
     @autoreleasepool
     {
-        // AE only hands out the output after an input has been checked out.
+        // AE only hands out the output after an input has been checked out, even an empty one.
         const SubstepCheckout& currentSub = data->frames[0].substeps.back();
-        PF_EffectWorld* currentInput = nullptr;
+        PF_EffectWorld* currentWorld = nullptr;
         PF_EffectWorld* output = nullptr;
-        if (currentSub.hasInput)
-            ERR(extra->cb->checkout_layer_pixels(in_data->effect_ref, currentSub.inputId, &currentInput));
+        ERR(extra->cb->checkout_layer_pixels(in_data->effect_ref, currentSub.inputId, &currentWorld));
         ERR(extra->cb->checkout_output(in_data->effect_ref, &output));
+        PF_EffectWorld* currentInput = currentSub.hasInput ? currentWorld : nullptr;
 
         // Newest usable starting point within the window.
         id<MTLBuffer> image = nil;
@@ -1062,7 +1199,10 @@ PF_Err RenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* 
 
                 FrameParams params{};
                 if (!err)
+                {
                     params = DivideIntoSubsteps(ReadFrameParams(in_data, sub.time, &err), data->samplesPerFrame);
+                    params.displaceFromLayer = data->displaceFromLayer;
+                }
 
                 auto fetchStart = std::chrono::steady_clock::now();
                 PF_EffectWorld* inputWorld = isCurrentSample ? currentInput : nullptr;
@@ -1162,8 +1302,7 @@ PF_Err RenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* 
 
         if (imageIsScratch)
             cache.releaseScratch(image);
-        if (currentInput)
-            extra->cb->checkin_layer_pixels(in_data->effect_ref, currentSub.inputId);
+        extra->cb->checkin_layer_pixels(in_data->effect_ref, currentSub.inputId);
     }
 
     Log("frame=%d window=%d computed=%d samples=%d prev=%d fetched=%d fetchMs=%.1f gpuMs=%.1f %dx%d out=%dx%d "
@@ -1247,7 +1386,10 @@ extern "C" DllExport PF_Err EffectMain(
         switch (cmd)
         {
         case PF_Cmd_ABOUT:
-            PF_SPRINTF(out_data->return_msg, "Feedback 1.0\rFeeds a processed copy of the output into each frame.");
+            PF_SPRINTF(out_data->return_msg,
+                       "Feedback 1.0\rFeeds a processed copy of the output into each frame.\r\r"
+                       "Trail Rebuild Limit: how many frames are recalculated when you jump to a frame. "
+                       "Playing forward keeps the full trail. Raise it if a trail looks shorter after jumping.");
             break;
         case PF_Cmd_GLOBAL_SETUP:
             err = GlobalSetup(out_data);

@@ -186,7 +186,12 @@ kernel void grade(
         c = float4(rgb.bgr * a, a);
     }
 
-    dst[xy.y * p.dstPitch + xy.x] = sanitize(c * p.alpha);
+    // With no offset this is a plain multiply, which also keeps colour held at zero alpha, as in Add.
+    float gain = p.alphaSlope;
+    if (p.alphaOffset != 0.0f)
+        gain = c.w > 1e-5f ? saturate(c.w * p.alphaSlope + p.alphaOffset) / c.w : 0.0f;
+
+    dst[xy.y * p.dstPitch + xy.x] = sanitize(c * gain);
 }
 
 // Combines this frame's input with the processed feedback image.

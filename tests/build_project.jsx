@@ -70,20 +70,20 @@
     }
 
     function build() {
-        dotComp("trail", 96, { "Alpha": 0.85 });
-        dotComp("behind", 96, { "Alpha": 0.85, "Composite": 2 });
-        dotComp("screen_sub", 96, { "Alpha": 0.9, "Composite": 4, "Sub-steps": 3 });
-        dotComp("add_sub", 96, { "Alpha": 0.8, "Composite": 3, "Sub-steps": 1 });
+        dotComp("trail", 96, { "Alpha Max": 0.85 });
+        dotComp("behind", 96, { "Alpha Max": 0.85, "Composite": 2 });
+        dotComp("screen_sub", 96, { "Alpha Max": 0.9, "Composite": 4, "Sub-steps": 3 });
+        dotComp("add_sub", 96, { "Alpha Max": 0.8, "Composite": 3, "Sub-steps": 1 });
         dotComp("grade_blur", 96, {
-            "Alpha": 0.9, "Blur Radius": 4, "Hue Shift": 12, "Saturation": 90, "Gamma": 1.1, "Lightness": 1
+            "Alpha Max": 0.9, "Blur Radius": 4, "Hue Shift": 12, "Saturation": 90, "Gamma": 1.1, "Lightness": 1
         });
-        dotComp("self_disp", 96, { "Alpha": 0.9, "Max Horizontal": 12, "Max Vertical": -8 });
+        dotComp("self_disp", 96, { "Alpha Max": 0.9, "Max Horizontal": 12, "Max Vertical": -8 });
 
         // Keyframes: `keyed` and `keyed_edit` agree up to frame 48 and differ after it.
         var keyed = dotComp("keyed", 96, {});
         var keyedEdit = dotComp("keyed_edit", 96, {});
-        var alphaA = find(keyed.fx, "Alpha"), blurA = find(keyed.fx, "Blur Radius");
-        var alphaB = find(keyedEdit.fx, "Alpha"), blurB = find(keyedEdit.fx, "Blur Radius");
+        var alphaA = find(keyed.fx, "Alpha Max"), blurA = find(keyed.fx, "Blur Radius");
+        var alphaB = find(keyedEdit.fx, "Alpha Max"), blurB = find(keyedEdit.fx, "Blur Radius");
         var t = 48 / FPS;
         alphaA.setValueAtTime(0, 0.7); alphaA.setValueAtTime(t, 0.9);
         alphaB.setValueAtTime(0, 0.7); alphaB.setValueAtTime(t, 0.9);
@@ -96,23 +96,23 @@
         var right = movingDot(two, "blue", BLUE, 320, H, [60, 60], [260, 300], 25);
         left.property("Position").setValue([160, H / 2]);
         right.property("Position").setValue([480, H / 2]);
-        feedback(left, { "Alpha": 0.9 });
-        feedback(right, { "Alpha": 0.9 });
+        feedback(left, { "Alpha Max": 0.9 });
+        feedback(right, { "Alpha Max": 0.9 });
 
         // The same layer's effect twice over.
-        var dup = dotComp("duplicate_fx", 72, { "Alpha": 0.8 });
-        feedback(dup.layer, { "Alpha": 0.8, "Hue Shift": 90 });
+        var dup = dotComp("duplicate_fx", 72, { "Alpha Max": 0.8 });
+        feedback(dup.layer, { "Alpha Max": 0.8, "Hue Shift": 90 });
 
         // Displacement: each of these should match `neutral_ref`.
-        dotComp("neutral_ref", 72, { "Alpha": 0.9 });
+        dotComp("neutral_ref", 72, { "Alpha Max": 0.9 });
         function mapped(name, makeMap, channel) {
             var d = dotComp(name, 72, {
-                "Alpha": 0.9, "Source": 2, "Max Horizontal": 100, "Max Vertical": 100,
+                "Alpha Max": 0.9, "Max Horizontal": 100, "Max Vertical": 100,
                 "Horizontal Channel": channel, "Vertical Channel": channel
             });
             var map = makeMap(d.comp);
             map.enabled = false;
-            find(d.fx, "Layer").setValue(map.index);
+            find(d.fx, "Map Layer (None = Trail)").setValue(map.index);
         }
         function greySolid(comp) { return comp.layers.addSolid(GREY, "map", W, H, 1, comp.duration); }
         function greySolidRed(comp) { return comp.layers.addSolid(RED, "map", W, H, 1, comp.duration); }
@@ -139,7 +139,7 @@
             return s;
         }
         function setStage(name, stage) {
-            find(comp(name).layer("dot").property("Effects").property(1), "Layer").setLayerInputStage(stage);
+            find(comp(name).layer("dot").property("Effects").property(1), "Map Layer (None = Trail)").setLayerInputStage(stage);
         }
         mapped("map_solid_opaque", greySolidRed, 4);
         mapped("map_source_default", maskedSolid, 4); // left at Source, which ignores the mask
@@ -155,10 +155,71 @@
         // Long trails, for PreRender cost and the 600-frame limit.
         var perf = newComp("perf_long", 300, 1920, 1080);
         var perfLayer = movingDot(perf, "dot", RED, 1920, 1080, [100, 100], [1800, 980], 60);
-        feedback(perfLayer, { "Alpha": 0.98, "Sub-steps": 2 });
-        dotComp("limit_700", 700, { "Alpha": 1 });
-        dotComp("preroll_800", 700, { "Alpha": 1, "Max Pre-roll Frames": 800 });
-        dotComp("preroll_100", 300, { "Alpha": 1, "Max Pre-roll Frames": 100 });
+        feedback(perfLayer, { "Alpha Max": 0.98, "Sub-steps": 2 });
+        dotComp("limit_700", 700, { "Alpha Max": 1 });
+        dotComp("preroll_800", 700, { "Alpha Max": 1, "Trail Rebuild Limit (Frames)": 800 });
+        dotComp("preroll_100", 300, { "Alpha Max": 1, "Trail Rebuild Limit (Frames)": 100 });
+
+        // Alpha Min: on its own, against the same blur without it, and split into sub-steps.
+        dotComp("alpha_min", 96, { "Alpha Max": 1, "Alpha Min": 0.2, "Blur Radius": 3 });
+        dotComp("alpha_min_ref", 96, { "Alpha Max": 1, "Blur Radius": 3 });
+        dotComp("alpha_min_fade", 96, { "Alpha Max": 0.9, "Alpha Min": 0.1 });
+        dotComp("alpha_min_sub", 96, { "Alpha Max": 0.9, "Alpha Min": 0.1, "Sub-steps": 3 });
+
+        // A layer with nothing in it, alone and with a map; and one that empties part way through,
+        // which should leave its trail to fade. Its mask moves off the layer at frame 30.
+        function emptyLayer(name, settings) {
+            var c = newComp(name, 48);
+            var shape = c.layers.addShape();
+            return { comp: c, fx: feedback(shape, settings) };
+        }
+        emptyLayer("empty_layer", { "Alpha Max": 0.9 });
+        var emptyMapped = emptyLayer("empty_mapped", { "Alpha Max": 0.9, "Max Horizontal": 20 });
+        var emptyMap = emptyMapped.comp.layers.addSolid(RED, "map", W, H, 1, emptyMapped.comp.duration);
+        emptyMap.enabled = false;
+        find(emptyMapped.fx, "Map Layer (None = Trail)").setValue(emptyMap.index);
+        var emptying = dotComp("empties_midway", 96, { "Alpha Max": 0.9 });
+        var emptyingShape = emptying.layer.Masks.property(1).property("maskShape");
+        emptyingShape.removeKey(2);
+        emptyingShape.setValueAtTime(29 / FPS, dot(200, 180, 30));
+        emptyingShape.setValueAtTime(30 / FPS, dot(-5000, -5000, 30));
+        emptyingShape.setInterpolationTypeAtKey(2, KeyframeInterpolationType.HOLD);
+
+        // Map Layer pointed at the effect's own layer reads that layer, rather than the trail.
+        var own = dotComp("layer_own", 72, { "Alpha Max": 0.9, "Max Horizontal": 100, "Horizontal Channel": 4 });
+        find(own.fx, "Map Layer (None = Trail)").setValue(own.layer.index);
+        dotComp("layer_none", 72, { "Alpha Max": 0.9, "Max Horizontal": 100, "Horizontal Channel": 4 });
+
+        // Shape layers rasterise continuously, unlike the solids above: a moving ellipse, alone,
+        // with sub-steps, and with a map. Each is also rendered at half resolution in live_session.
+        function shapeComp(name, settings, withMap) {
+            var c = newComp(name, 96);
+            var layer = c.layers.addShape();
+            var group = layer.property("Contents").addProperty("ADBE Vector Group");
+            group.property("Contents").addProperty("ADBE Vector Shape - Ellipse").property("Size").setValue([60, 60]);
+            group.property("Contents").addProperty("ADBE Vector Graphic - Fill").property("Color").setValue(RED);
+            var position = layer.property("Position");
+            position.setValueAtTime(0, ACROSS[0]);
+            position.setValueAtTime(c.duration, ACROSS[1]);
+            var fx = feedback(layer, settings);
+            if (withMap) {
+                var map = c.layers.addSolid([0.8, 0.2, 0.5], "map", W, H, 1, c.duration);
+                map.enabled = false;
+                find(fx, "Map Layer (None = Trail)").setValue(map.index);
+            }
+        }
+        shapeComp("shape_trail", { "Alpha Max": 0.9 });
+        shapeComp("shape_sub", { "Alpha Max": 0.9, "Sub-steps": 2 });
+        // A shape layer as the map instead, on a solid.
+        var shapeMap = dotComp("shape_as_map", 96, { "Alpha Max": 0.9, "Max Horizontal": 30, "Horizontal Channel": 4 });
+        var mapShape = shapeMap.comp.layers.addShape();
+        var mapGroup = mapShape.property("Contents").addProperty("ADBE Vector Group");
+        mapGroup.property("Contents").addProperty("ADBE Vector Shape - Ellipse").property("Size").setValue([400, 400]);
+        mapGroup.property("Contents").addProperty("ADBE Vector Graphic - Fill").property("Color").setValue(RED);
+        mapShape.property("Position").setValue([W / 2, H / 2]);
+        mapShape.enabled = false;
+        find(shapeMap.fx, "Map Layer (None = Trail)").setValue(mapShape.index);
+        shapeComp("shape_mapped", { "Alpha Max": 0.9, "Sub-steps": 2, "Max Horizontal": 6, "Max Vertical": 6, "Horizontal Channel": 1, "Vertical Channel": 2 }, true);
     }
 
     app.beginSuppressDialogs();
