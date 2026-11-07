@@ -8,7 +8,7 @@
 
 struct FrameParams
 {
-    float alpha; // the fade alone, which the input's strength in Add is worked out from
+    float alpha; // the fade alone
     float alphaSlope, alphaOffset; // the whole alpha curve: slope * alpha + offset
     float blurRadius; // full-resolution pixels
     float inputBlack, inputWhite, gamma, outputBlack, outputWhite;
@@ -17,9 +17,8 @@ struct FrameParams
     int channelX, channelY;
     float amountX, amountY; // full-resolution pixels
     int compositeMode;
-    float inputGain; // how much of the input one iteration adds
-    int screenGain; // in Screen, derive the input's strength from the two alphas below
-    float frameAlpha;
+    int splitsInput; // Add and Screen with sub-steps: each adds only its share of the input
+    float frameAlpha; // the fades that share is worked out from, per frame and per sub-step
     float stepAlpha;
 };
 
@@ -39,6 +38,16 @@ struct PlacedImage
     int width, height;
 };
 
+// Steps queued up to run together, as waiting for the GPU after each one wastes time. A step's buffers
+// come back to this rather than the shared pool until the batch has run: another instance of the effect
+// can run while a batch is open, and must not write over what the batch has still to read.
+struct StepBatch
+{
+    id<MTLCommandQueue> queue;
+    id<MTLCommandBuffer> commands;
+    std::vector<id<MTLBuffer>> freeBuffers;
+};
+
 class FeedbackRenderer
 {
 public:
@@ -46,15 +55,18 @@ public:
 
     FeedbackCache& cache() { return *mCache; }
 
-    // Returns a new image from the scratch pool, or nil if the GPU work failed.
-    // A nil prev starts the loop from transparent black.
+    // Queues one step, and returns the image it will produce. A nil prev starts the loop from transparent
+    // black. Nothing here can be read outside the batch until it has been flushed.
     id<MTLBuffer> step(
-        id<MTLCommandQueue> queue,
+        StepBatch& batch,
         const CanvasKey& canvas,
         id<MTLBuffer> prev,
         const PlacedImage& input,
         const PlacedImage& map,
         const FrameParams& params);
+
+    // Runs what's queued and waits for it. Returns false if the GPU work failed.
+    bool flush(StepBatch& batch);
 
     // Each returns a new image from the scratch pool, or nil if the GPU work failed.
     // reframe moves an image onto another canvas; compositeInput lays the input over an image.
@@ -82,9 +94,12 @@ private:
         const CanvasKey& canvas,
         float sigmaX,
         float sigmaY,
+        StepBatch& batch,
         std::vector<id<MTLBuffer>>& scratch);
 
-    id<MTLComputePipelineState> mDisplace, mBlurDown, mBlurAxis, mBlurUp, mGrade, mComposite, mReframe, mCopyOut;
+    id<MTLBuffer> acquireForBatch(StepBatch& batch, size_t bytes);
+
+    id<MTLComputePipelineState> mDisplace, mBlurDown, mBlurAxis, mBlurUp, mGradeAndComposite, mComposite, mReframe, mCopyOut;
     id<MTLBuffer> mEmpty; // bound wherever a kernel's optional buffer is absent
     std::unique_ptr<FeedbackCache> mCache;
 };

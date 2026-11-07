@@ -84,7 +84,6 @@ CompositeParams MakeCompositeParams(const CanvasKey& canvas, const PlacedImage& 
     p.prevPitch = canvas.width;
     p.dstPitch = canvas.width;
     p.mode = mode;
-    p.inputGain = 1.0f;
     p.inputPitch = input.pitch;
     p.inputOffsetX = input.offsetX;
     p.inputOffsetY = input.offsetY;
@@ -108,11 +107,11 @@ std::unique_ptr<FeedbackRenderer> FeedbackRenderer::create(id<MTLDevice> device,
     r->mBlurDown = pipeline(@"blurDown");
     r->mBlurAxis = pipeline(@"blurAxis");
     r->mBlurUp = pipeline(@"blurUp");
-    r->mGrade = pipeline(@"grade");
+    r->mGradeAndComposite = pipeline(@"gradeAndComposite");
     r->mComposite = pipeline(@"composite");
     r->mReframe = pipeline(@"reframe");
     r->mCopyOut = pipeline(@"copyOut");
-    if (!r->mDisplace || !r->mBlurDown || !r->mBlurAxis || !r->mBlurUp || !r->mGrade || !r->mComposite ||
+    if (!r->mDisplace || !r->mBlurDown || !r->mBlurAxis || !r->mBlurUp || !r->mGradeAndComposite || !r->mComposite ||
         !r->mReframe || !r->mCopyOut)
         return nullptr;
 
@@ -121,17 +120,46 @@ std::unique_ptr<FeedbackRenderer> FeedbackRenderer::create(id<MTLDevice> device,
     return r;
 }
 
+id<MTLBuffer> FeedbackRenderer::acquireForBatch(StepBatch& batch, size_t bytes)
+{
+    for (auto it = batch.freeBuffers.begin(); it != batch.freeBuffers.end(); ++it)
+    {
+        if ((*it).length >= bytes && (*it).length <= bytes * 2)
+        {
+            id<MTLBuffer> buffer = *it;
+            batch.freeBuffers.erase(it);
+            return buffer;
+        }
+    }
+    return mCache->acquireScratch(bytes);
+}
+
+bool FeedbackRenderer::flush(StepBatch& batch)
+{
+    bool ok = true;
+    if (batch.commands)
+    {
+        ok = Succeeded(batch.commands);
+        batch.commands = nil;
+    }
+    for (id<MTLBuffer> buffer : batch.freeBuffers)
+        mCache->releaseScratch(buffer);
+    batch.freeBuffers.clear();
+    return ok;
+}
+
 id<MTLBuffer> FeedbackRenderer::encodeBlur(
     id<MTLComputeCommandEncoder> encoder,
     id<MTLBuffer> source,
     const CanvasKey& canvas,
     float sigmaX,
     float sigmaY,
+    StepBatch& batch,
     std::vector<id<MTLBuffer>>& scratch)
 {
     auto acquire = [&](size_t bytes)
     {
-        id<MTLBuffer> buffer = mCache->acquireScratch(bytes);
+        id<MTLBuffer> buffer = acquireForBatch(batch, bytes);
         scratch.push_back(buffer);
         return buffer;
     };
@@ -191,7 +219,7 @@ id<MTLBuffer> FeedbackRenderer::encodeBlur(
 }
 
 id<MTLBuffer> FeedbackRenderer::step(
-    id<MTLCommandQueue> queue,
+    StepBatch& batch,
     const CanvasKey& canvas,
     id<MTLBuffer> prev,
     const PlacedImage& input,
@@ -206,13 +234,15 @@ id<MTLBuffer> FeedbackRenderer::step(
     std::vector<id<MTLBuffer>> scratch;
     auto acquire = [&]
     {
-        id<MTLBuffer> buffer = mCache->acquireScratch(canvas.bytes());
+        id<MTLBuffer> buffer = acquireForBatch(batch, canvas.bytes());
         scratch.push_back(buffer);
         return buffer;
     };
-    id<MTLBuffer> result = mCache->acquireScratch(canvas.bytes());
+    id<MTLBuffer> result = acquireForBatch(batch, canvas.bytes());
 
-    id<MTLCommandBuffer> commands = [queue commandBuffer];
+    if (!batch.commands)
+        batch.commands = [batch.queue commandBuffer];
+    id<MTLCommandBuffer> commands = batch.commands;
     id<MTLBuffer> current = prev;
 
     if (!current)
@@ -266,10 +296,12 @@ id<MTLBuffer> FeedbackRenderer::step(
     const float sigmaX = BlurSigma(f.blurRadius) * scaleX;
     const float sigmaY = BlurSigma(f.blurRadius) * scaleY;
     if (std::max(sigmaX, sigmaY) >= kMinSigma)
-        current = encodeBlur(encoder, current, canvas, sigmaX, sigmaY, scratch);
+        current = encodeBlur(encoder, current, canvas, sigmaX, sigmaY, batch, scratch);
 
-    // Levels, HSL, Alpha. Neutral settings skip the maths, so they're exactly a no-op.
-    GradeParams grade{};
+    // Levels, HSL and Alpha, then composite with this frame's input. Neutral settings skip the maths,
+    // so they're exactly a no-op.
+    StepParams last{};
+    GradeParams& grade = last.grade;
     grade.srcPitch = width;
     grade.dstPitch = width;
     grade.applyLevels = !(f.inputBlack == 0.0f && f.inputWhite == 1.0f && f.gamma == 1.0f &&
@@ -285,33 +317,15 @@ id<MTLBuffer> FeedbackRenderer::step(
     grade.lightness = f.lightness;
     grade.alphaSlope = f.alphaSlope;
     grade.alphaOffset = f.alphaOffset;
-    {
-        id<MTLBuffer> next = acquire();
-        Encode(encoder, mGrade, {current, next}, grade, width, height);
-        current = next;
-    }
-
-    // Composite with this frame's input.
-    {
-        CompositeParams p = MakeCompositeParams(canvas, input, f.compositeMode);
-        p.inputGain = f.inputGain;
-        p.screenGain = f.screenGain;
-        p.frameAlpha = f.frameAlpha;
-        p.stepAlpha = f.stepAlpha;
-        Encode(encoder, mComposite, {current, input.buffer ? input.buffer : mEmpty, result}, p, width, height);
-    }
+    last.composite = MakeCompositeParams(canvas, input, f.compositeMode);
+    last.composite.splitsInput = f.splitsInput;
+    last.composite.frameAlpha = f.frameAlpha;
+    last.composite.stepAlpha = f.stepAlpha;
+    Encode(encoder, mGradeAndComposite, {current, input.buffer ? input.buffer : mEmpty, result}, last, width, height);
 
     [encoder endEncoding];
-    bool ok = Succeeded(commands);
 
-    for (id<MTLBuffer> buffer : scratch)
-        mCache->releaseScratch(buffer);
-
-    if (!ok)
-    {
-        mCache->releaseScratch(result);
-        return nil;
-    }
+    batch.freeBuffers.insert(batch.freeBuffers.end(), scratch.begin(), scratch.end());
     return result;
 }
 

@@ -29,13 +29,15 @@ COMPS = ["trail", "behind", "screen_sub", "add_sub", "grade_blur", "self_disp", 
          "two_layers", "duplicate_fx", "neutral_ref", "neutral_luma", "neutral_red", "neutral_alpha_transparent",
          "neutral_alpha_half", "map_solid_opaque", "map_source_default", "map_solid_masked", "map_effects",
          "empty_layer", "empty_mapped", "layer_own", "layer_none",
-         "perf_long", "limit_600", "limit_800", "limit_100"]
+         "perf_long", "limit_600", "limit_800", "limit_100",
+         "trim_48", "trim_48_plain", "trim_24", "trim_24_plain", "trim_start", "trim_start_plain",
+         "trim_stretch", "trim_stretch_plain"]
 NEUTRAL = ["neutral_ref", "neutral_luma", "neutral_red", "neutral_alpha_transparent", "neutral_alpha_half"]
 # Rendered again alone in a new process: a full rebuild, with nothing cached.
 COLD = {"trail": 60, "behind": 60, "screen_sub": 60, "add_sub": 60, "grade_blur": 60, "self_disp": 60, "keyed": 70,
         "alpha_min": 60, "alpha_min_fade": 60, "alpha_min_sub": 60,
         "duplicate_fx": 40, "perf_long": 299, "limit_600": 699,
-        "limit_800": 699, "limit_100": 299}
+        "limit_800": 699, "limit_100": 299, "trim_48": 60, "trim_start": 60, "trim_stretch": 60}
 
 
 def render(project, comp, folder, start=None, end=None):
@@ -62,6 +64,8 @@ def cmd_render(label):
     timing = {}
     for comp in COMPS:
         timing[comp] = render("feedback_16.aep", comp, base / comp)
+    for comp in ("software_trail", "software_plain"):
+        timing[comp] = render("feedback_software.aep", comp, base / comp, 0, 23)
     for depth in (8, 32):
         for comp in NEUTRAL:
             timing[f"{comp}_{depth}"] = render(f"feedback_{depth}.aep", comp, base / f"{comp}_{depth}")
@@ -177,6 +181,19 @@ def cmd_check(label):
     report(peak > 8, f"its own layer reads the layer, None reads the trail: differ by peak {peak}/255 across {count} pixels")
     peak, _ = difference(load(label, "layer_none", 71), load(label, "neutral_ref", 71))
     report(peak > 8, f"None still displaces, using the trail: differs from no shift by peak {peak}/255")
+
+    print("Without a GPU:")
+    peak, count = difference(load(label, "software_trail", 23), load(label, "software_plain", 23))
+    report(peak <= 1, f"the layer passes through with no trail: peak {peak}/255 across {count} pixels")
+
+    print("A trimmed layer's trail starts at its in-point:")
+    for comp, first in (("trim_48", 48), ("trim_24", 24), ("trim_start", 48), ("trim_stretch", 48)):
+        peak, count = difference(load(label, comp, first), load(label, comp + "_plain", first))
+        report(peak <= 1, f"{comp}@{first} shows only the layer: peak {peak}/255 across {count} pixels")
+        later, plain = visible(load(label, comp, first + 6)), visible(load(label, comp + "_plain", first + 6))
+        report(later > plain, f"{comp}@{first + 6} has a trail: {later} visible pixels against {plain} for the layer")
+    short, whole = visible(load(label, "trim_48", 52)), visible(load(label, "trail", 52))
+    report(short < whole, f"4 frames in, the trail is shorter than an untrimmed one: {short} visible pixels against {whole}")
 
     print("A layer with nothing in it:")
     for comp, last in (("empty_layer", 47), ("empty_mapped", 47)):

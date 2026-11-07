@@ -66,6 +66,15 @@ def main(label):
     check("Source@60 ignores the mask", live("stage_source", 60), ref("map_solid_opaque", 60))
     check("a duplicate keeps Effects & Masks@60", live("stage_duplicate", 60), ref("neutral_ref", 60))
 
+    print("Changing Map Layer during the session:")
+    check("None before picking@60", live("pick_none_before", 60), ref("layer_none", 60))
+    check("its own layer@60", live("pick_own", 60), ref("layer_own", 60))
+    check("None again@60", live("pick_none_after", 60), ref("layer_none", 60))
+
+    print("Moving a layer's in-point during the session:")
+    check("before the move@60", live("trim_before", 60), ref("trim_48", 60))
+    check("after the move@60", live("trim_after", 60), ref("trim_24", 60))
+
     print("A project saved by an earlier version of the effect:")
     render("old_project.aep", "trail", OUT / label / "old_project", 0, 60)
     check("opens and renders the same@60", ref("old_project", 60), ref("trail", 60))

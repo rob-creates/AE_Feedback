@@ -21,21 +21,23 @@ inline float ScaleValue(const PF_RationalScale& r)
     return float(r.num) / float(std::max<A_u_long>(r.den, 1));
 }
 
-// Where an image sits, and at what resolution. Canvases follow the trail, so consecutive frames
-// usually differ in position; only images of the same resolution can be used together.
+// Where an image sits, at what resolution, and when its trail began. Canvases follow the trail, so
+// consecutive frames usually differ in position; only images that otherwise match can be used together.
 struct CanvasKey
 {
     A_long left, top, width, height;
     PF_RationalScale downsampleX, downsampleY;
+    A_long firstTime;
 
-    bool sameResolution(const CanvasKey& o) const
+    bool compatible(const CanvasKey& o) const
     {
-        return SameScale(downsampleX, o.downsampleX) && SameScale(downsampleY, o.downsampleY);
+        return SameScale(downsampleX, o.downsampleX) && SameScale(downsampleY, o.downsampleY) &&
+               firstTime == o.firstTime;
     }
 
     bool operator==(const CanvasKey& o) const
     {
-        return left == o.left && top == o.top && width == o.width && height == o.height && sameResolution(o);
+        return left == o.left && top == o.top && width == o.width && height == o.height && compatible(o);
     }
 
     size_t bytes() const { return size_t(width) * size_t(height) * 16; }

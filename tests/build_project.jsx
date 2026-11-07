@@ -61,8 +61,24 @@
         return { comp: comp, layer: layer, fx: feedback(layer, settings) };
     }
 
+    // A dot trimmed to begin at `inFrame`, with or without the effect, beside the same thing bare.
+    function trimComps(name, inFrame, startFrame, stretch) {
+        for (var bare = 0; bare < 2; bare++) {
+            var comp = newComp(name + (bare ? "_plain" : ""), 96);
+            var layer = movingDot(comp, "dot", RED, W, H, ACROSS[0], ACROSS[1], 30);
+            layer.stretch = stretch;
+            layer.startTime = startFrame / FPS;
+            layer.inPoint = inFrame / FPS;
+            if (!bare) feedback(layer, { "Alpha Max": 0.85 });
+        }
+    }
+
     function build() {
         dotComp("trail", 96, { "Alpha Max": 0.85 });
+        trimComps("trim_48", 48, 0, 100);
+        trimComps("trim_24", 24, 0, 100);
+        trimComps("trim_start", 48, 24, 100);
+        trimComps("trim_stretch", 48, 0, 200);
         dotComp("behind", 96, { "Alpha Max": 0.85, "Composite": 2 });
         dotComp("screen_sub", 96, { "Alpha Max": 0.9, "Composite": 4, "Sub-steps": 3 });
         dotComp("add_sub", 96, { "Alpha Max": 0.8, "Composite": 3, "Sub-steps": 1 });
@@ -210,7 +226,19 @@
         shapeComp("shape_mapped", { "Alpha Max": 0.9, "Sub-steps": 2, "Max Horizontal": 6, "Max Vertical": 6, "Horizontal Channel": 1, "Vertical Channel": 2 }, true);
     }
 
+    // Without a GPU, the layer passes through with no trail at all.
+    function buildSoftware() {
+        app.newProject();
+        app.project.bitsPerChannel = 16;
+        app.project.gpuAccelType = GpuAccelType.SOFTWARE;
+        dotComp("software_trail", 24, { "Alpha Max": 0.9 });
+        var plain = newComp("software_plain", 24);
+        movingDot(plain, "dot", RED, W, H, ACROSS[0], ACROSS[1], 30);
+        app.project.save(new File(OUT + "/feedback_software.aep"));
+    }
+
     app.beginSuppressDialogs();
+    buildSoftware();
     var results = [];
     var depths = [16, 8, 32];
     for (var i = 0; i < depths.length; i++) {

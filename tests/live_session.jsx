@@ -73,6 +73,21 @@
     find(masked.layer("dot").property("Effects").property(1), MAP_LAYER).setLayerInputStage(0);
     queue(masked, 60, "stage_source");
 
+    // Picking and clearing Map Layer must take effect right away, using bounds it hadn't read before.
+    var pick = comp("layer_none");
+    var pickFx = pick.layer("dot").property("Effects").property(1);
+    queue(pick, 60, "pick_none_before");
+    find(pickFx, MAP_LAYER).setValue(pick.layer("dot").index);
+    queue(pick, 60, "pick_own");
+    find(pickFx, MAP_LAYER).setValue(0);
+    queue(pick, 60, "pick_none_after");
+
+    // Moving an in-point changes every frame after it, though nothing in the layer's history did.
+    var trimmed = comp("trim_48");
+    queue(trimmed, 60, "trim_before");
+    trimmed.layer("dot").inPoint = 24 / FPS;
+    queue(trimmed, 60, "trim_after");
+
     // Saved so that a fresh aerender can show what those last frames should be.
     app.project.save(new File(OUT + "/feedback_live_edited.aep"));
     app.endSuppressDialogs(false);

@@ -156,15 +156,11 @@ kernel void blurUp(
     dst[xy.y * p.dstPitch + xy.x] = bilinearClamped(src, p.srcPitch, p.srcWidth, p.srcHeight, pos);
 }
 
-// Levels, then HSL, then Alpha.
-kernel void grade(
-    device const float4* src [[buffer(0)]],
-    device float4* dst [[buffer(1)]],
-    constant GradeParams& p [[buffer(2)]],
-    uint2 xy [[thread_position_in_grid]])
+namespace
 {
-    float4 c = src[xy.y * p.srcPitch + xy.x];
-
+// Levels, then HSL, then Alpha.
+inline float4 applyGrade(float4 c, constant GradeParams& p)
+{
     if ((p.applyLevels != 0 || p.applyHSL != 0) && c.w > 1e-5f)
     {
         float a = c.w;
@@ -197,37 +193,35 @@ kernel void grade(
     if (p.alphaOffset != 0.0f)
         gain = c.w > 1e-5f ? saturate(c.w * p.alphaSlope + p.alphaOffset) / c.w : 0.0f;
 
-    dst[xy.y * p.dstPitch + xy.x] = sanitize(c * gain);
+    return sanitize(c * gain);
+}
+
+// In Add and Screen, the input builds up with every sub-step rather than replacing what's there. This
+// is the strength at which still content settles where one step per frame would settle, before the
+// current frame is laid over the top. A and a are the fades per frame and per sub-step.
+inline float4 inputShare(float4 i, constant CompositeParams& p)
+{
+    const float A = p.frameAlpha, a = p.stepAlpha;
+    if (p.mode == COMPOSITE_ADD)
+        return i * A * (1.0f - a) / (1.0f - A);
+    float4 c = saturate(i);
+    float4 settled = A * c / max(1.0f - A + A * c, 1e-5f);
+    return settled * (1.0f - a) / max(1.0f - a * settled, 1e-5f);
 }
 
 // Combines this frame's input with the processed feedback image.
-kernel void composite(
-    device const float4* prev [[buffer(0)]],
-    device const float4* input [[buffer(1)]],
-    device float4* dst [[buffer(2)]],
-    constant CompositeParams& p [[buffer(3)]],
-    uint2 xy [[thread_position_in_grid]])
+inline float4 applyComposite(float4 f, device const float4* input, int2 xy, constant CompositeParams& p)
 {
-    float4 f = prev[xy.y * p.prevPitch + xy.x];
     float4 i = float4(0.0);
-    int2 m = int2(xy) - int2(p.inputOffsetX, p.inputOffsetY);
+    int2 m = xy - int2(p.inputOffsetX, p.inputOffsetY);
     if (m.x >= 0 && m.y >= 0 && m.x < p.inputWidth && m.y < p.inputHeight)
     {
         // A straight pixel can hold any colour where it's transparent, and that must not show.
         i = input[m.y * p.inputPitch + m.x];
         i.xyz *= i.w;
-        i *= p.inputGain;
     }
-
-    // Screen builds up non-linearly, so each sub-step's strength depends on the input's value. This
-    // is the strength at which still content settles where one step per frame would settle, before
-    // the current frame is laid over the top: settled = c / (1 - A + A c), feedback = A * settled.
-    if (p.screenGain != 0)
-    {
-        float4 c = saturate(i);
-        float4 feedback = p.frameAlpha * c / max(1.0f - p.frameAlpha + p.frameAlpha * c, 1e-5f);
-        i = feedback * (1.0f - p.stepAlpha) / max(1.0f - p.stepAlpha * feedback, 1e-5f);
-    }
+    if (p.splitsInput != 0)
+        i = inputShare(i, p);
 
     float4 out;
     switch (p.mode)
@@ -237,7 +231,31 @@ kernel void composite(
     case COMPOSITE_SCREEN: out = f + i - f * i; break;
     default: out = i + f * (1.0f - i.w); break;
     }
-    dst[xy.y * p.dstPitch + xy.x] = sanitize(out);
+    return sanitize(out);
+}
+} // namespace
+
+// The end of one step: grades the feedback image and combines it with the input, in one pass.
+kernel void gradeAndComposite(
+    device const float4* src [[buffer(0)]],
+    device const float4* input [[buffer(1)]],
+    device float4* dst [[buffer(2)]],
+    constant StepParams& p [[buffer(3)]],
+    uint2 xy [[thread_position_in_grid]])
+{
+    const float4 graded = applyGrade(src[xy.y * p.grade.srcPitch + xy.x], p.grade);
+    dst[xy.y * p.composite.dstPitch + xy.x] = applyComposite(graded, input, int2(xy), p.composite);
+}
+
+// Lays the input over an image, with no grading.
+kernel void composite(
+    device const float4* prev [[buffer(0)]],
+    device const float4* input [[buffer(1)]],
+    device float4* dst [[buffer(2)]],
+    constant CompositeParams& p [[buffer(3)]],
+    uint2 xy [[thread_position_in_grid]])
+{
+    dst[xy.y * p.dstPitch + xy.x] = applyComposite(prev[xy.y * p.prevPitch + xy.x], input, int2(xy), p);
 }
 
 // Moves an image onto a differently placed canvas; anything newly in view is transparent.

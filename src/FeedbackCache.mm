@@ -20,7 +20,7 @@ std::vector<FeedbackCache::Candidate> FeedbackCache::candidates(const CanvasKey&
     std::lock_guard<std::mutex> lock(mMutex);
     std::vector<Candidate> out;
     for (const Entry& e : mEntries)
-        if (e.time == time && e.key.sameResolution(key))
+        if (e.time == time && e.key.compatible(key))
             out.push_back({e.key, e.history, e.buffer});
     return out;
 }

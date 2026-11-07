@@ -91,10 +91,15 @@ struct CompositeParams
     int inputWidth;
     int inputHeight;
     int mode;
-    float inputGain;
-    int screenGain; // derive the input's strength per channel from the two alphas below
+    int splitsInput; // Add and Screen with sub-steps: each adds only its share of the input
     float frameAlpha;
     float stepAlpha;
+};
+
+struct StepParams
+{
+    GradeParams grade;
+    CompositeParams composite;
 };
 
 struct ReframeParams
