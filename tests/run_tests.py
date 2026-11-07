@@ -28,7 +28,7 @@ COMPS = ["trail", "behind", "screen_sub", "add_sub", "grade_blur", "self_disp", 
          "shape_trail", "shape_sub", "shape_mapped", "shape_as_map",
          "two_layers", "duplicate_fx", "neutral_ref", "neutral_luma", "neutral_red", "neutral_alpha_transparent",
          "neutral_alpha_half", "map_solid_opaque", "map_source_default", "map_solid_masked", "map_effects",
-         "empty_layer", "empty_mapped", "layer_own", "layer_none",
+         "empty_layer", "empty_mapped", "layer_own", "layer_none", "layer_own_effects",
          "perf_long", "limit_600", "limit_800", "limit_100",
          "trim_48", "trim_48_plain", "trim_24", "trim_24_plain", "trim_start", "trim_start_plain",
          "trim_stretch", "trim_stretch_plain"]
@@ -181,6 +181,8 @@ def cmd_check(label):
     report(peak > 8, f"its own layer reads the layer, None reads the trail: differ by peak {peak}/255 across {count} pixels")
     peak, _ = difference(load(label, "layer_none", 71), load(label, "neutral_ref", 71))
     report(peak > 8, f"None still displaces, using the trail: differs from no shift by peak {peak}/255")
+    peak, count = difference(load(label, "layer_own_effects", 71), load(label, "layer_none", 71))
+    report(peak <= 1, f"its own layer with Effects & Masks uses the trail, as None: peak {peak}/255 across {count} pixels")
 
     print("Without a GPU:")
     peak, count = difference(load(label, "software_trail", 23), load(label, "software_plain", 23))

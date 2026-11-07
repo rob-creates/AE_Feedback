@@ -786,18 +786,25 @@ PF_Err ReadFrameFacts(
     return err;
 }
 
-// Whether the Map Layer control has a layer picked. Checking out the layer can't tell None apart from
-// a layer that's empty at the moment, which should shift nothing. If this can't be read, it reports a
-// layer, because a missing map displaces nothing, which is the safer way to be wrong.
-bool MapLayerIsPicked(PF_InData* in_data, PF_OutData* out_data)
+// Whether displacement reads Map Layer rather than the trail. Checking out the layer can't tell None
+// apart from a layer that's empty at the moment, which should shift nothing. If this can't be read, it
+// reports a layer, because a missing map displaces nothing, which is the safer way to be wrong.
+//
+// This effect's own layer with Effects & Masks also means the trail: that's the layer as this effect
+// leaves it. AE can't render that for the effect itself, as it would loop, so it would otherwise
+// hand over the layer with its masks alone.
+bool MapReadsLayer(PF_InData* in_data, PF_OutData* out_data)
 {
     A_long picked = 1;
+    AEGP_LayerParamStage stage = AEGP_LayerParamStage_SOURCE;
+    AEGP_LayerIDVal own = AEGP_LayerIDVal_NONE;
     try
     {
         AEFX_SuiteScoper<AEGP_UtilitySuite6> util(in_data, kAEGPUtilitySuite, kAEGPUtilitySuiteVersion6, out_data);
         AEFX_SuiteScoper<AEGP_PFInterfaceSuite1> face(in_data, kAEGPPFInterfaceSuite, kAEGPPFInterfaceSuiteVersion1, out_data);
         AEFX_SuiteScoper<AEGP_EffectSuite5> effects(in_data, kAEGPEffectSuite, kAEGPEffectSuiteVersion5, out_data);
         AEFX_SuiteScoper<AEGP_StreamSuite7> streams(in_data, kAEGPStreamSuite, kAEGPStreamSuiteVersion7, out_data);
+        AEFX_SuiteScoper<AEGP_LayerSuite9> layers(in_data, kAEGPLayerSuite, kAEGPLayerSuiteVersion9, out_data);
 
         static const AEGP_PluginID pluginId = [&]
         {
@@ -821,15 +828,21 @@ bool MapLayerIsPicked(PF_InData* in_data, PF_OutData* out_data)
                 picked = value.val.layer_id;
                 streams->AEGP_DisposeStreamValue(&value);
             }
+            streams->AEGP_GetStreamLayerParamStageValue(pluginId, stream, &stage);
             streams->AEGP_DisposeStream(stream);
         }
         effects->AEGP_DisposeEffect(effect);
+
+        AEGP_LayerH layer = nullptr;
+        if (!face->AEGP_GetEffectLayer(in_data->effect_ref, &layer) && layer)
+            layers->AEGP_GetLayerID(layer, &own);
     }
     catch (...)
     {
         return true;
     }
-    return picked != AEGP_LayerIDVal_NONE;
+    const bool self = own != AEGP_LayerIDVal_NONE && picked == own && stage == AEGP_LayerParamStage_ALL_EFFECTS;
+    return picked != AEGP_LayerIDVal_NONE && !self;
 }
 
 // The layer's first frame, which is where its trail begins, however much of the layer lies before it.
@@ -1090,7 +1103,7 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             rebuildLimit = r.integer(PARAM_REBUILD_LIMIT);
             ERR(r.err);
         }
-        data->displaceFromLayer = MapLayerIsPicked(in_data, out_data);
+        data->displaceFromLayer = MapReadsLayer(in_data, out_data);
 
         const FrameFactsMemo::Key factsKey{
             step,

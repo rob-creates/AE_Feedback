@@ -197,6 +197,10 @@
         var own = dotComp("layer_own", 72, { "Alpha Max": 0.9, "Max Horizontal": 100, "Horizontal Channel": 4 });
         useMap(own.fx, own.layer);
         dotComp("layer_none", 72, { "Alpha Max": 0.9, "Max Horizontal": 100, "Horizontal Channel": 4 });
+        // Its own layer with Effects & Masks is the layer as the effect leaves it: the trail, as None.
+        var ownAll = dotComp("layer_own_effects", 72, { "Alpha Max": 0.9, "Max Horizontal": 100, "Horizontal Channel": 4 });
+        useMap(ownAll.fx, ownAll.layer);
+        find(ownAll.fx, MAP_LAYER).setLayerInputStage(-1);
 
         // Shape layers rasterise continuously, unlike the solids above: a moving ellipse, alone,
         // with sub-steps, and with a map. Each is also rendered at half resolution in live_session.
