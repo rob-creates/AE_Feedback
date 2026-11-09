@@ -1,6 +1,6 @@
 // Renders frames out of order within one After Effects session, editing the project part way
 // through, so the effect's caches are in play. live_check.py compares the results with aerender's.
-// Output folders tests/out/live/<step> must already exist; run with a project closed or empty.
+// Writes to tests/out/live/<step>; run with a project closed or empty.
 #include "common.jsx"
 
 (function () {
@@ -17,6 +17,8 @@
         item.timeSpanDuration = (frames || 1) / FPS;
         var om = item.outputModule(1);
         om.applyTemplate("TIFF Sequence with Alpha");
+        var folder = new Folder(OUT + "/live/" + step);
+        if (!folder.exists) folder.create();
         om.file = new File(OUT + "/live/" + step + "/f_[#####].tif");
         rq.render();
     }
@@ -42,6 +44,10 @@
     var halves = ["shape_trail", "shape_sub", "shape_mapped", "shape_as_map", "screen_sub", "map_solid_opaque", "alpha_min"];
     for (var h = 0; h < halves.length; h++) queue(comp(halves[h]), 60, "half_" + halves[h], { "Resolution": [2, 2] });
     queue(comp("shape_trail"), 60, "third_shape_trail", { "Resolution": [3, 3] });
+    // Transform's centre, offset and moves at half resolution.
+    queue(comp("transform_rotate"), 12, "half_transform_rotate", { "Resolution": [2, 2] });
+    queue(comp("transform_position"), 11, "half_transform_position", { "Resolution": [2, 2] });
+    queue(comp("transform_scale"), 11, "half_transform_scale", { "Resolution": [2, 2] });
     // From the start and playing through, so that frames resume from one another.
     queue(comp("shape_sub"), 60, "half_run_shape_sub", { "Resolution": [2, 2] }, 61);
 

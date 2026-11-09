@@ -1,0 +1,72 @@
+#!/bin/zsh
+# Runs the whole suite: builds, rebuilds the test projects and the live session in After Effects,
+# renders everything with aerender, and checks it.  run_all.sh LABEL [BASELINE]
+# Needs After Effects closed, and a build configured with -DFEEDBACK_LOG=ON. With a BASELINE label,
+# also lists the frames that moved most since that run.
+set -u
+LABEL=$1
+BASE=${2:-}
+APP="Adobe After Effects 2026"
+HERE=${0:A:h}
+ROOT=${HERE:h}
+LOG=~/Library/Logs/AEFeedback.log
+
+pgrep -x "After Effects" >/dev/null && { echo "After Effects is open: close it first"; exit 3; }
+grep -q "FEEDBACK_LOG:BOOL=ON" "$ROOT/Build/CMakeCache.txt" || { echo "Configure with -DFEEDBACK_LOG=ON first"; exit 3; }
+cmake --build "$ROOT/Build" -j8 2>&1 | grep -E "error|Built target"
+
+cd "$HERE"
+: > $LOG
+rm -rf out/live "out/$LABEL"
+mkdir -p out/live
+
+# Each script in a fresh After Effects, which is then quit.
+open -a "$APP"
+# Scripting works once a script can write a file. After Effects's reply can't be relied on: it can come
+# back as 0 even when the script ran.
+marker="$HERE/out/.scripting_ready"
+rm -f "$marker"
+for i in {1..60}; do
+    sleep 5
+    osascript -e "with timeout of 5 seconds" -e "tell application \"$APP\" to DoScript \"var f = new File('$marker'); f.open('w'); f.write('ready'); f.close();\"" -e "end timeout" >/dev/null 2>&1
+    [ -f "$marker" ] && break
+done
+[ -f "$marker" ] || { echo "After Effects can't run scripts: quit and reopen it, then try again"; exit 4; }
+rm -f "$marker"
+for script in build_project.jsx live_session.jsx; do
+    reply=$(osascript -e "with timeout of 900 seconds" -e "tell application \"$APP\" to DoScriptFile \"$HERE/$script\"" -e "end timeout" 2>&1)
+    echo "$script: exit $? ${reply:0:200}"
+done
+osascript -e "with timeout of 60 seconds" -e "tell application \"$APP\" to DoScript \"app.quit()\"" -e "end timeout" >/dev/null
+for i in {1..24}; do pgrep -x "After Effects" >/dev/null || break; sleep 5; done
+pgrep -x "After Effects" >/dev/null && { echo "After Effects would not quit"; exit 4; }
+
+caffeinate -i python3 run_tests.py render "$LABEL" | grep -E "exit [1-9]|Error|Traceback"
+python3 run_tests.py check "$LABEL" | grep -E "^FAIL|failed|passed|Traceback|Error"
+python3 live_check.py "$LABEL" | grep -E "^FAIL|failed|passed|Traceback|Error"
+echo "render errors: $(grep -E '^frame=.*err=[1-9]' $LOG | grep -vc 'err=517'), CPU renders: $(grep -c 'CPU render' $LOG)"
+
+if [ -n "$BASE" ]; then
+    python3 - "$BASE" "$LABEL" <<'PY'
+import sys
+import numpy as np
+from run_tests import read_tiff, OUT
+a, b = sys.argv[1:3]
+worst, n = [], 0
+for folder in sorted((OUT / b).iterdir()):
+    if not folder.is_dir() or not (OUT / a / folder.name).is_dir():
+        continue
+    peak, where = 0, ""
+    for t in folder.glob("f_*.tif"):
+        other = OUT / a / folder.name / t.name
+        if other.exists():
+            n += 1
+            d = int(np.abs(read_tiff(t) - read_tiff(other)).max())
+            if d > peak:
+                peak, where = d, t.name
+    worst.append((peak, folder.name, where))
+worst.sort(reverse=True)
+print(f"{a} against {b}: {n} frames, largest differences {worst[:6]}")
+PY
+fi
+rm -rf __pycache__

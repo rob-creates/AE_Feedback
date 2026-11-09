@@ -18,3 +18,13 @@ Requires macOS on Apple silicon, Xcode and CMake.
    ```sh
    scripts/install.sh
    ```
+
+## Testing
+
+With After Effects closed, and the build configured with `-DFEEDBACK_LOG=ON`:
+
+```sh
+tests/run_all.sh LABEL [BASELINE]
+```
+
+This rebuilds the test projects and runs a live session in After Effects, renders everything with `aerender` into `tests/out/LABEL`, and checks the results. With a `BASELINE` label, it also lists the frames that changed most since that run.

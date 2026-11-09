@@ -79,6 +79,49 @@ inline float3 hslToRgb(float3 hsl)
     float3 k = fmod(float3(0.0, 8.0, 4.0) + hsl.x * 12.0f, 12.0f);
     return hsl.z - a * max(float3(-1.0), min(min(k - 3.0f, 9.0f - k), float3(1.0)));
 }
+
+// One straight colour channel set blended onto another, as a layer above with that mode.
+inline float3 blendColours(float3 bottom, float3 top, int mode)
+{
+    switch (mode)
+    {
+    case COMPOSITE_MULTIPLY: return bottom * top;
+    case COMPOSITE_LIGHTEN: return max(bottom, top);
+    case COMPOSITE_DARKEN: return min(bottom, top);
+    case COMPOSITE_OVERLAY:
+        return select(1.0f - 2.0f * (1.0f - bottom) * (1.0f - top), 2.0f * bottom * top, bottom <= 0.5f);
+    case COMPOSITE_ADD_SUBTRACT: return bottom + 2.0f * top - 1.0f;
+    case COMPOSITE_DIFFERENCE: return abs(bottom - top);
+    default: return top;
+    }
+}
+
+// Puts `top` over `bottom`, both premultiplied. The blend modes follow the usual layer rule: the mode
+// applies where both are present, and elsewhere each shows as itself.
+inline float4 blendImages(float4 bottom, float4 top, int mode)
+{
+    switch (mode)
+    {
+    case COMPOSITE_INPUT_IN_FRONT: return top + bottom * (1.0f - top.w);
+    case COMPOSITE_INPUT_BEHIND: return bottom + top * (1.0f - bottom.w);
+    case COMPOSITE_ADD: return bottom + top;
+    case COMPOSITE_SCREEN: return bottom + top - bottom * top;
+    default:
+    {
+        const float b = bottom.w, t = top.w;
+        const float3 mixed = blendColours(unpremultiply(bottom), unpremultiply(top), mode);
+        return float4((1.0f - t) * bottom.xyz + (1.0f - b) * top.xyz + t * b * mixed, t + b - t * b);
+    }
+    }
+}
+
+// Transparent beyond the image, rather than repeating its edge.
+inline float4 sampleOrClear(device const float4* src, int pitch, int w, int h, float2 pos)
+{
+    if (pos.x > -1.0f && pos.y > -1.0f && pos.x < float(w) && pos.y < float(h))
+        return bilinearClamped(src, pitch, w, h, pos);
+    return float4(0.0);
+}
 } // namespace
 
 kernel void displace(
@@ -98,12 +141,46 @@ kernel void displace(
             mapShift(v, p.channelX, p.mapIsStraight != 0) * p.amountX,
             mapShift(v, p.channelY, p.mapIsStraight != 0) * p.amountY);
     }
-    float2 pos = float2(canvas) + shift;
-    float4 out = float4(0.0);
-    // Anything displaced in from beyond the layer is transparent.
-    if (pos.x > -1.0f && pos.y > -1.0f && pos.x < float(p.width) && pos.y < float(p.height))
-        out = bilinearClamped(src, p.srcPitch, p.width, p.height, pos);
-    dst[xy.y * p.dstPitch + xy.x] = out;
+    // Displacement says where each pixel comes from, and Transform where that was before it moved.
+    const float2 shifted = float2(canvas) + shift;
+    const float2 pos = float2(
+        p.inverse[0] * shifted.x + p.inverse[1] * shifted.y + p.offsetX,
+        p.inverse[2] * shifted.x + p.inverse[3] * shifted.y + p.offsetY);
+    // Anything brought in from beyond the canvas is transparent.
+    dst[xy.y * p.dstPitch + xy.x] = sampleOrClear(src, p.srcPitch, p.width, p.height, pos);
+}
+
+// Finds edges with a Sobel filter whose taps are `distance` apart, and puts them over the image.
+// A sharp step gives an edge of 1 at Strength 1, however far apart the taps are.
+kernel void edge(
+    device const float4* src [[buffer(0)]],
+    device float4* dst [[buffer(1)]],
+    constant EdgeParams& p [[buffer(2)]],
+    uint2 xy [[thread_position_in_grid]])
+{
+    const float2 c = float2(xy);
+    const float2 d = float2(p.distanceX, p.distanceY);
+#define AT(dx, dy) sampleOrClear(src, p.srcPitch, p.width, p.height, c + float2(dx, dy) * d)
+    const float4 nw = AT(-1, -1), n = AT(0, -1), ne = AT(1, -1);
+    const float4 w = AT(-1, 0), e = AT(1, 0);
+    const float4 sw = AT(-1, 1), s = AT(0, 1), se = AT(1, 1);
+#undef AT
+    const float4 gx = ((ne + 2.0f * e + se) - (nw + 2.0f * w + sw)) * 0.25f;
+    const float4 gy = ((sw + 2.0f * s + se) - (nw + 2.0f * n + ne)) * 0.25f;
+
+    float4 edges;
+    if (p.type == EDGE_LUMINANCE)
+    {
+        const float g = length(float2(luma(gx.xyz), luma(gy.xyz))) * p.strength;
+        edges = float4(float3(g), saturate(g));
+    }
+    else
+    {
+        const float4 g = sqrt(gx * gx + gy * gy) * p.strength;
+        edges = float4(g.xyz, saturate(max(g.w, max3(g.x, g.y, g.z))));
+    }
+    const float4 image = src[xy.y * p.srcPitch + xy.x];
+    dst[xy.y * p.dstPitch + xy.x] = sanitize(blendImages(image, edges, p.blend));
 }
 
 // Box-averages factor x factor blocks, keeping large blurs cheap.
@@ -196,13 +273,15 @@ inline float4 applyGrade(float4 c, constant GradeParams& p)
     return sanitize(c * gain);
 }
 
-// In Add and Screen, the input builds up with every sub-step rather than replacing what's there. This
+// Apart from In Front and Behind, the input builds up with every sub-step rather than replacing what's there. This
 // is the strength at which still content settles where one step per frame would settle, before the
 // current frame is laid over the top. A and a are the fades per frame and per sub-step.
 inline float4 inputShare(float4 i, constant CompositeParams& p)
 {
     const float A = p.frameAlpha, a = p.stepAlpha;
-    if (p.mode == COMPOSITE_ADD)
+    // Add's share, which as an opacity also serves the blend modes: exactly for Add/Subtract, and
+    // within a few percent for the rest.
+    if (p.mode != COMPOSITE_SCREEN)
         return i * A * (1.0f - a) / (1.0f - A);
     float4 c = saturate(i);
     float4 settled = A * c / max(1.0f - A + A * c, 1e-5f);
@@ -223,15 +302,7 @@ inline float4 applyComposite(float4 f, device const float4* input, int2 xy, cons
     if (p.splitsInput != 0)
         i = inputShare(i, p);
 
-    float4 out;
-    switch (p.mode)
-    {
-    case COMPOSITE_INPUT_BEHIND: out = f + i * (1.0f - f.w); break;
-    case COMPOSITE_ADD: out = f + i; break;
-    case COMPOSITE_SCREEN: out = f + i - f * i; break;
-    default: out = i + f * (1.0f - i.w); break;
-    }
-    return sanitize(out);
+    return sanitize(blendImages(f, i, p.mode));
 }
 } // namespace
 

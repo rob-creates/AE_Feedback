@@ -8,6 +8,7 @@
 
 Needs numpy, and a plugin built with -DFEEDBACK_LOG=ON for the log-based results.
 """
+import colorsys
 import json
 import os
 import re
@@ -33,13 +34,18 @@ COMPS = ["trail", "behind", "screen_sub", "add_sub", "grade_blur", "self_disp", 
          "empty_layer", "empty_mapped", "layer_own", "layer_none", "layer_own_effects",
          "perf_long", "limit_600", "limit_800", "limit_100",
          "trim_48", "trim_48_plain", "trim_24", "trim_24_plain", "trim_start", "trim_start_plain",
-         "trim_stretch", "trim_stretch_plain"]
+         "trim_stretch", "trim_stretch_plain",
+         *[f"blend_{m}{v}" for m in ("multiply", "lighten", "darken", "overlay", "add_subtract", "difference")
+           for v in ("", "_sub", "_fade")],
+         "transform_position", "transform_scale", "transform_scale_xy", "transform_rotate", "transform_sub",
+         "edge_luminance", "edge_colour", "edge_trail"]
 NEUTRAL = ["neutral_ref", "neutral_luma", "neutral_red", "neutral_alpha_transparent", "neutral_alpha_half"]
 # Rendered again alone in a new process: a full rebuild, with nothing cached.
 COLD = {"trail": 60, "behind": 60, "screen_sub": 60, "add_sub": 60, "grade_blur": 60, "self_disp": 60, "keyed": 70,
         "alpha_min": 60, "alpha_min_fade": 60, "alpha_min_sub": 60,
         "duplicate_fx": 40, "perf_long": 299, "limit_600": 699,
-        "limit_800": 699, "limit_100": 299, "trim_48": 60, "trim_start": 60, "trim_stretch": 60}
+        "limit_800": 699, "limit_100": 299, "trim_48": 60, "trim_start": 60, "trim_stretch": 60,
+        "blend_difference": 3, "blend_overlay_sub": 29, "transform_rotate": 12, "transform_sub": 60, "edge_trail": 60}
 DEEP = 3999  # deep_alpha1's last frame
 
 
@@ -120,6 +126,7 @@ RESULTS = []
 
 
 def report(ok, text):
+    ok = None if ok is None else bool(ok)  # numpy's own booleans aren't True or False
     RESULTS.append(ok)
     print(("PASS  " if ok is True else "FAIL  " if ok is False else "INFO  ") + text)
 
@@ -141,7 +148,7 @@ def cmd_check(label):
             report(None, text + " (fed by another trail, so a rebuild drops a sliver of the oldest tail)")
         else:
             # Add sums the same steps in another order, which can round a pixel the other way.
-            report(peak <= (2 if comp == "add_sub" else 1), text)
+            report(peak <= {"add_sub": 2}.get(comp, 1), text)
 
     print("A later keyframe edit leaves earlier frames alone:")
     before = [difference(load(label, "keyed", f), load(label, "keyed_edit", f))[0] for f in range(0, 49)]
@@ -228,11 +235,86 @@ def cmd_check(label):
 
     print("Inverted Levels, with and without sub-steps:")
     centre = lambda comp, f: load(label, comp, f)[170:190, 310:330, :3].reshape(-1, 3).mean(axis=0)
-    # Dividing an inverted Levels into sub-steps used to flatten the trail to grey.
-    for f in (60, 61):
-        whole, split = centre("levels_inverted", f), centre("levels_inverted_sub", f)
-        report(bool(np.abs(whole - split).max() < 25 and abs(split[0] - split[1]) > 100),
-               f"frame {f}: centre RGB {whole.round(0)} without, {split.round(0)} with")
+    # Worked out step by step: the trail inverted once a frame, faded, and laid over the dot. Sub-steps
+    # split the fade and the dot between them. Dividing the inversion itself used to flatten it to grey.
+    dot = np.array([1, 0.1, 0.1, 1.0])  # premultiplied RGBA
+    for comp, n in (("levels_inverted", 1), ("levels_inverted_sub", 2)):
+        trail = dot.copy()
+        for f in range(1, 62):
+            for step in range(n):
+                if step == n - 1:
+                    trail[:3] = (1 - np.maximum(trail[:3] / trail[3], 0)) * trail[3]
+                trail = trail * 0.9 ** (1 / n)
+                trail = trail + dot * (1 - trail[3])
+            if f in (60, 61):
+                want = np.clip(trail[:3] / trail[3], 0, 1) * 255
+                seen = centre(comp, f)
+                report(np.abs(seen - want).max() <= 2, f"{comp}@{f}: centre RGB {seen.round(0)}, expected {want.round(0)}")
+
+    print("Blend modes: the dot over its trail, the dot's hue turned half way:")
+    dot = np.array([0.8, 0.4, 0.2])
+    h, l, sat = colorsys.rgb_to_hls(*dot)
+    trail = np.array(colorsys.hls_to_rgb((h + 0.5) % 1, l, sat))
+    def blend_colours(bottom, top, mode):
+        return {"multiply": bottom * top, "lighten": np.maximum(bottom, top), "darken": np.minimum(bottom, top),
+                "overlay": np.where(bottom <= 0.5, 2 * bottom * top, 1 - 2 * (1 - bottom) * (1 - top)),
+                "add_subtract": bottom + 2 * top - 1, "difference": np.abs(bottom - top)}[mode]
+    expected = {mode: blend_colours(trail, dot, mode)
+                for mode in ("multiply", "lighten", "darken", "overlay", "add_subtract", "difference")}
+    for mode, want in expected.items():
+        want = np.clip(want, 0, 1) * 255
+        seen = load(label, "blend_" + mode, 1)[180, 320, :3]
+        report(np.abs(seen - want).max() <= 2, f"{mode}: centre RGB {seen}, expected {want.round(0)}")
+
+    # The dot over its own trail, worked out step by step. With sub-steps, each takes a share of the dot
+    # and the current frame goes over the top whole. At full strength each time, the look would build
+    # up with the count: up to 94/255 apart in a simulation, against about 2 with shares.
+    print("Blend modes keep their look with sub-steps:")
+    def blended(mode, n, alpha=0.9, frames=30):
+        def over(bottom, top, share=1.0):
+            top = top * share
+            b, t = bottom[3], top[3]
+            straight = lambda c: c[:3] / c[3] if c[3] > 1e-5 else np.zeros(3)
+            rgb = (1 - t) * bottom[:3] + (1 - b) * top[:3] + t * b * blend_colours(straight(bottom), straight(top), mode)
+            return np.r_[np.clip(rgb, -1024, 1024), min(t + b - t * b, 1)]
+        step, image, dot4 = alpha ** (1 / n), np.zeros(4), np.r_[dot, 1.0]
+        share = alpha * (1 - step) / (1 - alpha) if n > 1 else 1.0
+        for f in range(frames):
+            for _ in range(1 if f == 0 else n):
+                image = over(image * step, dot4, share)
+        shown = over(image, dot4) if n > 1 else image
+        return np.clip(shown[:3] / shown[3], 0, 1) * 255
+    for mode in expected:
+        whole, split = (load(label, f"blend_{mode}{v}", 29)[180, 320, :3] for v in ("_fade", "_sub"))
+        want_whole, want_split = blended(mode, 1), blended(mode, 4)
+        report(np.abs(whole - want_whole).max() <= 2 and np.abs(split - want_split).max() <= 2 and
+               np.abs(whole - split).max() <= 5,
+               f"{mode}: centre RGB {whole} without sub-steps, {split} with 3; worked out {want_whole.round(0)} and {want_split.round(0)}")
+
+    print("Transform carries each frame's dot, fading by Alpha Max 0.9 a frame:")
+    def alpha_at(comp, frame, x, y):
+        return int(load(label, comp, frame)[y, x, 3])
+    for k in range(1, 6):
+        seen, want = alpha_at("transform_position", 11, 200 + 20 * k, 180), 255 * 0.9 ** k
+        report(abs(seen - want) <= 4, f"Position 20 to the right, {k} frames back at x={200 + 20 * k}: alpha {seen}, expected {want:.0f}")
+    for comp, y, text in (("transform_scale", 180, "Uniform Scale 150% (Width 300% left out)"),
+                          ("transform_scale_xy", 220, "Scale Width 150%, Height 100%")):
+        for k in range(1, 5):
+            x = 320 + 40 * 1.5 ** k
+            seen, want = alpha_at(comp, 11, int(x), y), 255 * 0.9 ** k
+            report(abs(seen - want) <= 4, f"{text}, {k} frames back at ({x:.0f}, {y}): alpha {seen}, expected {want:.0f}")
+    for k, (x, y) in enumerate([(320, 280), (220, 180), (320, 80)], 1):
+        # Older copies land here too, but behind the dot, which covers them each frame before it turns.
+        seen, want = alpha_at("transform_rotate", 12, x, y), 255 * 0.9 ** k
+        report(abs(seen - want) <= 4, f"Rotation 90, a quarter turn clockwise {k} times at ({x}, {y}): alpha {seen}, expected {want:.0f}")
+
+    print("Edges: the dot's outline over its trail, in front of the dot:")
+    for comp, least in (("edge_luminance", 40), ("edge_colour", 200)):
+        im = load(label, comp, 1)
+        centre, ring, beyond = im[180, 320], im[180, 361], im[180, 370]
+        report(centre[0] > 240 and centre[1] < 40 and ring[3] > least and beyond[3] == 0,
+               f"{comp}: centre RGBA {centre} is the dot, outline alpha {ring[3]}, beyond it {beyond[3]}")
+    report(im[180, 361, 0] > 3 * im[180, 361, 1], f"edge_colour keeps the dot's colour: outline RGB {im[180, 361, :3]}")
 
     print("Alpha Min:")
     # A pixel the dot has left follows the curve exactly: Max 0.9, Min 0.1.

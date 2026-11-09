@@ -49,6 +49,14 @@ def main(label):
                f"{step}: {seen} visible pixels, expected about {expected}, "
                f"mean difference {np.abs(small - shrunk).mean():.2f}/255")
 
+    print("Transform at half resolution, against a shrunk full-resolution frame:")
+    for comp, frame in (("transform_rotate", 12), ("transform_scale", 11), ("transform_position", 11)):
+        shrunk = shrink(ref(comp, frame), 2)
+        small = live("half_" + comp, frame)[: shrunk.shape[0], : shrunk.shape[1]]
+        seen, expected = small[..., 3] > 32, shrunk[..., 3] > 32
+        overlap = (seen & expected).sum() / max((seen | expected).sum(), 1)
+        report(overlap > 0.7, f"{comp}: the dots overlap by {overlap:.0%}")
+
     print("Editing a keyframe during the session:")
     check("before the edit@70", live("keyed_before", 70), ref("keyed", 70))
     check("after the edit@70", live("keyed_after", 70), ref("keyed_edit", 70))

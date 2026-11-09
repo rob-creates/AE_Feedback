@@ -68,6 +68,14 @@ enum
     PARAM_SATURATION,
     PARAM_LIGHTNESS,
     PARAM_HSL_END,
+    PARAM_TRANSFORM_START,
+    PARAM_CENTRE,
+    PARAM_POSITION,
+    PARAM_UNIFORM_SCALE,
+    PARAM_SCALE_HEIGHT,
+    PARAM_SCALE_WIDTH,
+    PARAM_ROTATION,
+    PARAM_TRANSFORM_END,
     PARAM_DISPLACE_START,
     PARAM_DISPLACE_LAYER,
     PARAM_CHANNEL_X,
@@ -75,14 +83,22 @@ enum
     PARAM_CHANNEL_Y,
     PARAM_AMOUNT_Y,
     PARAM_DISPLACE_END,
+    PARAM_EDGE_START,
+    PARAM_EDGE_TYPE,
+    PARAM_EDGE_SIZE,
+    PARAM_EDGE_STRENGTH,
+    PARAM_EDGE_BLEND,
+    PARAM_EDGE_END,
     PARAM_SUBSTEPS,
     PARAM_REBUILD_LIMIT,
     PARAM_COUNT
 };
 
 // Saved projects find each control by this ID, so a control keeps its ID wherever it moves. In the
-// order above. ID 17 belonged to a Source popup, and mustn't be reused.
-const int kDiskIds[PARAM_COUNT] = {0, 1, 27, 2, 26, 28, 29, 3, 30, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25};
+// order above. ID 17 belonged to a Source popup, 33 and 34 to Position X and Y sliders, and 44 to a
+// Position where the centre went rather than how far it moved, and they mustn't be reused.
+const int kDiskIds[PARAM_COUNT] = {0,  1,  27, 2,  26, 28, 29, 3,  30, 4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 31,
+                                   32, 47, 45, 35, 46, 36, 37, 16, 18, 19, 20, 21, 22, 23, 38, 39, 40, 41, 42, 43, 24, 25};
 
 int DiskId(int param)
 {
@@ -152,6 +168,8 @@ struct SampleFacts
 struct FrameFacts
 {
     float alpha, blurRadius, amountX, amountY;
+    float edgeSize; // 0 when edges are off
+    bool moves; // Transform moves the trail
     std::vector<SampleFacts> samples; // oldest first; the last one is at the frame's own time
 };
 
@@ -338,6 +356,19 @@ struct ParamReader
     {
         return read(index, [](const PF_ParamDef& d) { return int(d.u.sd.value); });
     }
+
+    bool checkbox(int index)
+    {
+        return read(index, [](const PF_ParamDef& d) { return d.u.bd.value != 0; });
+    }
+
+    void point(int index, float* x, float* y)
+    {
+        const auto [px, py] = read(index, [](const PF_ParamDef& d)
+        { return std::pair<float, float>(float(d.u.td.x_value) / 65536.0f, float(d.u.td.y_value) / 65536.0f); });
+        *x = px;
+        *y = py;
+    }
 };
 
 inline SampleTime FrameSample(PF_InData* in_data, A_long time)
@@ -361,6 +392,19 @@ float RootOffset(float offset, float slope, float subSlope, float share)
     return std::abs(slope - 1.0f) < 1e-5f ? offset * share : offset * (subSlope - 1.0f) / (slope - 1.0f);
 }
 
+// Position is how far the trail moves each frame. With Uniform Scale on, Scale Height sets both.
+void ReadTransform(
+    ParamReader& r, float* centreX, float* centreY, float* moveX, float* moveY, float* scaleX, float* scaleY,
+    float* rotationDegrees)
+{
+    r.point(PARAM_CENTRE, centreX, centreY);
+    r.point(PARAM_POSITION, moveX, moveY);
+    const bool uniform = r.checkbox(PARAM_UNIFORM_SCALE);
+    *scaleY = r.slider(PARAM_SCALE_HEIGHT) / 100.0f;
+    *scaleX = uniform ? *scaleY : r.slider(PARAM_SCALE_WIDTH) / 100.0f;
+    *rotationDegrees = r.angleDegrees(PARAM_ROTATION);
+}
+
 FrameParams ReadFrameParams(PF_InData* in_data, const SampleTime& time, PF_Err* err)
 {
     ParamReader r{in_data, time};
@@ -381,14 +425,20 @@ FrameParams ReadFrameParams(PF_InData* in_data, const SampleTime& time, PF_Err* 
     f.amountX = r.slider(PARAM_AMOUNT_X);
     f.channelY = r.popup(PARAM_CHANNEL_Y);
     f.amountY = r.slider(PARAM_AMOUNT_Y);
+    ReadTransform(r, &f.centreX, &f.centreY, &f.moveX, &f.moveY, &f.scaleX, &f.scaleY, &f.rotationDegrees);
+    f.edgeType = r.popup(PARAM_EDGE_TYPE);
+    f.edgeSize = r.slider(PARAM_EDGE_SIZE);
+    f.edgeStrength = r.slider(PARAM_EDGE_STRENGTH);
+    f.edgeBlend = r.popup(PARAM_EDGE_BLEND);
     *err = r.err;
     return f;
 }
 
-// In these modes, the input builds up with every step rather than replacing what's there.
+// In all but In Front and Behind, the input builds up with every step rather than replacing what's
+// there, so sub-steps each take a share of it.
 bool BuildsUpInput(int compositeMode)
 {
-    return compositeMode == COMPOSITE_ADD || compositeMode == COMPOSITE_SCREEN;
+    return compositeMode != COMPOSITE_INPUT_IN_FRONT && compositeMode != COMPOSITE_INPUT_BEHIND;
 }
 
 // Each control describes what happens per frame. With n sub-steps, each one applies an nth of that,
@@ -413,6 +463,14 @@ FrameParams DivideIntoSubsteps(FrameParams f, int n, bool frameEnd)
     f.hueDegrees *= share;
     f.saturation = std::pow(f.saturation, share);
     f.lightness *= share;
+    f.moveX *= share;
+    f.moveY *= share;
+    f.rotationDegrees *= share;
+    f.scaleX = std::pow(f.scaleX, share);
+    f.scaleY = std::pow(f.scaleY, share);
+    // Edges of edges would build up with every sub-step, so they're found once a frame.
+    if (!frameEnd)
+        f.edgeStrength = 0.0f;
 
     // Levels is a linear map plus a gamma. Exact roots of each stand in for the combination. A flat or
     // inverted map has no root that keeps its look, so it's applied whole once a frame instead.
@@ -453,11 +511,27 @@ PF_Err GlobalSetup(PF_OutData* out_data)
     // Must match AE_Effect_Version in FeedbackPiPL.r (AE compares the encoded value, build included).
     out_data->my_version = PF_VERSION(1, 0, 0, PF_Stage_DEVELOP, 0);
     // Must match AE_Effect_Global_OutFlags in FeedbackPiPL.r.
-    out_data->out_flags = PF_OutFlag_WIDE_TIME_INPUT | PF_OutFlag_I_EXPAND_BUFFER | PF_OutFlag_DEEP_COLOR_AWARE;
+    out_data->out_flags = PF_OutFlag_WIDE_TIME_INPUT | PF_OutFlag_I_EXPAND_BUFFER | PF_OutFlag_DEEP_COLOR_AWARE |
+                          PF_OutFlag_SEND_UPDATE_PARAMS_UI;
     out_data->out_flags2 = PF_OutFlag2_SUPPORTS_SMART_RENDER | PF_OutFlag2_FLOAT_COLOR_AWARE |
                            PF_OutFlag2_AUTOMATIC_WIDE_TIME_INPUT | PF_OutFlag2_I_MIX_GUID_DEPENDENCIES |
                            PF_OutFlag2_SUPPORTS_GPU_RENDER_F32 | PF_OutFlag2_SUPPORTS_THREADED_RENDERING;
     return PF_Err_NONE;
+}
+
+// Scale Width does nothing while Uniform Scale is on, so it's greyed out, as in AE's Transform effect.
+PF_Err UpdateParamsUI(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[])
+{
+    PF_ParamDef width = *params[PARAM_SCALE_WIDTH];
+    const bool uniform = params[PARAM_UNIFORM_SCALE]->u.bd.value != 0;
+    if (uniform == ((width.ui_flags & PF_PUI_DISABLED) != 0))
+        return PF_Err_NONE;
+    if (uniform)
+        width.ui_flags |= PF_PUI_DISABLED;
+    else
+        width.ui_flags &= ~PF_PUI_DISABLED;
+    AEFX_SuiteScoper<PF_ParamUtilsSuite3> utils(in_data, kPFParamUtilsSuite, kPFParamUtilsSuiteVersion3, out_data);
+    return utils->PF_UpdateParamUI(in_data->effect_ref, PARAM_SCALE_WIDTH, &width);
 }
 
 PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
@@ -498,7 +572,8 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
         return err;
     };
 
-    popup("Composite", 4, COMPOSITE_INPUT_IN_FRONT, "Input In Front|Input Behind|Add|Screen", PARAM_COMPOSITE);
+    popup("Composite", 10, COMPOSITE_INPUT_IN_FRONT,
+          "Input In Front|Input Behind|Add|Screen|Multiply|Lighten|Darken|Overlay|Add/Subtract|Difference", PARAM_COMPOSITE);
 
     topic("Alpha", PARAM_ALPHA_START);
     slider("Alpha Max", 0, 1, 0, 1, 0.85, 3, PARAM_ALPHA_MAX);
@@ -524,6 +599,22 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
     slider("Lightness", -100, 100, -10, 10, 0, 2, PARAM_LIGHTNESS);
     endTopic(PARAM_HSL_END);
 
+    // Moves the trail each frame, before displacement shifts it: scaled and turned about Centre, then
+    // moved by Position, so a Position of 0, 0 leaves it in place.
+    topic("Transform", PARAM_TRANSFORM_START);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_POINT("Centre", 50, 50, FALSE, DiskId(PARAM_CENTRE));
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_POINT("Position", 0, 0, FALSE, DiskId(PARAM_POSITION));
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_CHECKBOXX("Uniform Scale", TRUE, PF_ParamFlag_SUPERVISE | PF_ParamFlag_CANNOT_TIME_VARY,
+                     DiskId(PARAM_UNIFORM_SCALE));
+    slider("Scale Height", 1, 1000, 50, 200, 100, 2, PARAM_SCALE_HEIGHT);
+    slider("Scale Width", 1, 1000, 50, 200, 100, 2, PARAM_SCALE_WIDTH);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_ANGLE("Rotation", 0, DiskId(PARAM_ROTATION));
+    endTopic(PARAM_TRANSFORM_END);
+
     topic("Displacement", PARAM_DISPLACE_START);
     AEFX_CLR_STRUCT(def);
     PF_ADD_LAYER("Map Layer (None = Trail)", PF_LayerDefault_NONE, DiskId(PARAM_DISPLACE_LAYER));
@@ -532,6 +623,15 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
     popup("Vertical Channel", 5, MAP_CHANNEL_LUMA, "Red|Green|Blue|Alpha|Luma", PARAM_CHANNEL_Y);
     slider("Max Vertical", -4000, 4000, -100, 100, 0, 2, PARAM_AMOUNT_Y);
     endTopic(PARAM_DISPLACE_END);
+
+    // Found on the moved trail once a frame, then blurred and graded with it. Off at Strength 0.
+    topic("Edge", PARAM_EDGE_START);
+    popup("Edge Type", 2, EDGE_COLOUR, "Colour|Luminance", PARAM_EDGE_TYPE);
+    slider("Edge Sample Size", 0.1, 100, 0.5, 10, 1, 2, PARAM_EDGE_SIZE);
+    slider("Edge Strength", 0, 100, 0, 4, 0, 3, PARAM_EDGE_STRENGTH);
+    popup("Edge Blend", 10, COMPOSITE_ADD,
+          "Over|Behind|Add|Screen|Multiply|Lighten|Darken|Overlay|Add/Subtract|Difference", PARAM_EDGE_BLEND);
+    endTopic(PARAM_EDGE_END);
 
     fixedInteger("Sub-steps", 0, kMaxSubsteps, kMaxSubsteps, 0, PARAM_SUBSTEPS);
     fixedInteger("Trail Rebuild Limit (Frames)", 1, kLongestRebuildLimit, 3000, kDefaultRebuildLimit, PARAM_REBUILD_LIMIT);
@@ -799,6 +899,10 @@ PF_Err ReadFrameFacts(
     facts->blurRadius = r.slider(PARAM_BLUR);
     facts->amountX = r.slider(PARAM_AMOUNT_X);
     facts->amountY = r.slider(PARAM_AMOUNT_Y);
+    facts->edgeSize = r.slider(PARAM_EDGE_STRENGTH) > 0.0f ? r.slider(PARAM_EDGE_SIZE) : 0.0f;
+    float centreX, centreY, moveX, moveY, scaleX, scaleY, rotation;
+    ReadTransform(r, &centreX, &centreY, &moveX, &moveY, &scaleX, &scaleY, &rotation);
+    facts->moves = MovesTrail(moveX, moveY, scaleX, scaleY, rotation);
     PF_Err err = r.err;
 
     for (int before = samplesPerFrame - 1; !err && before >= 0; before--)
@@ -904,6 +1008,10 @@ struct TrailWalk
     bool hasArea = false;
     PF_LRect area{};
     A_long focusX = 0, focusY = 0; // the centre of the newest area, which matters most if trimmed
+    // With Transform, the trail is clipped to this, the same for every frame, so each one cuts it
+    // the same way whichever earlier image it resumes from.
+    bool limited = false;
+    PF_LRect limit{};
     // Facts this render read itself, kept apart from the run until a history vouches for them.
     std::unordered_map<A_long, FrameFacts> read;
     bool hasProbe = false;
@@ -984,6 +1092,11 @@ PF_Err WalkTrail(
     float varianceX = 0.0f, varianceY = 0.0f; // blurs add by variance
     float shiftX = 0.0f, shiftY = 0.0f;
     bool oldest = false;
+    // Transform can carry the trail anywhere, and working out where exactly is fragile. So while it moves,
+    // the canvas is the layer's own rectangle, plus wherever its input reaches beyond that, and the
+    // trail is clipped there. Every frame then shares one canvas, and zooming in can't grow it.
+    bool moved = false;
+    PF_LRect layerArea{0, 0, A_long(std::ceil(in_data->width * scaleX)), A_long(std::ceil(in_data->height * scaleY))};
 
     for (int k = 0; !err && !oldest; k++)
     {
@@ -1009,7 +1122,9 @@ PF_Err WalkTrail(
         if (k <= rebuildLimit)
             walk->window.push_back(&facts);
 
-        remaining *= facts.alpha;
+        // Edges keep finding what's there and adding it back, so a trail with them never fades.
+        if (facts.edgeSize <= 0.0f)
+            remaining *= facts.alpha;
         oldest = remaining < kInvisibleContribution || k >= framesBefore;
 
         // The oldest frame in the window starts from blank, so only its final moment is used.
@@ -1041,9 +1156,15 @@ PF_Err WalkTrail(
             shiftX += std::abs(facts.amountX) * scaleX;
             shiftY += std::abs(facts.amountY) * scaleY;
         }
+        // Edges reach a sample's distance beyond what they're found on.
+        shiftX += facts.edgeSize * scaleX;
+        shiftY += facts.edgeSize * scaleY;
+        moved = moved || facts.moves;
 
         if (hasFrameArea)
         {
+            layerArea = Union(layerArea, frameArea);
+
             // Three sigma of blur, plus a pixel for displacement's filtering.
             const float limitX = kMaxSpread * scaleX, limitY = kMaxSpread * scaleY;
             const A_long padX = A_long(std::ceil(std::min(3.0f * std::sqrt(varianceX) + shiftX, limitX))) + 1;
@@ -1061,6 +1182,13 @@ PF_Err WalkTrail(
             walk->hasArea = true;
         }
     }
+
+    if (moved && walk->hasArea)
+    {
+        walk->area = layerArea;
+        walk->limited = true;
+        walk->limit = layerArea;
+    }
     return err;
 }
 
@@ -1073,6 +1201,13 @@ void SnapCanvas(const TrailWalk& walk, PF_LRect* area)
     area->bottom = ((area->bottom + (1 << kCanvasSnapBits) - 1) >> kCanvasSnapBits) << kCanvasSnapBits;
     TrimAxis(&area->left, &area->right, walk.focusX, kMaxCanvasSide);
     TrimAxis(&area->top, &area->bottom, walk.focusY, kMaxCanvasSide);
+    // After rounding out, which would otherwise keep a varying margin beyond the limit.
+    if (walk.limited)
+    {
+        *area = Intersect(*area, walk.limit);
+        if (IsEmpty(*area))
+            *area = walk.limit;
+    }
 }
 
 // Requests the pixels of the frames that need computing.
@@ -1146,6 +1281,10 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
 
         // Trimming changes the trail, which the history doesn't show.
         ERR(extra->cb->GuidMixInPtr(in_data->effect_ref, sizeof(firstTime), &firstTime));
+
+        // Each frame is a step further on, even where nothing in the history changes from one frame to
+        // the next. Without this, AE shows a still layer's first trailing frame for every later one.
+        ERR(extra->cb->GuidMixInPtr(in_data->effect_ref, sizeof(now), &now));
 
         // AE's disk cache outlives the plugin, so frames saved by a different build mustn't be reused.
         static const char kBuild[] = FEEDBACK_BUILD_STAMP;
@@ -1244,7 +1383,8 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
                 in_data, extra, request, walk, resumeK >= 0 ? resumeK : int(walk.window.size()), &nextId, data.get()));
         }
 
-        Log("prerender frame=%d window=%d samples=%d read=%d resume=%d checkouts=%d canvas=%dx%d ms=%.2f",
+        Log("prerender frame=%d window=%d samples=%d read=%d resume=%d checkouts=%d canvas=%dx%d at %d,%d layer=%dx%d "
+            "downsample=%.2f ms=%.2f",
             step > 0 ? now / step : 0,
             int(walk.window.size()) - 1,
             data->samplesPerFrame,
@@ -1253,6 +1393,11 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             nextId,
             data->canvas.width,
             data->canvas.height,
+            data->canvas.left,
+            data->canvas.top,
+            int(in_data->width),
+            int(in_data->height),
+            ScaleValue(in_data->downsample_x),
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - preRenderStart).count());
     }
 
@@ -1388,8 +1533,8 @@ PF_Err ShowImage(GpuRender& render, id<MTLBuffer> image, PF_EffectWorld* output)
     const CanvasKey& canvas = render.data.canvas;
     FeedbackRenderer& renderer = render.renderer;
 
-    // With sub-steps, Add and Screen store only the trail, so the current frame goes on top at full
-    // strength here. It stays sharp, and isn't fed back in twice.
+    // With sub-steps, all but In Front and Behind store only the trail, so the current frame goes on
+    // top at full strength here. It stays sharp, and isn't fed back in twice.
     id<MTLBuffer> shown = image;
     bool shownIsScratch = false;
     if (render.data.samplesPerFrame > 1 && render.currentInput)
@@ -1637,6 +1782,10 @@ extern "C" DllExport PF_Err EffectMain(
             break;
         case PF_Cmd_PARAMS_SETUP:
             err = ParamsSetup(in_data, out_data);
+            break;
+        case PF_Cmd_UPDATE_PARAMS_UI:
+        case PF_Cmd_USER_CHANGED_PARAM:
+            err = UpdateParamsUI(in_data, out_data, params);
             break;
         case PF_Cmd_GPU_DEVICE_SETUP:
             err = GPUDeviceSetup(in_data, out_data, static_cast<PF_GPUDeviceSetupExtra*>(extra));

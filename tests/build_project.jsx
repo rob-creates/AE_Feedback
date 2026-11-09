@@ -52,7 +52,7 @@
         return fx;
     }
 
-    var RED = [1, 0.1, 0.1], BLUE = [0.1, 0.2, 1], GREY = [0.5, 0.5, 0.5];
+    var RED = [1, 0.1, 0.1], BLUE = [0.1, 0.2, 1], GREY = [0.5, 0.5, 0.5], ORANGE = [0.8, 0.4, 0.2];
     var ACROSS = [[80, 100], [560, 260]];
 
     function dotComp(name, frames, settings) {
@@ -86,6 +86,42 @@
             "Alpha Max": 0.9, "Blur Radius": 4, "Hue Shift": 12, "Saturation": 90, "Gamma": 1.1, "Lightness": 1
         });
         dotComp("self_disp", 96, { "Alpha Max": 0.9, "Max Horizontal": 12, "Max Vertical": -8 });
+
+        // A still dot whose trail is its hue turned half way: from frame 1, each blend mode lays the
+        // dot's colour over its opposite, which run_tests.py works out for itself. Then the dot over its
+        // own fading trail, with and without sub-steps, which should look much the same.
+        var modes = ["multiply", "lighten", "darken", "overlay", "add_subtract", "difference"];
+        for (var m = 0; m < modes.length; m++) {
+            feedback(movingDot(newComp("blend_" + modes[m], 4), "dot", ORANGE, W, H, [W / 2, H / 2], [W / 2, H / 2], 30),
+                { "Alpha Max": 1, "Hue Shift": 180, "Composite": 5 + m });
+            for (var sub = 0; sub < 2; sub++) {
+                var bc = newComp("blend_" + modes[m] + (sub ? "_sub" : "_fade"), 30);
+                feedback(movingDot(bc, "dot", ORANGE, W, H, [W / 2, H / 2], [W / 2, H / 2], 30),
+                    { "Alpha Max": 0.9, "Composite": 5 + m, "Sub-steps": sub * 3 });
+            }
+        }
+
+        // Transform, with each frame's dot left behind: moved along, scaled away from the centre,
+        // and turned a quarter about it. Small dots, so the copies don't overlap.
+        function stillDot(name, frames, at, r, settings) {
+            var c = newComp(name, frames);
+            return feedback(movingDot(c, "dot", RED, W, H, at, at, r), settings);
+        }
+        stillDot("transform_position", 12, [200, 180], 5, { "Alpha Max": 0.9, "Position": [20, 0] });
+        // Uniform Scale is on, so Scale Width is left out.
+        stillDot("transform_scale", 12, [360, 180], 4, { "Alpha Max": 0.9, "Scale Height": 150, "Scale Width": 300 });
+        stillDot("transform_scale_xy", 12, [360, 220], 4, { "Alpha Max": 0.9, "Uniform Scale": false, "Scale Width": 150 });
+        stillDot("transform_rotate", 13, [420, 180], 5, { "Alpha Max": 0.9, "Rotation": 90 });
+        // Moving, turning and drifting with sub-steps, for rebuilds.
+        dotComp("transform_sub", 72, { "Alpha Max": 0.9, "Rotation": 10, "Scale Height": 98, "Position": [0, 2], "Sub-steps": 3 });
+
+        // Edges of a still dot, over its trail, in front of the dot itself: only its outline shows.
+        stillDot("edge_luminance", 4, [W / 2, H / 2], 40,
+            { "Alpha Max": 1, "Composite": 2, "Edge Type": 2, "Edge Sample Size": 2, "Edge Strength": 1, "Edge Blend": 1 });
+        stillDot("edge_colour", 4, [W / 2, H / 2], 40,
+            { "Alpha Max": 1, "Composite": 2, "Edge Sample Size": 2, "Edge Strength": 1, "Edge Blend": 1 });
+        // A moving dot with edges added to its trail, for rebuilds.
+        dotComp("edge_trail", 72, { "Alpha Max": 0.9, "Edge Strength": 0.5, "Edge Sample Size": 3, "Sub-steps": 1 });
 
         // Inverted Levels on a still dot, behind the trail so the trail shows: it flips every frame,
         // with or without sub-steps.

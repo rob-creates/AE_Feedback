@@ -2,6 +2,7 @@
 #pragma once
 
 #import <Metal/Metal.h>
+#include <cmath>
 #include <memory>
 
 #include "FeedbackCache.h"
@@ -16,11 +17,50 @@ struct FrameParams
     int displaceFromLayer;
     int channelX, channelY;
     float amountX, amountY; // full-resolution pixels
+    float centreX, centreY; // layer pixels at the current resolution, as AE gives a point
+    float moveX, moveY; // Position: how far the trail moves, in the same pixels
+    float scaleX, scaleY; // 1 leaves the size alone
+    float rotationDegrees; // clockwise
+    int edgeType;
+    float edgeSize; // full-resolution pixels between the samples either side
+    float edgeStrength; // 0 is off
+    int edgeBlend;
     int compositeMode;
-    int splitsInput; // Add and Screen with sub-steps: each adds only its share of the input
+    int splitsInput; // all but In Front and Behind with sub-steps: each adds only its share of the input
     float frameAlpha; // the fades that share is worked out from, per frame and per sub-step
     float stepAlpha;
 };
+
+// x' = a x + b y + tx, y' = c x + d y + ty.
+struct Affine
+{
+    float a = 1, b = 0, c = 0, d = 1, tx = 0, ty = 0;
+};
+
+// Where Transform moves a point in one step, in layer pixels at the current resolution: scaled, then
+// turned, about the centre, then moved along. Rotation is clockwise on screen, where y points
+// down. A reduced resolution that differs across and down rescales the turn.
+inline Affine TrailTransform(
+    float centreX, float centreY, float moveX, float moveY, float scaleX, float scaleY, float rotationDegrees,
+    float resolutionX, float resolutionY)
+{
+    const float turn = rotationDegrees * 3.14159265358979f / 180.0f;
+    const float c = std::cos(turn), s = std::sin(turn);
+    Affine t;
+    t.a = c * scaleX;
+    t.b = -s * scaleY * resolutionX / resolutionY;
+    t.c = s * scaleX * resolutionY / resolutionX;
+    t.d = c * scaleY;
+    // centre + move + A (x - centre)
+    t.tx = centreX + moveX - (t.a * centreX + t.b * centreY);
+    t.ty = centreY + moveY - (t.c * centreX + t.d * centreY);
+    return t;
+}
+
+inline bool MovesTrail(float moveX, float moveY, float scaleX, float scaleY, float rotationDegrees)
+{
+    return moveX != 0.0f || moveY != 0.0f || scaleX != 1.0f || scaleY != 1.0f || rotationDegrees != 0.0f;
+}
 
 // A radius covers about two sigma, the way most blur tools work. The canvas has to allow for what this
 // produces, so PreRender and the renderer share it.
@@ -99,7 +139,7 @@ private:
 
     id<MTLBuffer> acquireForBatch(StepBatch& batch, size_t bytes);
 
-    id<MTLComputePipelineState> mDisplace, mBlurDown, mBlurAxis, mBlurUp, mGradeAndComposite, mComposite, mReframe, mCopyOut;
+    id<MTLComputePipelineState> mDisplace, mEdge, mBlurDown, mBlurAxis, mBlurUp, mGradeAndComposite, mComposite, mReframe, mCopyOut;
     id<MTLBuffer> mEmpty; // bound wherever a kernel's optional buffer is absent
     std::unique_ptr<FeedbackCache> mCache;
 };

@@ -6,12 +6,27 @@
 
 #define FEEDBACK_BLUR_MAX_RADIUS 12
 
+// How one image goes over another: the input over the trail, or edges over the trail. The values are
+// the popup's, so saved projects keep their choice. From Multiply on, the top image is blended like a
+// layer above with that mode: where either is transparent, the other shows as itself.
 enum CompositeMode
 {
     COMPOSITE_INPUT_IN_FRONT = 1,
     COMPOSITE_INPUT_BEHIND = 2,
     COMPOSITE_ADD = 3,
-    COMPOSITE_SCREEN = 4
+    COMPOSITE_SCREEN = 4,
+    COMPOSITE_MULTIPLY = 5,
+    COMPOSITE_LIGHTEN = 6,
+    COMPOSITE_DARKEN = 7,
+    COMPOSITE_OVERLAY = 8,
+    COMPOSITE_ADD_SUBTRACT = 9, // bottom + 2 * top - 1: brighter than grey adds, darker subtracts
+    COMPOSITE_DIFFERENCE = 10
+};
+
+enum EdgeType
+{
+    EDGE_COLOUR = 1,
+    EDGE_LUMINANCE = 2
 };
 
 enum MapChannel
@@ -39,6 +54,24 @@ struct DisplaceParams
     int mapIsStraight; // a layer from AE, rather than the feedback image itself
     float amountX; // pixels of shift at full channel value
     float amountY;
+    // Where each pixel's shifted position came from before Transform moved it, as canvas pixels:
+    // source = inverse * position + offset.
+    float inverse[4]; // row-major 2x2
+    float offsetX;
+    float offsetY;
+};
+
+struct EdgeParams
+{
+    int srcPitch;
+    int dstPitch;
+    int width;
+    int height;
+    int type;
+    int blend;
+    float distanceX; // canvas pixels between the samples either side
+    float distanceY;
+    float strength;
 };
 
 // Moving to and from the smaller image that wide blurs run on.

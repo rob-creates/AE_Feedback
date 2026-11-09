@@ -77,6 +77,30 @@ void FillWeights(BlurAxisParams& p, float sigma)
         p.weights[i] /= total;
 }
 
+// Where Transform moves a canvas pixel from, as `inverse * position + offset`.
+void InvertTransform(const FrameParams& f, const CanvasKey& canvas, DisplaceParams* p)
+{
+    const Affine layer = TrailTransform(f.centreX, f.centreY, f.moveX, f.moveY, f.scaleX, f.scaleY, f.rotationDegrees,
+                                        ScaleValue(canvas.downsampleX), ScaleValue(canvas.downsampleY));
+    // The same move with the canvas's corner as the origin.
+    Affine t = layer;
+    t.tx = layer.a * canvas.left + layer.b * canvas.top + layer.tx - canvas.left;
+    t.ty = layer.c * canvas.left + layer.d * canvas.top + layer.ty - canvas.top;
+
+    const float det = t.a * t.d - t.b * t.c;
+    p->inverse[0] = t.d / det;
+    p->inverse[1] = -t.b / det;
+    p->inverse[2] = -t.c / det;
+    p->inverse[3] = t.a / det;
+    p->offsetX = -(p->inverse[0] * t.tx + p->inverse[1] * t.ty);
+    p->offsetY = -(p->inverse[2] * t.tx + p->inverse[3] * t.ty);
+}
+
+bool MovesTrail(const FrameParams& f)
+{
+    return ::MovesTrail(f.moveX, f.moveY, f.scaleX, f.scaleY, f.rotationDegrees);
+}
+
 // A missing input has zero size, so the kernel never reads it.
 CompositeParams MakeCompositeParams(const CanvasKey& canvas, const PlacedImage& input, int mode)
 {
@@ -104,6 +128,7 @@ std::unique_ptr<FeedbackRenderer> FeedbackRenderer::create(id<MTLDevice> device,
         return fn ? [device newComputePipelineStateWithFunction:fn error:&error] : nil;
     };
     r->mDisplace = pipeline(@"displace");
+    r->mEdge = pipeline(@"edge");
     r->mBlurDown = pipeline(@"blurDown");
     r->mBlurAxis = pipeline(@"blurAxis");
     r->mBlurUp = pipeline(@"blurUp");
@@ -111,7 +136,7 @@ std::unique_ptr<FeedbackRenderer> FeedbackRenderer::create(id<MTLDevice> device,
     r->mComposite = pipeline(@"composite");
     r->mReframe = pipeline(@"reframe");
     r->mCopyOut = pipeline(@"copyOut");
-    if (!r->mDisplace || !r->mBlurDown || !r->mBlurAxis || !r->mBlurUp || !r->mGradeAndComposite || !r->mComposite ||
+    if (!r->mDisplace || !r->mEdge || !r->mBlurDown || !r->mBlurAxis || !r->mBlurUp || !r->mGradeAndComposite || !r->mComposite ||
         !r->mReframe || !r->mCopyOut)
         return nullptr;
 
@@ -255,11 +280,12 @@ id<MTLBuffer> FeedbackRenderer::step(
 
     id<MTLComputeCommandEncoder> encoder = [commands computeCommandEncoder];
 
-    // Displacement
+    // Transform and displacement, in one resampling. Neutral settings skip it, so they're exactly a no-op.
     const float amountX = f.amountX * scaleX;
     const float amountY = f.amountY * scaleY;
     const bool mapMissing = f.displaceFromLayer && !map.buffer;
-    if ((amountX != 0.0f || amountY != 0.0f) && !mapMissing)
+    const bool displaces = (amountX != 0.0f || amountY != 0.0f) && !mapMissing;
+    if (displaces || MovesTrail(f))
     {
         DisplaceParams p{};
         p.srcPitch = width;
@@ -270,8 +296,13 @@ id<MTLBuffer> FeedbackRenderer::step(
         p.channelY = f.channelY;
         p.amountX = amountX;
         p.amountY = amountY;
+        p.inverse[0] = p.inverse[3] = 1.0f;
+        if (MovesTrail(f))
+            InvertTransform(f, canvas, &p);
         id<MTLBuffer> mapBuffer = current;
-        if (f.displaceFromLayer)
+        if (!displaces)
+            mapBuffer = mEmpty; // no map: zero size, so nothing shifts
+        else if (f.displaceFromLayer)
         {
             mapBuffer = map.buffer;
             p.mapIsStraight = 1;
@@ -289,6 +320,24 @@ id<MTLBuffer> FeedbackRenderer::step(
         }
         id<MTLBuffer> next = acquire();
         Encode(encoder, mDisplace, {current, mapBuffer, next}, p, width, height);
+        current = next;
+    }
+
+    // Edges, found on the moved trail.
+    if (f.edgeStrength > 0.0f)
+    {
+        EdgeParams p{};
+        p.srcPitch = width;
+        p.dstPitch = width;
+        p.width = width;
+        p.height = height;
+        p.type = f.edgeType;
+        p.blend = f.edgeBlend;
+        p.distanceX = std::max(f.edgeSize * scaleX, 0.05f);
+        p.distanceY = std::max(f.edgeSize * scaleY, 0.05f);
+        p.strength = f.edgeStrength;
+        id<MTLBuffer> next = acquire();
+        Encode(encoder, mEdge, {current, next}, p, width, height);
         current = next;
     }
 
