@@ -115,6 +115,38 @@ inline float4 blendImages(float4 bottom, float4 top, int mode)
     }
 }
 
+// A pixel position through a projective map. False where it falls behind the camera.
+inline bool project(constant float* m, float2 p, thread float2& out)
+{
+    const float w = m[6] * p.x + m[7] * p.y + m[8];
+    if (w <= 1e-6f)
+        return false;
+    out = float2(m[0] * p.x + m[1] * p.y + m[2], m[3] * p.x + m[4] * p.y + m[5]) / w;
+    return true;
+}
+
+// Bilinear, with each tap premultiplied first if it's straight, and nothing beyond the image, so
+// colour hidden in transparent pixels can't bleed in.
+inline float4 tap(device const float4* src, int pitch, int w, int h, int2 i, bool straight)
+{
+    if (i.x < 0 || i.y < 0 || i.x >= w || i.y >= h)
+        return float4(0.0);
+    float4 v = src[i.y * pitch + i.x];
+    if (straight)
+        v.xyz *= v.w;
+    return v;
+}
+
+inline float4 bilinearPremultiplied(device const float4* src, int pitch, int w, int h, float2 pos, bool straight)
+{
+    const int2 i0 = int2(floor(pos));
+    const float2 f = pos - float2(i0);
+    const float4 top = mix(tap(src, pitch, w, h, i0, straight), tap(src, pitch, w, h, i0 + int2(1, 0), straight), f.x);
+    const float4 bottom =
+        mix(tap(src, pitch, w, h, i0 + int2(0, 1), straight), tap(src, pitch, w, h, i0 + int2(1, 1), straight), f.x);
+    return mix(top, bottom, f.y);
+}
+
 // Transparent beyond the image, rather than repeating its edge.
 inline float4 sampleOrClear(device const float4* src, int pitch, int w, int h, float2 pos)
 {
@@ -133,6 +165,11 @@ kernel void displace(
 {
     int2 canvas = int2(xy);
     int2 m = canvas - int2(p.mapOffsetX, p.mapOffsetY);
+    if (p.mapWarped != 0)
+    {
+        float2 at;
+        m = project(p.mapFromCanvas, float2(canvas), at) ? int2(floor(at + 0.5f)) : int2(-1);
+    }
     float2 shift = float2(0.0);
     if (m.x >= 0 && m.y >= 0 && m.x < p.mapWidth && m.y < p.mapHeight)
     {
@@ -179,6 +216,10 @@ kernel void edge(
         const float4 g = sqrt(gx * gx + gy * gy) * p.strength;
         edges = float4(g.xyz, saturate(max(g.w, max3(g.x, g.y, g.z))));
     }
+    // The blend modes work on straight colour, which only stays in range if the edges are valid
+    // premultiplied colour. Strong edges otherwise turn Multiply into a brightening.
+    if (p.blend >= COMPOSITE_MULTIPLY)
+        edges.xyz = min(edges.xyz, float3(edges.w));
     const float4 image = src[xy.y * p.srcPitch + xy.x];
     dst[xy.y * p.dstPitch + xy.x] = sanitize(blendImages(image, edges, p.blend));
 }
@@ -293,7 +334,13 @@ inline float4 applyComposite(float4 f, device const float4* input, int2 xy, cons
 {
     float4 i = float4(0.0);
     int2 m = xy - int2(p.inputOffsetX, p.inputOffsetY);
-    if (m.x >= 0 && m.y >= 0 && m.x < p.inputWidth && m.y < p.inputHeight)
+    if (p.inputWarped != 0)
+    {
+        float2 at;
+        if (project(p.inputFromCanvas, float2(xy), at))
+            i = bilinearPremultiplied(input, p.inputPitch, p.inputWidth, p.inputHeight, at, true);
+    }
+    else if (m.x >= 0 && m.y >= 0 && m.x < p.inputWidth && m.y < p.inputHeight)
     {
         // A straight pixel can hold any colour where it's transparent, and that must not show.
         i = input[m.y * p.inputPitch + m.x];
@@ -349,8 +396,19 @@ kernel void copyOut(
     constant CopyOutParams& p [[buffer(2)]],
     uint2 xy [[thread_position_in_grid]])
 {
-    int2 c = int2(xy) + int2(p.offsetX, p.offsetY);
-    float4 v = src[c.y * p.srcPitch + c.x];
+    float4 v;
+    if (p.warped != 0)
+    {
+        float2 at;
+        v = project(p.canvasFromOutput, float2(xy), at)
+                ? bilinearPremultiplied(src, p.srcPitch, p.canvasWidth, p.canvasHeight, at, false)
+                : float4(0.0);
+    }
+    else
+    {
+        int2 c = int2(xy) + int2(p.offsetX, p.offsetY);
+        v = src[c.y * p.srcPitch + c.x];
+    }
     v.xyz = unpremultiply(v);
     dst[xy.y * p.dstPitch + xy.x] = v;
 }

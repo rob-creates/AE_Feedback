@@ -18,9 +18,12 @@ struct FrameParams
     int channelX, channelY;
     float amountX, amountY; // full-resolution pixels
     float centreX, centreY; // layer pixels at the current resolution, as AE gives a point
-    float moveX, moveY; // Position: how far the trail moves, in the same pixels
     float scaleX, scaleY; // 1 leaves the size alone
     float rotationDegrees; // clockwise
+    // One step's move about the centre, at full resolution: x -> linear (x - centre) + centre + move.
+    // Worked out from the controls above, and divided between sub-steps as a whole.
+    float linear[4]; // row-major 2x2
+    float moveX, moveY;
     int edgeType;
     float edgeSize; // full-resolution pixels between the samples either side
     float edgeStrength; // 0 is off
@@ -37,29 +40,25 @@ struct Affine
     float a = 1, b = 0, c = 0, d = 1, tx = 0, ty = 0;
 };
 
-// Where Transform moves a point in one step, in layer pixels at the current resolution: scaled, then
-// turned, about the centre, then moved along. Rotation is clockwise on screen, where y points
-// down. A reduced resolution that differs across and down rescales the turn.
-inline Affine TrailTransform(
-    float centreX, float centreY, float moveX, float moveY, float scaleX, float scaleY, float rotationDegrees,
-    float resolutionX, float resolutionY)
+// Where Transform moves a point in one step, in layer pixels at the current resolution. A reduced
+// resolution that differs across and down rescales the full-resolution move to match.
+inline Affine TrailTransform(const FrameParams& f, float resolutionX, float resolutionY)
 {
-    const float turn = rotationDegrees * 3.14159265358979f / 180.0f;
-    const float c = std::cos(turn), s = std::sin(turn);
     Affine t;
-    t.a = c * scaleX;
-    t.b = -s * scaleY * resolutionX / resolutionY;
-    t.c = s * scaleX * resolutionY / resolutionX;
-    t.d = c * scaleY;
+    t.a = f.linear[0];
+    t.b = f.linear[1] * resolutionX / resolutionY;
+    t.c = f.linear[2] * resolutionY / resolutionX;
+    t.d = f.linear[3];
     // centre + move + A (x - centre)
-    t.tx = centreX + moveX - (t.a * centreX + t.b * centreY);
-    t.ty = centreY + moveY - (t.c * centreX + t.d * centreY);
+    t.tx = f.centreX + f.moveX * resolutionX - (t.a * f.centreX + t.b * f.centreY);
+    t.ty = f.centreY + f.moveY * resolutionY - (t.c * f.centreX + t.d * f.centreY);
     return t;
 }
 
-inline bool MovesTrail(float moveX, float moveY, float scaleX, float scaleY, float rotationDegrees)
+inline bool MovesTrail(const FrameParams& f)
 {
-    return moveX != 0.0f || moveY != 0.0f || scaleX != 1.0f || scaleY != 1.0f || rotationDegrees != 0.0f;
+    return f.moveX != 0.0f || f.moveY != 0.0f || f.linear[0] != 1.0f || f.linear[1] != 0.0f || f.linear[2] != 0.0f ||
+           f.linear[3] != 1.0f;
 }
 
 // A radius covers about two sigma, the way most blur tools work. The canvas has to allow for what this
@@ -69,13 +68,16 @@ inline float BlurSigma(float radius)
     return radius * 0.5f;
 }
 
-// A buffer plus where it sits on the canvas. A null buffer means nothing is there.
+// A buffer plus where it sits on the canvas. A null buffer means nothing is there. A warped image is
+// found through a projective map from canvas pixels instead of an offset.
 struct PlacedImage
 {
     id<MTLBuffer> buffer;
     int pitch;
     int offsetX, offsetY;
     int width, height;
+    bool warped;
+    float fromCanvas[9]; // row-major 3x3
 };
 
 // Steps queued up to run together, as waiting for the GPU after each one wastes time. A step's buffers
@@ -123,7 +125,13 @@ public:
         const PlacedImage& input,
         int compositeMode);
 
-    bool copyOut(id<MTLCommandQueue> queue, const CanvasKey& canvas, id<MTLBuffer> image, const PlacedImage& output);
+    // With canvasFromOutput, each output pixel is looked up through it rather than by offset.
+    bool copyOut(
+        id<MTLCommandQueue> queue,
+        const CanvasKey& canvas,
+        id<MTLBuffer> image,
+        const PlacedImage& output,
+        const float* canvasFromOutput = nullptr);
 
 private:
     FeedbackRenderer() = default;

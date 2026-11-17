@@ -49,8 +49,9 @@ def main(label):
                f"{step}: {seen} visible pixels, expected about {expected}, "
                f"mean difference {np.abs(small - shrunk).mean():.2f}/255")
 
-    print("Transform at half resolution, against a shrunk full-resolution frame:")
-    for comp, frame in (("transform_rotate", 12), ("transform_scale", 11), ("transform_position", 11)):
+    print("Transform and comp-space trails at half resolution, against a shrunk full-resolution frame:")
+    for comp, frame in (("transform_rotate", 12), ("transform_scale", 11), ("transform_position", 11),
+                        ("comp_space_2d", 20), ("layer_3d", 20)):
         shrunk = shrink(ref(comp, frame), 2)
         small = live("half_" + comp, frame)[: shrunk.shape[0], : shrunk.shape[1]]
         seen, expected = small[..., 3] > 32, shrunk[..., 3] > 32
@@ -85,6 +86,12 @@ def main(label):
     print("Moving a layer's in-point during the session:")
     check("before the move@60", live("trim_before", 60), ref("trim_48", 60))
     check("after the move@60", live("trim_after", 60), ref("trim_24", 60))
+
+    print("Moving a comp-space trail's layer during the session:")
+    render("feedback_live_edited.aep", "comp_space_2d", OUT / label / "edited_motion", 0, 20)
+    check("before the move@20", live("comp_motion_before", 20), ref("comp_space_2d", 20))
+    check("after the move@20", live("comp_motion_after", 20), ref("edited_motion", 20))
+    report(None, f"the move itself changed the frame by a peak of {difference(live('comp_motion_before', 20), ref('edited_motion', 20))[0]}/255")
 
     print("A project saved by an earlier version of the effect:")
     render("old_project.aep", "trail", OUT / label / "old_project", 0, 60)

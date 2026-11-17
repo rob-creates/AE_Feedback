@@ -1,6 +1,15 @@
 # AE_Feedback
 Feedback Effect for Adobe After Effects
 
+## Using it
+
+- The trail stays where the layer left it in the comp, so a moving layer leaves its trail behind.
+- A 3D layer keeps its trail on the layer, which goes through the camera with it. To work on what a
+  3D layer looks like through the camera, precompose it with the camera and put Feedback on the
+  precomp, or put Feedback on an adjustment layer above it.
+- Map Layer is read where it is in the comp. Where the map is transparent, nothing moves.
+- Map Layer set to the effect's own layer, at Effects & Masks, uses the trail as the map.
+
 ## Building
 
 Requires macOS on Apple silicon, Xcode and CMake.
@@ -13,7 +22,7 @@ Requires macOS on Apple silicon, Xcode and CMake.
    cmake --build Build
    ```
 
-3. Link it into After Effects 2026, using an admin account or `sudo`, then restart After Effects:
+3. Link it into After Effects 2027, using an admin account or `sudo`, then restart After Effects:
 
    ```sh
    scripts/install.sh

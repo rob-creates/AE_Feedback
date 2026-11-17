@@ -59,6 +59,9 @@ struct DisplaceParams
     float inverse[4]; // row-major 2x2
     float offsetX;
     float offsetY;
+    // With the trail in comp space, the map is in the layer: where each canvas pixel falls in it.
+    int mapWarped;
+    float mapFromCanvas[9]; // row-major 3x3, to map pixel coordinates
 };
 
 struct EdgeParams
@@ -124,9 +127,12 @@ struct CompositeParams
     int inputWidth;
     int inputHeight;
     int mode;
-    int splitsInput; // Add and Screen with sub-steps: each adds only its share of the input
+    int splitsInput; // all but In Front and Behind with sub-steps: each adds only its share of the input
     float frameAlpha;
     float stepAlpha;
+    // With the trail in comp space, the input is drawn through the layer's own move.
+    int inputWarped;
+    float inputFromCanvas[9]; // row-major 3x3, to input pixel coordinates
 };
 
 struct StepParams
@@ -151,4 +157,9 @@ struct CopyOutParams
     int dstPitch;
     int offsetX; // canvas pixel = output pixel + offset
     int offsetY;
+    // With the trail in comp space, each output pixel looks up where the layer puts it in comp.
+    int warped;
+    float canvasFromOutput[9]; // row-major 3x3, to canvas pixel coordinates
+    int canvasWidth;
+    int canvasHeight;
 };

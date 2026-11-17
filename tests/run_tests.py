@@ -22,7 +22,7 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 OUT = HERE / "out"
-AERENDER = "/Applications/Adobe After Effects 2026/aerender"
+AERENDER = "/Applications/Adobe After Effects 2027/aerender"
 LOG = Path.home() / "Library/Logs/AEFeedback.log"
 
 COMPS = ["trail", "behind", "screen_sub", "add_sub", "grade_blur", "self_disp", "levels_inverted",
@@ -38,6 +38,9 @@ COMPS = ["trail", "behind", "screen_sub", "add_sub", "grade_blur", "self_disp", 
          *[f"blend_{m}{v}" for m in ("multiply", "lighten", "darken", "overlay", "add_subtract", "difference")
            for v in ("", "_sub", "_fade")],
          "transform_position", "transform_scale", "transform_scale_xy", "transform_rotate", "transform_sub",
+         "transform_sub_scale", "transform_sub_skew", "edge_multiply", "square_path", "square_path_plain",
+         "map_offset",
+         *[f"comp_space_{v}{p}" for v in ("2d", "parented") for p in ("", "_plain")], "layer_3d", "layer_3d_plain",
          "edge_luminance", "edge_colour", "edge_trail"]
 NEUTRAL = ["neutral_ref", "neutral_luma", "neutral_red", "neutral_alpha_transparent", "neutral_alpha_half"]
 # Rendered again alone in a new process: a full rebuild, with nothing cached.
@@ -45,7 +48,7 @@ COLD = {"trail": 60, "behind": 60, "screen_sub": 60, "add_sub": 60, "grade_blur"
         "alpha_min": 60, "alpha_min_fade": 60, "alpha_min_sub": 60,
         "duplicate_fx": 40, "perf_long": 299, "limit_600": 699,
         "limit_800": 699, "limit_100": 299, "trim_48": 60, "trim_start": 60, "trim_stretch": 60,
-        "blend_difference": 3, "blend_overlay_sub": 29, "transform_rotate": 12, "transform_sub": 60, "edge_trail": 60}
+        "blend_difference": 3, "blend_overlay_sub": 29, "comp_space_2d": 20, "layer_3d": 20, "transform_rotate": 12, "transform_sub": 60, "edge_trail": 60}
 DEEP = 3999  # deep_alpha1's last frame
 
 
@@ -224,6 +227,42 @@ def cmd_check(label):
     short, whole = visible(load(label, "trim_48", 52)), visible(load(label, "trail", 52))
     report(short < whole, f"4 frames in, the trail is shorter than an untrimmed one: {short} visible pixels against {whole}")
 
+    print("The layer itself always shows whole, in front of its trail:")
+    worst, where = 0, 0
+    for f in range(96):
+        plain, shown = load(label, "square_path_plain", f)[..., 3], load(label, "square_path", f)[..., 3]
+        short = int((plain - shown).max())
+        if short > worst:
+            worst, where = short, f
+    report(worst <= 1, f"square_path: at worst {worst}/255 less opaque than the bare layer (frame {where})")
+
+    print("The trail stays in comp space, leaving each copy where the bare layer was:")
+    for kind in ("2d", "parented"):
+        comp = f"comp_space_{kind}"
+        worst = []
+        for k in range(1, 6):
+            plain = load(label, comp + "_plain", 20 - k)[..., 3]
+            ys, xs = np.nonzero(plain > 200)
+            if not len(xs):
+                worst.append((k, None, 0))
+                continue
+            y, x = int(round(ys.mean())), int(round(xs.mean()))
+            seen, want = int(load(label, comp, 20)[y, x, 3]), 255 * 0.9 ** k
+            worst.append((k, (x, y), seen - want))
+        bad = [w for w in worst if w[1] is None or abs(w[2]) > 8]
+        report(not bad, f"{comp}: copies 1-5 frames back against the bare layer's centres, alpha off by "
+                        f"{[round(w[2]) for w in worst]}")
+    # layer_3d isn't checked against layer_3d_plain: under aerender, a 3D solid with the effect draws only a
+    # pixel or two at its corner, though 3D footage and shape layers draw at full size in After Effects.
+    # It's still rendered for the cold and half-resolution checks.
+    # Each frame's copy 20 pixels further up and left, from the dot's centre at 400,260.
+    image, off = load(label, "map_offset", 11), []
+    for k in range(1, 9):
+        x, y = 400 - 20 * k, 260 - 20 * k
+        off.append(round(int(image[y, x, 3]) - 255 * 0.9 ** k))
+    report(all(abs(o) <= 12 for o in off), f"map_offset: Map Layer shifts the trail beyond the layer's corner, "
+                                           f"alpha off by {off} for copies 1-8 frames back")
+
     print("A layer with nothing in it:")
     for comp, last in (("empty_layer", 47), ("empty_mapped", 47)):
         frames = len(list((OUT / label / comp).glob("f_*.tif")))
@@ -308,6 +347,22 @@ def cmd_check(label):
         seen, want = alpha_at("transform_rotate", 12, x, y), 255 * 0.9 ** k
         report(abs(seen - want) <= 4, f"Rotation 90, a quarter turn clockwise {k} times at ({x}, {y}): alpha {seen}, expected {want:.0f}")
 
+    # One frame's move, applied k times to the dot's centre, about the layer's centre.
+    def carried(x, y, k, scale_x, scale_y, turn, move):
+        c, s = np.cos(np.radians(turn)), np.sin(np.radians(turn))
+        for _ in range(k):
+            dx, dy = (x - 320) * scale_x, (y - 180) * scale_y
+            x, y = 320 + c * dx - s * dy + move[0], 180 + s * dx + c * dy + move[1]
+        return x, y
+    for comp, start, scale_x, scale_y, turn, move, text in (
+            ("transform_sub_scale", (330, 180), 1.5, 1.5, 0, (60, 0), "Scale 150% and Position 60"),
+            ("transform_sub_skew", (360, 180), 1.5, 1.0, 30, (0, 0), "Scale Width 150% and Rotation 30")):
+        for k in (1, 2):
+            x, y = carried(*start, k, scale_x, scale_y, turn, move)
+            # Earlier moments of the frame trail behind each copy, so it's at least as solid as one.
+            seen, want = alpha_at(comp, 11, int(round(x)), int(round(y))), 255 * 0.9 ** k
+            report(seen >= want - 4, f"{text} with 3 sub-steps, {k} frames back at ({x:.0f}, {y:.0f}): alpha {seen}, at least {want - 4:.0f}")
+
     print("Edges: the dot's outline over its trail, in front of the dot:")
     for comp, least in (("edge_luminance", 40), ("edge_colour", 200)):
         im = load(label, comp, 1)
@@ -315,6 +370,8 @@ def cmd_check(label):
         report(centre[0] > 240 and centre[1] < 40 and ring[3] > least and beyond[3] == 0,
                f"{comp}: centre RGBA {centre} is the dot, outline alpha {ring[3]}, beyond it {beyond[3]}")
     report(im[180, 361, 0] > 3 * im[180, 361, 1], f"edge_colour keeps the dot's colour: outline RGB {im[180, 361, :3]}")
+    inside = load(label, "edge_multiply", 1)[180, 358, :3]
+    report(np.all(inside <= np.array([255, 26, 26]) + 2), f"strong edges multiplied over the dot only darken it: RGB {inside} just inside its edge")
 
     print("Alpha Min:")
     # A pixel the dot has left follows the curve exactly: Max 0.9, Min 0.1.

@@ -1,5 +1,5 @@
 // Builds the test projects in tests/out/ (which must exist), one per bit depth. Run inside After Effects:
-//   osascript -e 'tell application "Adobe After Effects 2026" to DoScriptFile "<path to this file>"'
+//   osascript -e 'tell application "Adobe After Effects 2027" to DoScriptFile "<path to this file>"'
 #include "common.jsx"
 
 (function () {
@@ -112,6 +112,11 @@
         stillDot("transform_scale", 12, [360, 180], 4, { "Alpha Max": 0.9, "Scale Height": 150, "Scale Width": 300 });
         stillDot("transform_scale_xy", 12, [360, 220], 4, { "Alpha Max": 0.9, "Uniform Scale": false, "Scale Width": 150 });
         stillDot("transform_rotate", 13, [420, 180], 5, { "Alpha Max": 0.9, "Rotation": 90 });
+        // With sub-steps, each frame's copy should land where one step a frame puts it: scaled and
+        // moved, and scaled unevenly and turned.
+        stillDot("transform_sub_scale", 12, [330, 180], 4, { "Alpha Max": 0.9, "Scale Height": 150, "Position": [60, 0], "Sub-steps": 3 });
+        stillDot("transform_sub_skew", 12, [360, 180], 4,
+            { "Alpha Max": 0.9, "Uniform Scale": false, "Scale Width": 150, "Rotation": 30, "Sub-steps": 3 });
         // Moving, turning and drifting with sub-steps, for rebuilds.
         dotComp("transform_sub", 72, { "Alpha Max": 0.9, "Rotation": 10, "Scale Height": 98, "Position": [0, 2], "Sub-steps": 3 });
 
@@ -120,6 +125,9 @@
             { "Alpha Max": 1, "Composite": 2, "Edge Type": 2, "Edge Sample Size": 2, "Edge Strength": 1, "Edge Blend": 1 });
         stillDot("edge_colour", 4, [W / 2, H / 2], 40,
             { "Alpha Max": 1, "Composite": 2, "Edge Sample Size": 2, "Edge Strength": 1, "Edge Blend": 1 });
+        // Strong edges multiplied over the dot's trail must darken it, never brighten it.
+        stillDot("edge_multiply", 4, [W / 2, H / 2], 40,
+            { "Alpha Max": 1, "Composite": 2, "Edge Sample Size": 2, "Edge Strength": 4, "Edge Blend": 5 });
         // A moving dot with edges added to its trail, for rebuilds.
         dotComp("edge_trail", 72, { "Alpha Max": 0.9, "Edge Strength": 0.5, "Edge Sample Size": 3, "Sub-steps": 1 });
 
@@ -267,6 +275,67 @@
             }
         }
         shapeComp("shape_trail", { "Alpha Max": 0.9 });
+
+        // The trail in comp space: a small solid, drawn in its own space like footage, moved by its own
+        // transform, beside the same layer bare. Each copy in the trail should sit where the bare layer
+        // was drawn that many frames before. Moved along; and parented to a null that moves and turns.
+        // A 3D layer, moving in depth and turning under a camera, keeps its trail on the layer instead.
+        function compSpaceComps(name, build, size) {
+            for (var bare = 0; bare < 2; bare++) {
+                var c = newComp(name + (bare ? "_plain" : ""), 24);
+                var solid = c.layers.addSolid(RED, "dot", size || 8, size || 8, 1, c.duration);
+                build(c, solid);
+                if (!bare) feedback(solid, { "Alpha Max": 0.9 });
+            }
+        }
+        compSpaceComps("comp_space_2d", function (c, solid) {
+            var p = solid.property("Position");
+            p.setValueAtTime(0, [80, 120]);
+            p.setValueAtTime(c.duration, [560, 240]);
+        });
+        compSpaceComps("comp_space_parented", function (c, solid) {
+            var parent = c.layers.addNull(c.duration);
+            parent.property("Position").setValueAtTime(0, [200, 180]);
+            parent.property("Position").setValueAtTime(c.duration, [440, 180]);
+            parent.property("Rotation").setValueAtTime(0, 0);
+            parent.property("Rotation").setValueAtTime(c.duration, 240);
+            solid.parent = parent;
+            solid.property("Position").setValue([110, 0]);
+        });
+        compSpaceComps("layer_3d", function (c, solid) {
+            c.layers.addCamera("camera", [W / 2, H / 2]);
+            solid.threeDLayer = true;
+            var p = solid.property("Position");
+            p.setValueAtTime(0, [100, 200, 300]);
+            p.setValueAtTime(c.duration, [540, 140, -300]);
+            solid.property("Y Rotation").setValueAtTime(0, 0);
+            solid.property("Y Rotation").setValueAtTime(c.duration, 50);
+        }, 64);
+
+        // A small square shape layer moved by its own Position, right and then curving up, with the
+        // effect at its defaults, beside the same layer bare. The layer itself must always show whole.
+        for (var bare = 0; bare < 2; bare++) {
+            var sq = newComp("square_path" + (bare ? "_plain" : ""), 96);
+            var square = sq.layers.addShape();
+            var group = square.property("Contents").addProperty("ADBE Vector Group").property("Contents");
+            group.addProperty("ADBE Vector Shape - Rect").property("Size").setValue([32, 32]);
+            group.addProperty("ADBE Vector Graphic - Fill").property("Color").setValue(RED);
+            var path = square.property("Position");
+            path.setValueAtTime(0, [60, 260]);
+            path.setValueAtTime(60 / FPS, [430, 250]);
+            path.setValueAtTime(95 / FPS, [560, 110]);
+            if (!bare) square.property("Effects").addProperty("RPAY Feedback");
+        }
+        // Map Layer goes where it is in the comp, not where the effect's layer is. A small solid, with
+        // a hidden opaque map the size of the comp, shifts its trail up and left 20 pixels a frame,
+        // well past its own top-left corner, which is where the map used to stop.
+        var mo = newComp("map_offset", 12);
+        var moDot = mo.layers.addSolid(RED, "dot", 16, 16, 1, mo.duration);
+        moDot.property("Position").setValue([400, 260]);
+        var moMap = mo.layers.addSolid(GREY, "map", W, H, 1, mo.duration);
+        moMap.enabled = false;
+        useMap(feedback(moDot, { "Alpha Max": 0.9, "Max Horizontal": 20, "Max Vertical": 20, "Horizontal Channel": 4,
+                                 "Vertical Channel": 4 }), moMap);
         shapeComp("shape_sub", { "Alpha Max": 0.9, "Sub-steps": 2 });
         // A shape layer as the map instead, on a solid.
         var shapeMap = dotComp("shape_as_map", 96, { "Alpha Max": 0.9, "Max Horizontal": 30, "Horizontal Channel": 4 });

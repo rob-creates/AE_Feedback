@@ -47,6 +47,9 @@
     // Transform's centre, offset and moves at half resolution.
     queue(comp("transform_rotate"), 12, "half_transform_rotate", { "Resolution": [2, 2] });
     queue(comp("transform_position"), 11, "half_transform_position", { "Resolution": [2, 2] });
+    // The trail in comp space at half resolution.
+    queue(comp("comp_space_2d"), 20, "half_comp_space_2d", { "Resolution": [2, 2] });
+    queue(comp("layer_3d"), 20, "half_layer_3d", { "Resolution": [2, 2] });
     queue(comp("transform_scale"), 11, "half_transform_scale", { "Resolution": [2, 2] });
     // From the start and playing through, so that frames resume from one another.
     queue(comp("shape_sub"), 60, "half_run_shape_sub", { "Resolution": [2, 2] }, 61);
@@ -103,6 +106,12 @@
     queue(trimmed, 60, "trim_before");
     trimmed.layer("dot").inPoint = 24 / FPS;
     queue(trimmed, 60, "trim_after");
+
+    // Moving the layer itself changes a comp-space trail, though nothing in the effect's own history did.
+    var travelling = comp("comp_space_2d");
+    queue(travelling, 20, "comp_motion_before");
+    travelling.layer("dot").property("Position").setValueAtKey(2, [560, 60]);
+    queue(travelling, 20, "comp_motion_after");
 
     // Saved so that a fresh aerender can show what those last frames should be.
     app.project.save(new File(OUT + "/feedback_live_edited.aep"));

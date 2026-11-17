@@ -80,8 +80,7 @@ void FillWeights(BlurAxisParams& p, float sigma)
 // Where Transform moves a canvas pixel from, as `inverse * position + offset`.
 void InvertTransform(const FrameParams& f, const CanvasKey& canvas, DisplaceParams* p)
 {
-    const Affine layer = TrailTransform(f.centreX, f.centreY, f.moveX, f.moveY, f.scaleX, f.scaleY, f.rotationDegrees,
-                                        ScaleValue(canvas.downsampleX), ScaleValue(canvas.downsampleY));
+    const Affine layer = TrailTransform(f, ScaleValue(canvas.downsampleX), ScaleValue(canvas.downsampleY));
     // The same move with the canvas's corner as the origin.
     Affine t = layer;
     t.tx = layer.a * canvas.left + layer.b * canvas.top + layer.tx - canvas.left;
@@ -96,11 +95,6 @@ void InvertTransform(const FrameParams& f, const CanvasKey& canvas, DisplacePara
     p->offsetY = -(p->inverse[2] * t.tx + p->inverse[3] * t.ty);
 }
 
-bool MovesTrail(const FrameParams& f)
-{
-    return ::MovesTrail(f.moveX, f.moveY, f.scaleX, f.scaleY, f.rotationDegrees);
-}
-
 // A missing input has zero size, so the kernel never reads it.
 CompositeParams MakeCompositeParams(const CanvasKey& canvas, const PlacedImage& input, int mode)
 {
@@ -113,6 +107,9 @@ CompositeParams MakeCompositeParams(const CanvasKey& canvas, const PlacedImage& 
     p.inputOffsetY = input.offsetY;
     p.inputWidth = input.width;
     p.inputHeight = input.height;
+    p.inputWarped = input.warped;
+    if (input.warped)
+        std::copy(input.fromCanvas, input.fromCanvas + 9, p.inputFromCanvas);
     return p;
 }
 } // namespace
@@ -311,6 +308,9 @@ id<MTLBuffer> FeedbackRenderer::step(
             p.mapOffsetY = map.offsetY;
             p.mapWidth = map.width;
             p.mapHeight = map.height;
+            p.mapWarped = map.warped;
+            if (map.warped)
+                std::copy(map.fromCanvas, map.fromCanvas + 9, p.mapFromCanvas);
         }
         else
         {
@@ -412,13 +412,29 @@ id<MTLBuffer> FeedbackRenderer::compositeInput(
 }
 
 bool FeedbackRenderer::copyOut(
-    id<MTLCommandQueue> queue, const CanvasKey& canvas, id<MTLBuffer> image, const PlacedImage& output)
+    id<MTLCommandQueue> queue,
+    const CanvasKey& canvas,
+    id<MTLBuffer> image,
+    const PlacedImage& output,
+    const float* canvasFromOutput)
 {
-    const int width = std::min(output.width, canvas.width - output.offsetX);
-    const int height = std::min(output.height, canvas.height - output.offsetY);
+    CopyOutParams p{};
+    p.srcPitch = canvas.width;
+    p.dstPitch = output.pitch;
+    p.offsetX = output.offsetX;
+    p.offsetY = output.offsetY;
+    p.canvasWidth = canvas.width;
+    p.canvasHeight = canvas.height;
+    int width = std::min(output.width, canvas.width - output.offsetX);
+    int height = std::min(output.height, canvas.height - output.offsetY);
+    if (canvasFromOutput)
+    {
+        p.warped = 1;
+        std::copy(canvasFromOutput, canvasFromOutput + 9, p.canvasFromOutput);
+        width = output.width;
+        height = output.height;
+    }
     if (width <= 0 || height <= 0)
         return true;
-
-    CopyOutParams p{canvas.width, output.pitch, output.offsetX, output.offsetY};
     return RunOnce(queue, mCopyOut, {image, output.buffer}, p, width, height);
 }

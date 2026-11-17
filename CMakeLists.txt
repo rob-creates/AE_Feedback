@@ -52,6 +52,7 @@ add_library(Feedback MODULE
     src/Feedback.mm
     src/FeedbackCache.mm
     src/FeedbackRenderer.mm
+    src/LayerMotion.mm
     "${SDK}/Util/AEFX_SuiteHelper.c"
     "${PIPL_RSRC}"
     "${METALLIB}"
@@ -66,7 +67,7 @@ target_include_directories(Feedback PRIVATE
     "${SDK}/Resources")
 
 target_compile_features(Feedback PRIVATE cxx_std_17)
-set_source_files_properties(src/Feedback.mm src/FeedbackCache.mm src/FeedbackRenderer.mm
+set_source_files_properties(src/Feedback.mm src/FeedbackCache.mm src/FeedbackRenderer.mm src/LayerMotion.mm
     PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 
 option(FEEDBACK_LOG "Log renders to ~/Library/Logs/AEFeedback.log" OFF)

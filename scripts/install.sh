@@ -5,7 +5,7 @@
 set -euo pipefail
 
 SOURCE="$(cd "$(dirname "$0")/.." && pwd)/Build/Feedback.plugin"
-DEST_DIR="/Applications/Adobe After Effects 2026/Plug-ins/Feedback"
+DEST_DIR="/Applications/Adobe After Effects 2027/Plug-ins/Feedback"
 
 if [[ ! -d "$SOURCE" ]]; then
     echo "Not built yet: $SOURCE" >&2

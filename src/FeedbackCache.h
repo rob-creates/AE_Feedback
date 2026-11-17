@@ -28,11 +28,12 @@ struct CanvasKey
     A_long left, top, width, height;
     PF_RationalScale downsampleX, downsampleY;
     A_long firstTime;
+    bool compSpace = false; // in comp pixels rather than the layer's
 
     bool compatible(const CanvasKey& o) const
     {
         return SameScale(downsampleX, o.downsampleX) && SameScale(downsampleY, o.downsampleY) &&
-               firstTime == o.firstTime;
+               firstTime == o.firstTime && compSpace == o.compSpace;
     }
 
     bool operator==(const CanvasKey& o) const
@@ -46,10 +47,13 @@ struct CanvasKey
 class FeedbackCache
 {
 public:
+    // `motion` fingerprints where the layer went while a comp-space trail was built, which AE's history
+    // doesn't cover. Zero for trails kept in the layer.
     struct Candidate
     {
         CanvasKey key;
         PF_State history;
+        uint64_t motion;
         id<MTLBuffer> buffer;
     };
 
@@ -61,7 +65,7 @@ public:
 
     // Takes ownership of the buffer. Evicted buffers are dropped rather than recycled, because
     // a render further up the stack may still be reading them.
-    void publish(const CanvasKey& key, A_long time, const PF_State& history, id<MTLBuffer> buffer);
+    void publish(const CanvasKey& key, A_long time, const PF_State& history, uint64_t motion, id<MTLBuffer> buffer);
 
     id<MTLBuffer> acquireScratch(size_t bytes);
     void releaseScratch(id<MTLBuffer> buffer);
@@ -72,6 +76,7 @@ private:
         CanvasKey key;
         A_long time;
         PF_State history;
+        uint64_t motion;
         id<MTLBuffer> buffer;
         uint64_t lastUsed;
     };

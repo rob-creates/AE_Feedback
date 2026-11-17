@@ -2,18 +2,22 @@
 # Runs the whole suite: builds, rebuilds the test projects and the live session in After Effects,
 # renders everything with aerender, and checks it.  run_all.sh LABEL [BASELINE]
 # Needs After Effects closed, and a build configured with -DFEEDBACK_LOG=ON. With a BASELINE label,
-# also lists the frames that moved most since that run.
+# also lists the frames that moved most since that run. Exits non-zero if the build or any check fails.
 set -u
 LABEL=$1
 BASE=${2:-}
-APP="Adobe After Effects 2026"
+APP="Adobe After Effects 2027"
 HERE=${0:A:h}
 ROOT=${HERE:h}
 LOG=~/Library/Logs/AEFeedback.log
 
 pgrep -x "After Effects" >/dev/null && { echo "After Effects is open: close it first"; exit 3; }
 grep -q "FEEDBACK_LOG:BOOL=ON" "$ROOT/Build/CMakeCache.txt" || { echo "Configure with -DFEEDBACK_LOG=ON first"; exit 3; }
-cmake --build "$ROOT/Build" -j8 2>&1 | grep -E "error|Built target"
+if ! built=$(cmake --build "$ROOT/Build" -j8 2>&1); then
+    echo "$built" | grep -E "error" | head -20
+    echo "The build failed, so nothing was tested"
+    exit 2
+fi
 
 cd "$HERE"
 : > $LOG
@@ -39,12 +43,28 @@ for script in build_project.jsx live_session.jsx; do
 done
 osascript -e "with timeout of 60 seconds" -e "tell application \"$APP\" to DoScript \"app.quit()\"" -e "end timeout" >/dev/null
 for i in {1..24}; do pgrep -x "After Effects" >/dev/null || break; sleep 5; done
+# It can hang on the way out with no window left, once the projects are saved, so then it's stopped.
+if pgrep -x "After Effects" >/dev/null; then
+    echo "After Effects hung quitting, so it was stopped"
+    pkill -x "After Effects"
+    for i in {1..6}; do pgrep -x "After Effects" >/dev/null || break; sleep 5; done
+    pkill -9 -x "After Effects"
+    sleep 2
+fi
 pgrep -x "After Effects" >/dev/null && { echo "After Effects would not quit"; exit 4; }
 
-caffeinate -i python3 run_tests.py render "$LABEL" | grep -E "exit [1-9]|Error|Traceback"
-python3 run_tests.py check "$LABEL" | grep -E "^FAIL|failed|passed|Traceback|Error"
-python3 live_check.py "$LABEL" | grep -E "^FAIL|failed|passed|Traceback|Error"
-echo "render errors: $(grep -E '^frame=.*err=[1-9]' $LOG | grep -vc 'err=517'), CPU renders: $(grep -c 'CPU render' $LOG)"
+failed=0
+report=$(mktemp)
+caffeinate -i python3 run_tests.py render "$LABEL" > "$report" 2>&1 || failed=1
+grep -E "exit [1-9]|Error|Traceback" "$report"
+python3 run_tests.py check "$LABEL" > "$report" 2>&1 || failed=1
+grep -E "^FAIL|failed|passed|Traceback|Error" "$report"
+python3 live_check.py "$LABEL" > "$report" 2>&1 || failed=1
+grep -E "^FAIL|failed|passed|Traceback|Error" "$report"
+rm -f "$report"
+errors=$(grep -E '^frame=.*err=[1-9]' $LOG | grep -vc 'err=517')
+echo "render errors: $errors, CPU renders: $(grep -c 'CPU render' $LOG)"
+[ "$errors" -eq 0 ] || failed=1
 
 if [ -n "$BASE" ]; then
     python3 - "$BASE" "$LABEL" <<'PY'
@@ -70,3 +90,4 @@ print(f"{a} against {b}: {n} frames, largest differences {worst[:6]}")
 PY
 fi
 rm -rf __pycache__
+exit $failed
