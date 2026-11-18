@@ -37,6 +37,15 @@ enum EdgeType
     EDGE_LUMINANCE = 2
 };
 
+// What a map reads: nothing, the trail itself (Map Layer set to the effect's own layer at Effects &
+// Masks), or a layer from AE.
+enum MapSource
+{
+    MAP_NONE = 0,
+    MAP_TRAIL = 1,
+    MAP_LAYER = 2
+};
+
 enum MapChannel
 {
     MAP_CHANNEL_RED = 1,
@@ -105,6 +114,24 @@ struct AddScaledParams
     int factor;
     float weight;
     int first;
+};
+
+// Blurs each pixel by its own share of the radius: Blur Map Layer's luminance, from none at black to
+// all of it at white. Blends the two blurs either side of that share, of the unblurred image and blurs
+// at 1/8, 1/4, 1/2 and all of the radius.
+struct BlurMapParams
+{
+    int pitch; // of the image and its blurs
+    int width;
+    int height;
+    int mapPitch;
+    int mapOffsetX; // map pixel = canvas pixel - offset
+    int mapOffsetY;
+    int mapWidth;
+    int mapHeight;
+    int mapIsStraight;
+    int mapWarped;
+    float mapFromCanvas[9]; // row-major 3x3, to map pixel coordinates
 };
 
 struct BlurAxisParams

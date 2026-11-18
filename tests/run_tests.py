@@ -34,6 +34,7 @@ COMPS = ["trail", "behind", "screen_sub", "add_sub", "grade_blur", "self_disp", 
          "empty_layer", "empty_mapped", "layer_own", "layer_none", "layer_own_effects",
          "perf_long", "limit_600", "limit_800", "limit_100", "preroll_unlimited",
          "flash_gaussian", "flash_spread", "flash_spread_sub", "adjust_below", "precomp_outer",
+         "blur_sharp", "blur_whole", "blurmap_black", "blurmap_white", "blurmap_left", "blurmap_trail",
          "trim_48", "trim_48_plain", "trim_24", "trim_24_plain", "trim_start", "trim_start_plain",
          "trim_stretch", "trim_stretch_plain",
          *[f"blend_{m}{v}" for m in ("multiply", "lighten", "darken", "overlay", "add_subtract", "difference")
@@ -48,7 +49,7 @@ NEUTRAL = ["neutral_ref", "neutral_luma", "neutral_red", "neutral_alpha_transpar
 COLD = {"trail": 60, "behind": 60, "screen_sub": 60, "add_sub": 60, "grade_blur": 60, "self_disp": 60, "keyed": 70,
         "alpha_min": 60, "alpha_min_fade": 60, "alpha_min_sub": 60,
         "duplicate_fx": 40, "perf_long": 299, "limit_600": 699,
-        "limit_800": 699, "limit_100": 299, "preroll_unlimited": 699, "flash_spread": 32, "trim_48": 60, "trim_start": 60, "trim_stretch": 60,
+        "limit_800": 699, "limit_100": 299, "preroll_unlimited": 699, "flash_spread": 32, "blurmap_left": 60, "blurmap_trail": 60, "trim_48": 60, "trim_start": 60, "trim_stretch": 60,
         "blend_difference": 3, "blend_overlay_sub": 29, "comp_space_2d": 20, "layer_3d": 20, "transform_rotate": 12, "transform_sub": 60, "edge_trail": 60}
 DEEP = 3999  # deep_alpha1's last frame
 
@@ -228,12 +229,27 @@ def cmd_check(label):
 
     print("Map Layer:")
     # A trail displaced by its own alpha differs from one displaced by the layer's image.
-    peak, count = difference(load(label, "layer_own", 71), load(label, "layer_none", 71))
-    report(peak > 8, f"its own layer reads the layer, None reads the trail: differ by peak {peak}/255 across {count} pixels")
-    peak, _ = difference(load(label, "layer_none", 71), load(label, "neutral_ref", 71))
-    report(peak > 8, f"None still displaces, using the trail: differs from no shift by peak {peak}/255")
-    peak, count = difference(load(label, "layer_own_effects", 71), load(label, "layer_none", 71))
-    report(peak <= 1, f"its own layer with Effects & Masks uses the trail, as None: peak {peak}/255 across {count} pixels")
+    peak, count = difference(load(label, "layer_none", 71), load(label, "neutral_ref", 71))
+    report(peak <= 1, f"None displaces nothing: peak {peak}/255 against no shift, across {count} pixels")
+    peak, count = difference(load(label, "layer_own", 71), load(label, "layer_own_effects", 71))
+    report(peak > 8, f"its own layer reads the layer, and at Effects & Masks the trail: differ by peak {peak}/255 "
+                     f"across {count} pixels")
+    peak, _ = difference(load(label, "layer_own_effects", 71), load(label, "neutral_ref", 71))
+    report(peak > 8, f"displaced by the trail, it differs from no shift by peak {peak}/255")
+
+    print("Blur Map Layer:")
+    for comp, ref in (("blurmap_black", "blur_sharp"), ("blurmap_white", "blur_whole")):
+        peak, count = difference(load(label, comp, 60), load(label, ref, 60))
+        report(peak <= 1, f"{comp} matches {ref}: peak {peak}/255 across {count} pixels")
+    left, sharp, whole = (load(label, c, 60) for c in ("blurmap_left", "blur_sharp", "blur_whole"))
+    w = left.shape[1] // 2
+    # Kept clear of the map's edge, where the blur reaches across it.
+    blurred = int(np.abs(left[:, : w - 30] - whole[:, : w - 30]).max())
+    unblurred = int(np.abs(left[:, w + 30 :] - sharp[:, w + 30 :]).max())
+    report(blurred <= 1 and unblurred <= 1, f"blurmap_left blurs the left half only: off by {blurred}/255 from the "
+                                            f"blur there and {unblurred}/255 from none on the right")
+    peak, _ = difference(load(label, "blurmap_trail", 60), load(label, "blur_whole", 60))
+    report(peak > 8, f"blurmap_trail blurs by the trail's own luminance, less than the whole radius: differs by peak {peak}/255")
 
     print("Without a GPU:")
     peak, count = difference(load(label, "software_trail", 23), load(label, "software_plain", 23))

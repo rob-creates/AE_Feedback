@@ -79,9 +79,9 @@ def main(label):
     check("None before picking@60", live("pick_none_before", 60), ref("layer_none", 60))
     check("its own layer@60", live("pick_own", 60), ref("layer_own", 60))
     check("None again@60", live("pick_none_after", 60), ref("layer_none", 60))
-    check("its own layer at Effects & Masks@60", live("own_effects", 60), ref("layer_none", 60))
+    check("its own layer at Effects & Masks@60", live("own_effects", 60), ref("layer_own_effects", 60))
     check("then at Source@60", live("own_source", 60), ref("layer_own", 60))
-    check("then at Effects & Masks again@60", live("own_effects_again", 60), ref("layer_none", 60))
+    check("then at Effects & Masks again@60", live("own_effects_again", 60), ref("layer_own_effects", 60))
 
     print("Moving a layer's in-point during the session:")
     check("before the move@60", live("trim_before", 60), ref("trim_48", 60))

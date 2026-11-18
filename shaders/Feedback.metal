@@ -290,6 +290,39 @@ kernel void addScaled(
     dst[i] = p.first != 0 ? v * p.weight : dst[i] + v * p.weight;
 }
 
+// Each pixel takes its share of the blur from the map's luminance, blending the two blurs either side.
+kernel void blurByMap(
+    device const float4* sharp [[buffer(0)]],
+    device const float4* eighth [[buffer(1)]],
+    device const float4* quarter [[buffer(2)]],
+    device const float4* halfway [[buffer(3)]],
+    device const float4* whole [[buffer(4)]],
+    device const float4* map [[buffer(5)]],
+    device float4* dst [[buffer(6)]],
+    constant BlurMapParams& p [[buffer(7)]],
+    uint2 xy [[thread_position_in_grid]])
+{
+    float2 at = float2(int2(xy) - int2(p.mapOffsetX, p.mapOffsetY));
+    bool seen = true;
+    if (p.mapWarped != 0)
+        seen = project(p.mapFromCanvas, float2(xy), at);
+    // Premultiplied, so transparent parts of the map blur nothing. Beyond it, nothing is blurred.
+    const float4 v =
+        seen ? bilinearPremultiplied(map, p.mapPitch, p.mapWidth, p.mapHeight, at, p.mapIsStraight != 0) : float4(0.0);
+    const float share = saturate(luma(v.xyz));
+    const uint i = xy.y * p.pitch + xy.x;
+    float4 result;
+    if (share <= 0.125f)
+        result = mix(sharp[i], eighth[i], share / 0.125f);
+    else if (share <= 0.25f)
+        result = mix(eighth[i], quarter[i], (share - 0.125f) / 0.125f);
+    else if (share <= 0.5f)
+        result = mix(quarter[i], halfway[i], (share - 0.25f) / 0.25f);
+    else
+        result = mix(halfway[i], whole[i], (share - 0.5f) / 0.5f);
+    dst[i] = result;
+}
+
 namespace
 {
 // Levels, then HSL, then Alpha.

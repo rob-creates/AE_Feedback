@@ -159,11 +159,12 @@ std::unique_ptr<FeedbackRenderer> FeedbackRenderer::create(id<MTLDevice> device,
     r->mBlurAxis = pipeline(@"blurAxis");
     r->mBlurUp = pipeline(@"blurUp");
     r->mAddScaled = pipeline(@"addScaled");
+    r->mBlurByMap = pipeline(@"blurByMap");
     r->mGradeAndComposite = pipeline(@"gradeAndComposite");
     r->mComposite = pipeline(@"composite");
     r->mReframe = pipeline(@"reframe");
     r->mCopyOut = pipeline(@"copyOut");
-    if (!r->mDisplace || !r->mEdge || !r->mBlurDown || !r->mBlurAxis || !r->mBlurUp || !r->mAddScaled || !r->mGradeAndComposite || !r->mComposite ||
+    if (!r->mDisplace || !r->mEdge || !r->mBlurDown || !r->mBlurAxis || !r->mBlurUp || !r->mAddScaled || !r->mBlurByMap || !r->mGradeAndComposite || !r->mComposite ||
         !r->mReframe || !r->mCopyOut)
         return nullptr;
 
@@ -311,6 +312,7 @@ id<MTLBuffer> FeedbackRenderer::step(
     id<MTLBuffer> prev,
     const PlacedImage& input,
     const PlacedImage& map,
+    const PlacedImage& blurMap,
     const FrameParams& f)
 {
     const int width = canvas.width;
@@ -345,7 +347,8 @@ id<MTLBuffer> FeedbackRenderer::step(
     // Transform and displacement, in one resampling. Neutral settings skip it, so they're exactly a no-op.
     const float amountX = f.amountX * scaleX;
     const float amountY = f.amountY * scaleY;
-    const bool mapMissing = f.displaceFromLayer && !map.buffer;
+    // None displaces nothing, and nor does a layer with nothing there.
+    const bool mapMissing = f.displaceSource == MAP_NONE || (f.displaceSource == MAP_LAYER && !map.buffer);
     const bool displaces = (amountX != 0.0f || amountY != 0.0f) && !mapMissing;
     if (displaces || MovesTrail(f))
     {
@@ -364,7 +367,7 @@ id<MTLBuffer> FeedbackRenderer::step(
         id<MTLBuffer> mapBuffer = current;
         if (!displaces)
             mapBuffer = mEmpty; // no map: zero size, so nothing shifts
-        else if (f.displaceFromLayer)
+        else if (f.displaceSource == MAP_LAYER)
         {
             mapBuffer = map.buffer;
             p.mapIsStraight = 1;
@@ -409,9 +412,54 @@ id<MTLBuffer> FeedbackRenderer::step(
     // Blur
     const float sigmaX = BlurSigma(f.blurRadius) * scaleX;
     const float sigmaY = BlurSigma(f.blurRadius) * scaleY;
-    if (std::max(sigmaX, sigmaY) >= kMinSigma)
-        current = f.blurType == BLUR_SPREAD ? encodeSpread(encoder, current, canvas, sigmaX, sigmaY, batch, scratch)
-                                            : encodeBlur(encoder, current, canvas, sigmaX, sigmaY, batch, scratch);
+    auto blurBy = [&](id<MTLBuffer> source, float share)
+    {
+        if (std::max(sigmaX, sigmaY) * share < kMinSigma)
+            return source;
+        return f.blurType == BLUR_SPREAD
+                   ? encodeSpread(encoder, source, canvas, sigmaX * share, sigmaY * share, batch, scratch)
+                   : encodeBlur(encoder, source, canvas, sigmaX * share, sigmaY * share, batch, scratch);
+    };
+    // A layer with nothing there blurs nothing, as black would.
+    const bool blurMapMissing = f.blurSource == MAP_LAYER && !blurMap.buffer;
+    if (std::max(sigmaX, sigmaY) >= kMinSigma && !blurMapMissing)
+    {
+        if (f.blurSource == MAP_NONE)
+            current = blurBy(current, 1.0f);
+        else
+        {
+            BlurMapParams p{};
+            p.pitch = width;
+            p.width = width;
+            p.height = height;
+            id<MTLBuffer> mapBuffer = current;
+            if (f.blurSource == MAP_LAYER)
+            {
+                mapBuffer = blurMap.buffer;
+                p.mapIsStraight = 1;
+                p.mapPitch = blurMap.pitch;
+                p.mapOffsetX = blurMap.offsetX;
+                p.mapOffsetY = blurMap.offsetY;
+                p.mapWidth = blurMap.width;
+                p.mapHeight = blurMap.height;
+                p.mapWarped = blurMap.warped;
+                if (blurMap.warped)
+                    std::copy(blurMap.fromCanvas, blurMap.fromCanvas + 9, p.mapFromCanvas);
+            }
+            else
+            {
+                p.mapPitch = width;
+                p.mapWidth = width;
+                p.mapHeight = height;
+            }
+            id<MTLBuffer> next = acquire();
+            Encode(encoder, mBlurByMap,
+                   {current, blurBy(current, 0.125f), blurBy(current, 0.25f), blurBy(current, 0.5f), blurBy(current, 1.0f),
+                    mapBuffer, next},
+                   p, width, height);
+            current = next;
+        }
+    }
 
     // Levels, HSL and Alpha, then composite with this frame's input. Neutral settings skip the maths,
     // so they're exactly a no-op.

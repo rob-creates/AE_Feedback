@@ -85,7 +85,10 @@
         dotComp("grade_blur", 96, {
             "Alpha Max": 0.9, "Blur Radius": 4, "Hue Shift": 12, "Saturation": 90, "Gamma": 1.1, "Lightness": 1
         });
-        dotComp("self_disp", 96, { "Alpha Max": 0.9, "Max Horizontal": 12, "Max Vertical": -8 });
+        // Displaced by the trail itself: Map Layer is its own layer, at Effects & Masks.
+        var selfDisp = dotComp("self_disp", 96, { "Alpha Max": 0.9, "Max Horizontal": 12, "Max Vertical": -8 });
+        useMap(selfDisp.fx, selfDisp.layer);
+        find(selfDisp.fx, MAP_LAYER).setLayerInputStage(-1);
 
         // A still dot whose trail is its hue turned half way: from frame 1, each blend mode lays the
         // dot's colour over its opposite, which run_tests.py works out for itself. Then the dot over its
@@ -263,6 +266,23 @@
         var outer = newComp("precomp_outer", 48);
         feedback(outer.layers.add(inner), { "Alpha Max": 0.9 });
 
+        // Blur Map Layer scales the blur by its luminance: black blurs nothing, white the whole radius, and a
+        // white map over the left half alone blurs only there. Beside the same dot unblurred and blurred.
+        dotComp("blur_sharp", 72, { "Alpha Max": 0.9 });
+        dotComp("blur_whole", 72, { "Alpha Max": 0.9, "Blur Radius": 6 });
+        var blurMaps = { "blurmap_black": [[0, 0, 0], W], "blurmap_white": [[1, 1, 1], W], "blurmap_left": [[1, 1, 1], W / 2] };
+        for (var bm in blurMaps) {
+            var b = dotComp(bm, 72, { "Alpha Max": 0.9, "Blur Radius": 6 });
+            var bmap = b.comp.layers.addSolid(blurMaps[bm][0], "blur map", blurMaps[bm][1], H, 1, b.comp.duration);
+            bmap.property("Position").setValue([blurMaps[bm][1] / 2, H / 2]);
+            bmap.enabled = false;
+            find(b.fx, BLUR_MAP_LAYER).setValue(bmap.index);
+        }
+        // The trail's own luminance as the blur map: its own layer at Effects & Masks.
+        var blurSelf = dotComp("blurmap_trail", 72, { "Alpha Max": 0.9, "Blur Radius": 6 });
+        find(blurSelf.fx, BLUR_MAP_LAYER).setValue(blurSelf.layer.index);
+        find(blurSelf.fx, BLUR_MAP_LAYER).setLayerInputStage(-1);
+
         // Alpha Min: on its own, against the same blur without it, and split into sub-steps.
         dotComp("alpha_min", 96, { "Alpha Max": 1, "Alpha Min": 0.2, "Blur Radius": 3 });
         dotComp("alpha_min_ref", 96, { "Alpha Max": 1, "Blur Radius": 3 });
@@ -292,7 +312,7 @@
         var own = dotComp("layer_own", 72, { "Alpha Max": 0.9, "Max Horizontal": 100, "Horizontal Channel": 4 });
         useMap(own.fx, own.layer);
         dotComp("layer_none", 72, { "Alpha Max": 0.9, "Max Horizontal": 100, "Horizontal Channel": 4 });
-        // Its own layer with Effects & Masks is the layer as the effect leaves it: the trail, as None.
+        // Its own layer with Effects & Masks is the layer as the effect leaves it: the trail.
         var ownAll = dotComp("layer_own_effects", 72, { "Alpha Max": 0.9, "Max Horizontal": 100, "Horizontal Channel": 4 });
         useMap(ownAll.fx, ownAll.layer);
         find(ownAll.fx, MAP_LAYER).setLayerInputStage(-1);

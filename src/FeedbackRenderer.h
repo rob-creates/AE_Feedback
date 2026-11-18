@@ -13,9 +13,10 @@ struct FrameParams
     float alphaSlope, alphaOffset; // the whole alpha curve: slope * alpha + offset
     float blurRadius; // full-resolution pixels
     int blurType;
+    int blurSource; // MapSource: what scales the radius at each pixel
     float inputBlack, inputWhite, gamma, outputBlack, outputWhite;
     float hueDegrees, saturation, lightness;
-    int displaceFromLayer;
+    int displaceSource; // MapSource
     int channelX, channelY;
     float amountX, amountY; // full-resolution pixels
     float centreX, centreY; // layer pixels at the current resolution, as AE gives a point
@@ -106,6 +107,7 @@ public:
         id<MTLBuffer> prev,
         const PlacedImage& input,
         const PlacedImage& map,
+        const PlacedImage& blurMap,
         const FrameParams& params);
 
     // Runs what's queued and waits for it. Returns false if the GPU work failed.
@@ -176,7 +178,7 @@ private:
 
     id<MTLBuffer> acquireForBatch(StepBatch& batch, size_t bytes);
 
-    id<MTLComputePipelineState> mDisplace, mEdge, mBlurDown, mBlurAxis, mBlurUp, mAddScaled, mGradeAndComposite, mComposite, mReframe, mCopyOut;
+    id<MTLComputePipelineState> mDisplace, mEdge, mBlurDown, mBlurAxis, mBlurUp, mAddScaled, mBlurByMap, mGradeAndComposite, mComposite, mReframe, mCopyOut;
     id<MTLBuffer> mEmpty; // bound wherever a kernel's optional buffer is absent
     std::unique_ptr<FeedbackCache> mCache;
 };

@@ -60,6 +60,7 @@ enum
     PARAM_BLUR_START,
     PARAM_BLUR_TYPE,
     PARAM_BLUR,
+    PARAM_BLUR_LAYER,
     PARAM_BLUR_END,
     PARAM_LEVELS_START,
     PARAM_INPUT_BLACK,
@@ -104,7 +105,7 @@ enum
 // order above. ID 17 belonged to a Source popup, 33 and 34 to Position X and Y sliders, and 44 to a
 // Position where the centre went rather than how far it moved, and 48 to a comp-space checkbox, and they
 // mustn't be reused.
-const int kDiskIds[PARAM_COUNT] = {0,  1,  27, 2,  26, 28, 29, 50, 3,  30, 4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15,
+const int kDiskIds[PARAM_COUNT] = {0,  1,  27, 2,  26, 28, 29, 50, 3,  51, 30, 4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15,
                                    31, 32, 47, 45, 35, 46, 36, 37, 16, 18, 19, 20, 21, 22, 23, 38, 39, 40, 41, 42, 43, 24, 49, 25};
 
 int DiskId(int param)
@@ -175,6 +176,7 @@ struct SampleFacts
     SampleTime time;
     PF_LRect inputRect;
     PF_LRect mapRect;
+    PF_LRect blurMapRect;
 };
 
 struct FrameFacts
@@ -239,6 +241,9 @@ struct SubstepCheckout
     PF_LRect mapRect; // empty if there's no map to fetch
     Projective layerToComp; // with the trail in comp space: where the layer is at this moment
     Projective mapToComp; // and where Map Layer is
+    A_long blurMapId;
+    PF_LRect blurMapRect; // empty if there's no blur map to fetch
+    Projective blurMapToComp;
 };
 
 struct FrameCheckout
@@ -248,9 +253,16 @@ struct FrameCheckout
     uint64_t motion = 0; // with the trail in comp space: the fingerprint an image of this frame is kept with
 };
 
+// What displacement and the blur's size read.
+struct MapSources
+{
+    int displace = MAP_NONE;
+    int blur = MAP_NONE;
+};
+
 struct PreRenderData
 {
-    bool displaceFromLayer = false;
+    MapSources sources;
     CanvasKey canvas;
     PF_LRect outputRect;
     int samplesPerFrame; // the frame's own moment plus any sub-steps
@@ -312,9 +324,9 @@ bool WarpOntoCanvas(PlacedImage* image, const Projective& layerToComp, const PF_
 class MotionPrints
 {
 public:
-    // With `map`, where Map Layer went counts too.
-    MotionPrints(LayerMotion& motion, LayerMotion* map, A_long firstTime, A_long step, int window)
-        : mMotion(motion), mMap(map), mFirst(firstTime), mStep(step), mWindow(window)
+    // Where each map layer went counts too. Null ones are left out.
+    MotionPrints(LayerMotion& motion, std::initializer_list<LayerMotion*> maps, A_long firstTime, A_long step, int window)
+        : mMotion(motion), mMaps(maps), mFirst(firstTime), mStep(step), mWindow(window)
     {
     }
 
@@ -356,15 +368,16 @@ private:
         if (found == mFrames.end())
         {
             uint64_t print = mMotion.fingerprint(t);
-            if (mMap)
-                print = print * 0xC2B2AE3D27D4EB4Full + mMap->fingerprint(t);
+            for (LayerMotion* map : mMaps)
+                if (map)
+                    print = print * 0xC2B2AE3D27D4EB4Full + map->fingerprint(t);
             found = mFrames.emplace(t, print * 0x9E3779B97F4A7C15ull + uint64_t(t)).first;
         }
         return found->second;
     }
 
     LayerMotion& mMotion;
-    LayerMotion* mMap;
+    std::vector<LayerMotion*> mMaps;
     A_long mFirst, mStep;
     int mWindow;
     std::unordered_map<A_long, uint64_t> mFrames, mSums;
@@ -787,6 +800,9 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
     topic("Blur", PARAM_BLUR_START);
     popup("Blur Type", 2, BLUR_GAUSSIAN, "Gaussian|Spread", PARAM_BLUR_TYPE);
     slider("Blur Radius", 0, 500, 0, 50, 0, 2, PARAM_BLUR);
+    // Scales Blur Radius by its luminance at each pixel: black blurs nothing, white the whole radius.
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_LAYER("Blur Map Layer", PF_LayerDefault_NONE, DiskId(PARAM_BLUR_LAYER));
     endTopic(PARAM_BLUR_END);
 
     topic("Levels", PARAM_LEVELS_START);
@@ -822,7 +838,7 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
 
     topic("Displacement", PARAM_DISPLACE_START);
     AEFX_CLR_STRUCT(def);
-    PF_ADD_LAYER("Map Layer (None = Trail)", PF_LayerDefault_NONE, DiskId(PARAM_DISPLACE_LAYER));
+    PF_ADD_LAYER("Map Layer", PF_LayerDefault_NONE, DiskId(PARAM_DISPLACE_LAYER));
     popup("Horizontal Channel", 5, MAP_CHANNEL_LUMA, "Red|Green|Blue|Alpha|Luma", PARAM_CHANNEL_X);
     slider("Max Horizontal", -4000, 4000, -100, 100, 0, 2, PARAM_AMOUNT_X);
     popup("Vertical Channel", 5, MAP_CHANNEL_LUMA, "Red|Green|Blue|Alpha|Luma", PARAM_CHANNEL_Y);
@@ -1116,7 +1132,7 @@ PF_Err ReadFrameFacts(
     const PF_RenderRequest& request,
     A_long time,
     int samplesPerFrame,
-    bool fromLayer,
+    const MapSources& sources,
     A_long* nextId,
     FrameFacts* facts)
 {
@@ -1147,29 +1163,29 @@ PF_Err ReadFrameFacts(
             facts->moves = MovesTrail(f);
         }
         ERR(LayerBounds(in_data, extra, request, PARAM_INPUT, sample.time, nextId, &sample.inputRect));
-        if (!err && fromLayer)
+        if (!err && sources.displace == MAP_LAYER)
             ERR(LayerBounds(in_data, extra, request, PARAM_DISPLACE_LAYER, sample.time, nextId, &sample.mapRect));
+        if (!err && sources.blur == MAP_LAYER)
+            ERR(LayerBounds(in_data, extra, request, PARAM_BLUR_LAYER, sample.time, nextId, &sample.blurMapRect));
         facts->samples.push_back(sample);
     }
     return err;
 }
 
-// Whether displacement reads Map Layer rather than the trail. Checking out the layer can't tell None
-// apart from a layer that's empty at the moment, which should shift nothing. If this can't be read, it
-// reports a layer, because a missing map displaces nothing, which is the safer way to be wrong.
-//
-// This effect's own layer with Effects & Masks also means the trail: that's the layer as this effect
-// leaves it. AE can't render that for the effect itself, as it would loop, so it would otherwise
-// hand over the layer with its masks alone.
+// What a map layer control reads: None reads nothing. The effect's own layer with Effects & Masks means
+// the trail: that's the layer as this effect leaves it. AE can't render that for the effect itself, as
+// it would loop, so it would otherwise hand over the layer with its masks alone. Checking out the layer
+// can't tell None apart from a layer that's empty at the moment, which reads nothing too. If this can't
+// be read, it reports `fallback`.
 //
 // It also says which layer, so a comp-space trail can put the map where that layer is in the comp.
 struct MapChoice
 {
-    bool fromLayer = true;
+    int source = MAP_LAYER;
     AEGP_LayerIDVal layer = AEGP_LayerIDVal_NONE; // none if it couldn't be read
 };
 
-MapChoice ReadMapChoice(PF_InData* in_data, PF_OutData* out_data)
+MapChoice ReadMapChoice(PF_InData* in_data, PF_OutData* out_data, int param, int fallback)
 {
     A_long picked = 1;
     bool readPicked = false;
@@ -1190,13 +1206,13 @@ MapChoice ReadMapChoice(PF_InData* in_data, PF_OutData* out_data)
             return id;
         }();
         if (!pluginId)
-            return {};
+            return MapChoice{fallback};
 
         AEGP_EffectRefH effect = nullptr;
         if (face->AEGP_GetNewEffectForEffect(pluginId, in_data->effect_ref, &effect))
-            return {};
+            return MapChoice{fallback};
         AEGP_StreamRefH stream = nullptr;
-        if (!streams->AEGP_GetNewEffectStreamByIndex(pluginId, effect, PARAM_DISPLACE_LAYER, &stream))
+        if (!streams->AEGP_GetNewEffectStreamByIndex(pluginId, effect, param, &stream))
         {
             AEGP_StreamValue2 value{};
             A_Time time = {in_data->current_time, static_cast<A_u_long>(in_data->time_scale)};
@@ -1217,12 +1233,15 @@ MapChoice ReadMapChoice(PF_InData* in_data, PF_OutData* out_data)
     }
     catch (...)
     {
-        return {};
+        return MapChoice{fallback};
     }
     const bool self = own != AEGP_LayerIDVal_NONE && picked == own && stage == AEGP_LayerParamStage_ALL_EFFECTS;
-    MapChoice choice;
-    choice.fromLayer = picked != AEGP_LayerIDVal_NONE && !self;
-    if (choice.fromLayer && readPicked)
+    MapChoice choice{readPicked ? MAP_LAYER : fallback};
+    if (readPicked && picked == AEGP_LayerIDVal_NONE)
+        choice.source = MAP_NONE;
+    else if (self)
+        choice.source = MAP_TRAIL;
+    else if (readPicked)
         choice.layer = picked;
     return choice;
 }
@@ -1326,7 +1345,7 @@ PF_Err WalkTrail(
     const RunView& view,
     int samplesPerFrame,
     int rebuildLimit,
-    bool fromLayer,
+    const MapSources& sources,
     A_long firstTime,
     A_long* nextId,
     TrailWalk* walk)
@@ -1362,7 +1381,7 @@ PF_Err WalkTrail(
         if (!known)
         {
             FrameFacts read{};
-            ERR(ReadFrameFacts(in_data, extra, request, time, samplesPerFrame, fromLayer, nextId, &read));
+            ERR(ReadFrameFacts(in_data, extra, request, time, samplesPerFrame, sources, nextId, &read));
             if (err)
                 break;
             known = &walk->read.emplace(time, std::move(read)).first->second;
@@ -1394,7 +1413,7 @@ PF_Err WalkTrail(
                     walk->probe = sample;
                 }
             }
-            hasMap = hasMap || (fromLayer && !IsEmpty(sample.mapRect));
+            hasMap = hasMap || (sources.displace == MAP_LAYER && !IsEmpty(sample.mapRect));
         }
 
         const float sigmaX = BlurSigma(facts.blurRadius) * scaleX;
@@ -1410,7 +1429,7 @@ PF_Err WalkTrail(
             varianceX += sigmaX * sigmaX;
             varianceY += sigmaY * sigmaY;
         }
-        if (!fromLayer || hasMap)
+        if (sources.displace == MAP_TRAIL || hasMap)
         {
             shiftX += std::abs(facts.amountX) * scaleX;
             shiftY += std::abs(facts.amountY) * scaleY;
@@ -1545,6 +1564,12 @@ PF_Err CheckOutFrames(
                 ERR(CheckoutWholeLayer(
                     in_data, extra, request, PARAM_DISPLACE_LAYER, sample.time, sub.mapId, &sub.mapRect));
             }
+            if (!err && !IsEmpty(sample.blurMapRect))
+            {
+                sub.blurMapId = (*nextId)++;
+                ERR(CheckoutWholeLayer(
+                    in_data, extra, request, PARAM_BLUR_LAYER, sample.time, sub.blurMapId, &sub.blurMapRect));
+            }
             frame.substeps.push_back(sub);
         }
         data->frames.push_back(std::move(frame));
@@ -1632,16 +1657,20 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
         if (data->watchesComp)
             motion.timestamp(&data->made);
         data->canvas.compSpace = motion.usable() && !motion.drawnInComp();
-        const MapChoice mapChoice = ReadMapChoice(in_data, out_data);
-        data->displaceFromLayer = mapChoice.fromLayer;
-        // Map Layer goes where it is in the comp. If that can't be read, it goes where this layer is.
-        std::optional<LayerMotion> mapMotion;
-        if (data->canvas.compSpace && mapChoice.layer != AEGP_LayerIDVal_NONE)
-        {
-            mapMotion.emplace(in_data, out_data, mapChoice.layer);
-            if (!mapMotion->usable())
-                mapMotion.reset();
-        }
+        // If they can't be read: a missing map displaces nothing, and a blur goes ahead unscaled.
+        const MapChoice mapChoice = ReadMapChoice(in_data, out_data, PARAM_DISPLACE_LAYER, MAP_LAYER);
+        const MapChoice blurChoice = ReadMapChoice(in_data, out_data, PARAM_BLUR_LAYER, MAP_NONE);
+        data->sources.displace = mapChoice.source;
+        data->sources.blur = blurChoice.source;
+        // A map layer goes where it is in the comp. If that can't be read, it goes where this layer is.
+        std::optional<LayerMotion> mapMotion, blurMotion;
+        for (auto [choice, place] : {std::pair{&mapChoice, &mapMotion}, std::pair{&blurChoice, &blurMotion}})
+            if (data->canvas.compSpace && choice->layer != AEGP_LayerIDVal_NONE)
+            {
+                place->emplace(in_data, out_data, choice->layer);
+                if (!(*place)->usable())
+                    place->reset();
+            }
 
         const FrameFactsMemo::Key factsKey{
             step,
@@ -1656,7 +1685,7 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
         TrailWalk walk;
         if (!err)
             ERR(WalkTrail(
-                in_data, extra, request, metal->memo, view, data->samplesPerFrame, rebuildLimit, data->displaceFromLayer, firstTime, &nextId, &walk));
+                in_data, extra, request, metal->memo, view, data->samplesPerFrame, rebuildLimit, data->sources, firstTime, &nextId, &walk));
 
         // A failed walk keeps nothing, as what it read may not match any history.
         if (!err)
@@ -1693,7 +1722,8 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
         }
 
         // With the trail in comp space, the output is the layer's view of the comp, around the layer.
-        MotionPrints prints(motion, mapMotion ? &*mapMotion : nullptr, firstTime, step, int(walk.window.size()));
+        MotionPrints prints(motion, {mapMotion ? &*mapMotion : nullptr, blurMotion ? &*blurMotion : nullptr}, firstTime, step,
+                            int(walk.window.size()));
         MotionAt motionAt;
         if (!err && data->canvas.compSpace)
         {
@@ -1738,6 +1768,10 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
                 sub.mapToComp = sub.layerToComp;
                 if (!err && mapMotion && !IsEmpty(sub.mapRect) &&
                     !mapMotion->layerToComp(sub.time.value, sub.time.scale, &sub.mapToComp))
+                    err = PF_Err_INTERNAL_STRUCT_DAMAGED;
+                sub.blurMapToComp = sub.layerToComp;
+                if (!err && blurMotion && !IsEmpty(sub.blurMapRect) &&
+                    !blurMotion->layerToComp(sub.time.value, sub.time.scale, &sub.blurMapToComp))
                     err = PF_Err_INTERNAL_STRUCT_DAMAGED;
             }
         }
@@ -1850,7 +1884,8 @@ PF_Err ComputeSample(
     FrameParams params{};
     if (!err)
         params = DivideIntoSubsteps(ReadFrameParams(in_data, sub.time, &err), render.data.samplesPerFrame, frameEnd);
-    params.displaceFromLayer = render.data.displaceFromLayer;
+    params.displaceSource = render.data.sources.displace;
+    params.blurSource = render.data.sources.blur;
 
     auto fetchStart = std::chrono::steady_clock::now();
     PF_EffectWorld* inputWorld = isCurrent ? render.currentInput : nullptr;
@@ -1862,20 +1897,26 @@ PF_Err ComputeSample(
     PF_EffectWorld* mapWorld = nullptr;
     if (!err && !IsEmpty(sub.mapRect))
         ERR(extra->cb->checkout_layer_pixels(in_data->effect_ref, sub.mapId, &mapWorld));
+    PF_EffectWorld* blurMapWorld = nullptr;
+    if (!err && !IsEmpty(sub.blurMapRect))
+        ERR(extra->cb->checkout_layer_pixels(in_data->effect_ref, sub.blurMapId, &blurMapWorld));
     render.fetchMs += MsSince(fetchStart);
 
-    PlacedImage input{}, map{};
+    PlacedImage input{}, map{}, blurMap{};
     if (!err)
         ERR(render.place(inputWorld, sub.inputRect, &input));
     if (!err)
         ERR(render.place(mapWorld, sub.mapRect, &map));
+    if (!err)
+        ERR(render.place(blurMapWorld, sub.blurMapRect, &blurMap));
 
     // In comp space, the input and map are where the layer is at this moment, and Centre goes with it.
     if (!err && render.data.canvas.compSpace)
     {
         const CanvasKey& canvas = render.data.canvas;
         if ((input.buffer && !WarpOntoCanvas(&input, sub.layerToComp, sub.inputRect, canvas, in_data)) ||
-            (map.buffer && !WarpOntoCanvas(&map, sub.mapToComp, sub.mapRect, canvas, in_data)))
+            (map.buffer && !WarpOntoCanvas(&map, sub.mapToComp, sub.mapRect, canvas, in_data)) ||
+            (blurMap.buffer && !WarpOntoCanvas(&blurMap, sub.blurMapToComp, sub.blurMapRect, canvas, in_data)))
             err = PF_Err_INTERNAL_STRUCT_DAMAGED;
 
         const Projective toComp = AtResolution(sub.layerToComp, in_data);
@@ -1890,7 +1931,7 @@ PF_Err ComputeSample(
     if (!err)
     {
         auto gpuStart = std::chrono::steady_clock::now();
-        *next = render.renderer.step(render.batch, render.data.canvas, image, input, map, params);
+        *next = render.renderer.step(render.batch, render.data.canvas, image, input, map, blurMap, params);
         render.gpuMs += MsSince(gpuStart);
         render.queuedSteps++;
     }
@@ -1899,6 +1940,8 @@ PF_Err ComputeSample(
         render.checkedOut.push_back(sub.inputId);
     if (mapWorld)
         render.checkedOut.push_back(sub.mapId);
+    if (blurMapWorld)
+        render.checkedOut.push_back(sub.blurMapId);
     return err;
 }
 

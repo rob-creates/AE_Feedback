@@ -64,7 +64,12 @@
             var fx = feedback(movingDot(c), { "Alpha Max": 0.98, "Max Horizontal": 15, "Max Vertical": 15 }, n);
             find(fx, MAP_LAYER).setValue(c.layer("map").index);
         },
-        trailmap: function (c, n) { feedback(movingDot(c), { "Alpha Max": 0.98, "Max Horizontal": 6, "Max Vertical": 6 }, n); },
+        trailmap: function (c, n) {
+            var layer = movingDot(c);
+            var fx = feedback(layer, { "Alpha Max": 0.98, "Max Horizontal": 6, "Max Vertical": 6 }, n);
+            find(fx, MAP_LAYER).setValue(layer.index);
+            find(fx, MAP_LAYER).setLayerInputStage(-1);
+        },
         sub: function (c, n) { feedback(movingDot(c), { "Alpha Max": 0.98, "Sub-steps": 7 }, n); },
         add: function (c, n) { feedback(movingDot(c), { "Alpha Max": 0.97, "Composite": 3, "Sub-steps": 3 }, n); },
         late: function (c, n) {

@@ -7,8 +7,13 @@ Feedback Effect for Adobe After Effects
 - A 3D layer keeps its trail on the layer, which goes through the camera with it. To work on what a
   3D layer looks like through the camera, precompose it with the camera and put Feedback on the
   precomp, or put Feedback on an adjustment layer above it.
-- Map Layer is read where it is in the comp. Where the map is transparent, nothing moves.
+- Map Layer is read where it is in the comp. Where the map is transparent, nothing moves. Left at
+  None, nothing is displaced.
 - Map Layer set to the effect's own layer, at Effects & Masks, uses the trail as the map.
+- Blur Map Layer scales Blur Radius by its luminance at each pixel: black blurs nothing, white blurs
+  by the whole radius, and transparent parts blur nothing. Like Map Layer, it's read where it is in
+  the comp, and the effect's own layer at Effects & Masks uses the trail. Left at None, the whole
+  image blurs by the radius.
 - Jumping to a frame recalculates the whole trail before it, so the trail is always complete, though a
   long one that never fades takes a while. Turn on Limit Pre-Roll to recalculate only the last
   Pre-Roll Limit frames instead: quicker, but a long trail can look shorter after a jump. Playing
