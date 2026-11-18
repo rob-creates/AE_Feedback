@@ -33,7 +33,7 @@ COMPS = ["trail", "behind", "screen_sub", "add_sub", "grade_blur", "self_disp", 
          "neutral_alpha_half", "map_solid_opaque", "map_source_default", "map_solid_masked", "map_effects",
          "empty_layer", "empty_mapped", "layer_own", "layer_none", "layer_own_effects",
          "perf_long", "limit_600", "limit_800", "limit_100", "preroll_unlimited",
-         "flash_gaussian", "flash_spread", "flash_spread_sub", "adjust_below", "precomp_outer",
+         "flash_spread", "flash_spread_sub", "adjust_below", "precomp_outer",
          "blur_sharp", "blur_whole", "blurmap_black", "blurmap_white", "blurmap_left", "blurmap_trail",
          "trim_48", "trim_48_plain", "trim_24", "trim_24_plain", "trim_start", "trim_start_plain",
          "trim_stretch", "trim_stretch_plain",
@@ -173,7 +173,7 @@ def cmd_check(label):
     worst = min(b / a for a, b in zip(counts, counts[1:]) if a)
     report(worst > 0.99, f"playing forward, the limit doesn't cut the trail: worst frame-to-frame change x{worst:.3f}")
 
-    print("Spread's widths add, so a copy spreads in step with its age, where a Gaussian's spreads with its root:")
+    print("The blur's widths add, so a copy spreads in step with its age, not its square root:")
     def half_radius(comp, frame):
         """The radius around the centre holding half the trail's alpha."""
         a = load(label, comp, frame)[..., 3].astype(np.float64)
@@ -182,13 +182,13 @@ def cmd_check(label):
         order = np.argsort(r)
         mass = np.cumsum(a.ravel()[order])
         return float(r[order][np.searchsorted(mass, mass[-1] / 2)])
-    for comp, lo, hi in (("flash_gaussian", 1.6, 2.4), ("flash_spread", 3.0, 4.5)):
-        radii = [half_radius(comp, f) for f in (4, 8, 16, 32)]
-        growth = radii[3] / radii[1]
-        report(lo <= growth <= hi, f"{comp}: half-alpha radius {[round(r, 1) for r in radii]} at frames 4, 8, 16, 32, "
-                                   f"x{growth:.2f} from 8 to 32 (between {lo} and {hi})")
+    radii = [half_radius("flash_spread", f) for f in (4, 8, 16, 32)]
+    growth = radii[3] / radii[1]
+    # A square root would be x2 at most.
+    report(3.0 <= growth <= 4.5, f"flash_spread: half-alpha radius {[round(r, 1) for r in radii]} at frames 4, 8, 16, 32, "
+                                 f"x{growth:.2f} from 8 to 32 (between 3.0 and 4.5)")
     whole, split = half_radius("flash_spread", 16), half_radius("flash_spread_sub", 16)
-    report(abs(split / whole - 1) <= 0.1, f"flash_spread_sub: sub-steps keep Spread's reach: half-alpha radius {split:.1f} "
+    report(abs(split / whole - 1) <= 0.1, f"flash_spread_sub: sub-steps keep the blur's reach: half-alpha radius {split:.1f} "
                                           f"against {whole:.1f} at frame 16")
 
     print("Alpha Max 1.0, 4000 frames in, rendered alone:")
@@ -244,8 +244,8 @@ def cmd_check(label):
     left, sharp, whole = (load(label, c, 60) for c in ("blurmap_left", "blur_sharp", "blur_whole"))
     w = left.shape[1] // 2
     # Kept clear of the map's edge, where the blur reaches across it.
-    blurred = int(np.abs(left[:, : w - 30] - whole[:, : w - 30]).max())
-    unblurred = int(np.abs(left[:, w + 30 :] - sharp[:, w + 30 :]).max())
+    blurred = difference(left[:, : w - 30], whole[:, : w - 30])[0]
+    unblurred = difference(left[:, w + 30 :], sharp[:, w + 30 :])[0]
     report(blurred <= 1 and unblurred <= 1, f"blurmap_left blurs the left half only: off by {blurred}/255 from the "
                                             f"blur there and {unblurred}/255 from none on the right")
     peak, _ = difference(load(label, "blurmap_trail", 60), load(label, "blur_whole", 60))

@@ -147,6 +147,15 @@ inline float4 bilinearPremultiplied(device const float4* src, int pitch, int w, 
     return mix(top, bottom, f.y);
 }
 
+// Where a canvas pixel falls in a map. False where it has no place in it.
+inline bool mapPosition(constant MapLookup& m, uint2 xy, thread float2& at)
+{
+    if (m.warped != 0)
+        return project(m.fromCanvas, float2(xy), at);
+    at = float2(int2(xy) - int2(m.offsetX, m.offsetY));
+    return true;
+}
+
 // Transparent beyond the image, rather than repeating its edge.
 inline float4 sampleOrClear(device const float4* src, int pitch, int w, int h, float2 pos)
 {
@@ -164,19 +173,15 @@ kernel void displace(
     uint2 xy [[thread_position_in_grid]])
 {
     int2 canvas = int2(xy);
-    int2 m = canvas - int2(p.mapOffsetX, p.mapOffsetY);
-    if (p.mapWarped != 0)
-    {
-        float2 at;
-        m = project(p.mapFromCanvas, float2(canvas), at) ? int2(floor(at + 0.5f)) : int2(-1);
-    }
+    float2 at;
+    const int2 m = mapPosition(p.map, xy, at) ? int2(floor(at + 0.5f)) : int2(-1);
     float2 shift = float2(0.0);
-    if (m.x >= 0 && m.y >= 0 && m.x < p.mapWidth && m.y < p.mapHeight)
+    if (m.x >= 0 && m.y >= 0 && m.x < p.map.width && m.y < p.map.height)
     {
-        float4 v = map[m.y * p.mapPitch + m.x];
+        float4 v = map[m.y * p.map.pitch + m.x];
         shift = float2(
-            mapShift(v, p.channelX, p.mapIsStraight != 0) * p.amountX,
-            mapShift(v, p.channelY, p.mapIsStraight != 0) * p.amountY);
+            mapShift(v, p.channelX, p.map.isStraight != 0) * p.amountX,
+            mapShift(v, p.channelY, p.map.isStraight != 0) * p.amountY);
     }
     // Displacement says where each pixel comes from, and Transform where that was before it moved.
     const float2 shifted = float2(canvas) + shift;
@@ -264,16 +269,6 @@ kernel void blurAxis(
     dst[xy.y * p.dstPitch + xy.x] = sum;
 }
 
-kernel void blurUp(
-    device const float4* src [[buffer(0)]],
-    device float4* dst [[buffer(1)]],
-    constant BlurResizeParams& p [[buffer(2)]],
-    uint2 xy [[thread_position_in_grid]])
-{
-    float2 pos = (float2(xy) + 0.5f) / float(p.factor) - 0.5f;
-    dst[xy.y * p.dstPitch + xy.x] = bilinearClamped(src, p.srcPitch, p.srcWidth, p.srcHeight, pos);
-}
-
 // Adds a weighted share of a blurred image, scaled up from its smaller size, to the sum.
 kernel void addScaled(
     device const float4* src [[buffer(0)]],
@@ -302,13 +297,11 @@ kernel void blurByMap(
     constant BlurMapParams& p [[buffer(7)]],
     uint2 xy [[thread_position_in_grid]])
 {
-    float2 at = float2(int2(xy) - int2(p.mapOffsetX, p.mapOffsetY));
-    bool seen = true;
-    if (p.mapWarped != 0)
-        seen = project(p.mapFromCanvas, float2(xy), at);
     // Premultiplied, so transparent parts of the map blur nothing. Beyond it, nothing is blurred.
-    const float4 v =
-        seen ? bilinearPremultiplied(map, p.mapPitch, p.mapWidth, p.mapHeight, at, p.mapIsStraight != 0) : float4(0.0);
+    float2 at;
+    const float4 v = mapPosition(p.map, xy, at)
+                         ? bilinearPremultiplied(map, p.map.pitch, p.map.width, p.map.height, at, p.map.isStraight != 0)
+                         : float4(0.0);
     const float share = saturate(luma(v.xyz));
     const uint i = xy.y * p.pitch + xy.x;
     float4 result;

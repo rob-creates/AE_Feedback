@@ -52,28 +52,40 @@ public:
     // can't be read.
     uint64_t fingerprint(A_long time);
 
-    // An adjustment layer's input is whatever is beneath it, and AE's history of the effect's inputs
-    // doesn't change when that does. So its images are kept with when they were made, and only used
-    // while nothing in the comp has changed since, up to their frame.
-    bool watchesComp() const { return mAdjustment; }
-    // The project's timestamp, which goes up with every change that affects rendering.
-    bool timestamp(AEGP_TimeStamp* out);
-    // False if anything in the comp before `endExclusive`, in the effect's time, has changed since
-    // `made`, or if that can't be told.
-    bool unchangedSince(const AEGP_TimeStamp& made, A_long endExclusive);
-
 private:
     PF_InData* mInData;
     PF_OutData* mOutData;
     AEGP_LayerH mLayer = nullptr;
     bool mUsable = false;
     bool mDrawnInComp = false;
-    bool mAdjustment = false;
-    AEGP_ItemH mCompItem = nullptr;
     A_long mCompWidth = 0, mCompHeight = 0;
     // Held for the life of this object, which lasts one call.
     std::optional<AEFX_SuiteScoper<AEGP_PFInterfaceSuite1>> mFace;
     std::optional<AEFX_SuiteScoper<AEGP_LayerSuite9>> mLayers;
-    std::optional<AEFX_SuiteScoper<AEGP_RenderSuite5>> mRender;
     std::map<std::pair<A_long, A_u_long>, Projective> mRead;
+};
+
+// An adjustment layer's input is whatever is beneath it, and AE's history of the effect's inputs
+// doesn't change when that does. So its images are kept with the project's timestamp from when they
+// were made, and only used while nothing in the comp has changed since, up to their frame. Other
+// layers have nothing to watch.
+class CompWatch
+{
+public:
+    CompWatch(PF_InData* in_data, PF_OutData* out_data);
+
+    bool active() const { return mCompItem != nullptr; }
+    // The project's timestamp, which goes up with every change that affects rendering.
+    bool timestamp(AEGP_TimeStamp* out) const;
+    // False if anything in the comp before `endExclusive`, in the effect's time, has changed since
+    // `made`, or if that can't be told.
+    bool unchangedSince(const AEGP_TimeStamp& made, A_long endExclusive) const;
+
+private:
+    PF_InData* mInData;
+    AEGP_ItemH mCompItem = nullptr;
+    std::optional<AEFX_SuiteScoper<AEGP_PFInterfaceSuite1>> mFace;
+    std::optional<AEFX_SuiteScoper<AEGP_RenderSuite5>> mRender;
+    AEGP_TimeStamp mNow{}; // nothing made at this timestamp can have been changed since
+    bool mHaveNow = false;
 };

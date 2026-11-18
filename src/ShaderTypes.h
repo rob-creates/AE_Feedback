@@ -23,14 +23,6 @@ enum CompositeMode
     COMPOSITE_DIFFERENCE = 10
 };
 
-// Gaussian softens each frame's copy by the same amount, so the spread grows only with the square root of
-// the frame count. Spread has long tails, so its widths add straight up: n frames spread n times as far.
-enum BlurType
-{
-    BLUR_GAUSSIAN = 1,
-    BLUR_SPREAD = 2
-};
-
 enum EdgeType
 {
     EDGE_COLOUR = 1,
@@ -55,20 +47,28 @@ enum MapChannel
     MAP_CHANNEL_LUMA = 5
 };
 
+// Where a map is, for a kernel reading it: a layer from AE, or the feedback image itself.
+struct MapLookup
+{
+    int pitch;
+    int offsetX; // map pixel = canvas pixel - offset
+    int offsetY;
+    int width;
+    int height;
+    int isStraight; // a layer from AE, rather than the feedback image itself
+    // With the trail in comp space, the map is in its layer: where each canvas pixel falls in it.
+    int warped;
+    float fromCanvas[9]; // row-major 3x3, to map pixel coordinates
+};
+
 struct DisplaceParams
 {
     int srcPitch;
-    int mapPitch;
     int dstPitch;
     int width;
     int height;
-    int mapOffsetX; // map pixel = canvas pixel - offset
-    int mapOffsetY;
-    int mapWidth;
-    int mapHeight;
     int channelX;
     int channelY;
-    int mapIsStraight; // a layer from AE, rather than the feedback image itself
     float amountX; // pixels of shift at full channel value
     float amountY;
     // Where each pixel's shifted position came from before Transform moved it, as canvas pixels:
@@ -76,9 +76,7 @@ struct DisplaceParams
     float inverse[4]; // row-major 2x2
     float offsetX;
     float offsetY;
-    // With the trail in comp space, the map is in the layer: where each canvas pixel falls in it.
-    int mapWarped;
-    float mapFromCanvas[9]; // row-major 3x3, to map pixel coordinates
+    MapLookup map;
 };
 
 struct EdgeParams
@@ -124,14 +122,7 @@ struct BlurMapParams
     int pitch; // of the image and its blurs
     int width;
     int height;
-    int mapPitch;
-    int mapOffsetX; // map pixel = canvas pixel - offset
-    int mapOffsetY;
-    int mapWidth;
-    int mapHeight;
-    int mapIsStraight;
-    int mapWarped;
-    float mapFromCanvas[9]; // row-major 3x3, to map pixel coordinates
+    MapLookup map;
 };
 
 struct BlurAxisParams

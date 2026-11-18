@@ -10,6 +10,8 @@ Feedback Effect for Adobe After Effects
 - Map Layer is read where it is in the comp. Where the map is transparent, nothing moves. Left at
   None, nothing is displaced.
 - Map Layer set to the effect's own layer, at Effects & Masks, uses the trail as the map.
+- The blur spreads a copy in step with its age: a small Blur Radius leaves new copies almost sharp,
+  and older ones spread further each frame, with soft, long-tailed edges.
 - Blur Map Layer scales Blur Radius by its luminance at each pixel: black blurs nothing, white blurs
   by the whole radius, and transparent parts blur nothing. Like Map Layer, it's read where it is in
   the comp, and the effect's own layer at Effects & Masks uses the trail. Left at None, the whole

@@ -12,7 +12,6 @@ struct FrameParams
     float alpha; // the fade alone
     float alphaSlope, alphaOffset; // the whole alpha curve: slope * alpha + offset
     float blurRadius; // full-resolution pixels
-    int blurType;
     int blurSource; // MapSource: what scales the radius at each pixel
     float inputBlack, inputWhite, gamma, outputBlack, outputWhite;
     float hueDegrees, saturation, lightness;
@@ -139,46 +138,53 @@ public:
 private:
     FeedbackRenderer() = default;
 
-    // A blurred image, `factor` times smaller than the canvas.
+    // An image `factor` times smaller than the canvas. `owned` if it's this step's to hand back early.
     struct SmallBlur
     {
         id<MTLBuffer> buffer;
         int width, height, factor;
+        bool owned = false;
     };
+
+    // The image to be blurred, halved again and again as far as any blur needs, shared by every blur
+    // of it in a step. [j] is 2^j times smaller, and [0] the image itself.
+    struct Pyramid
+    {
+        std::vector<SmallBlur> levels;
+    };
+
+    SmallBlur pyramidLevel(id<MTLComputeCommandEncoder> encoder, Pyramid& pyramid, int level, StepBatch& batch,
+                           std::vector<id<MTLBuffer>>& scratch);
 
     // Wide blurs are worked out on a smaller image, which this leaves small.
     SmallBlur encodeSmallBlur(
         id<MTLComputeCommandEncoder> encoder,
-        id<MTLBuffer> source,
-        const CanvasKey& canvas,
+        Pyramid& pyramid,
         float sigmaX,
         float sigmaY,
         StepBatch& batch,
         std::vector<id<MTLBuffer>>& scratch);
 
-    id<MTLBuffer> encodeBlur(
-        id<MTLComputeCommandEncoder> encoder,
-        id<MTLBuffer> source,
-        const CanvasKey& canvas,
-        float sigmaX,
-        float sigmaY,
-        StepBatch& batch,
-        std::vector<id<MTLBuffer>>& scratch);
-
-    // Spread: Gaussians from far narrower to far wider than `width` mixed into a long-tailed blur
-    // whose widths add, as a Cauchy distribution's do.
+    // The blur: Gaussians from far narrower to far wider than `width` mixed into a long-tailed blur
+    // whose widths add, as a Cauchy distribution's do, so a copy spreads in step with its age rather
+    // than its square root. Each is worked out at its own size and they're
+    // summed from the smallest up.
     id<MTLBuffer> encodeSpread(
         id<MTLComputeCommandEncoder> encoder,
-        id<MTLBuffer> source,
+        Pyramid& pyramid,
         const CanvasKey& canvas,
         float widthX,
         float widthY,
         StepBatch& batch,
         std::vector<id<MTLBuffer>>& scratch);
 
+    // Hands a buffer back for the rest of the step to reuse, once everything reading it is encoded.
+    // Dispatches in one encoder run in order, so nothing later can overwrite it too soon.
+    void release(id<MTLBuffer> buffer, StepBatch& batch, std::vector<id<MTLBuffer>>& scratch);
+
     id<MTLBuffer> acquireForBatch(StepBatch& batch, size_t bytes);
 
-    id<MTLComputePipelineState> mDisplace, mEdge, mBlurDown, mBlurAxis, mBlurUp, mAddScaled, mBlurByMap, mGradeAndComposite, mComposite, mReframe, mCopyOut;
+    id<MTLComputePipelineState> mDisplace, mEdge, mBlurDown, mBlurAxis, mAddScaled, mBlurByMap, mGradeAndComposite, mComposite, mReframe, mCopyOut;
     id<MTLBuffer> mEmpty; // bound wherever a kernel's optional buffer is absent
     std::unique_ptr<FeedbackCache> mCache;
 };

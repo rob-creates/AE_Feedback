@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <initializer_list>
+#include <functional>
+#include <map>
 #include <vector>
 
 #include "ShaderTypes.h"
@@ -106,6 +108,28 @@ std::vector<SpreadPart> SpreadParts(float width, float widest)
     return parts;
 }
 
+// Describes a map for a kernel: a placed layer, or else the trail itself, and returns its buffer.
+id<MTLBuffer> FillMap(MapLookup& m, const PlacedImage& image, int source, id<MTLBuffer> trail, int width, int height)
+{
+    if (source != MAP_LAYER)
+    {
+        m.pitch = width;
+        m.width = width;
+        m.height = height;
+        return trail;
+    }
+    m.isStraight = 1;
+    m.pitch = image.pitch;
+    m.offsetX = image.offsetX;
+    m.offsetY = image.offsetY;
+    m.width = image.width;
+    m.height = image.height;
+    m.warped = image.warped;
+    if (image.warped)
+        std::copy(image.fromCanvas, image.fromCanvas + 9, m.fromCanvas);
+    return image.buffer;
+}
+
 // Where Transform moves a canvas pixel from, as `inverse * position + offset`.
 void InvertTransform(const FrameParams& f, const CanvasKey& canvas, DisplaceParams* p)
 {
@@ -157,14 +181,13 @@ std::unique_ptr<FeedbackRenderer> FeedbackRenderer::create(id<MTLDevice> device,
     r->mEdge = pipeline(@"edge");
     r->mBlurDown = pipeline(@"blurDown");
     r->mBlurAxis = pipeline(@"blurAxis");
-    r->mBlurUp = pipeline(@"blurUp");
     r->mAddScaled = pipeline(@"addScaled");
     r->mBlurByMap = pipeline(@"blurByMap");
     r->mGradeAndComposite = pipeline(@"gradeAndComposite");
     r->mComposite = pipeline(@"composite");
     r->mReframe = pipeline(@"reframe");
     r->mCopyOut = pipeline(@"copyOut");
-    if (!r->mDisplace || !r->mEdge || !r->mBlurDown || !r->mBlurAxis || !r->mBlurUp || !r->mAddScaled || !r->mBlurByMap || !r->mGradeAndComposite || !r->mComposite ||
+    if (!r->mDisplace || !r->mEdge || !r->mBlurDown || !r->mBlurAxis || !r->mAddScaled || !r->mBlurByMap || !r->mGradeAndComposite || !r->mComposite ||
         !r->mReframe || !r->mCopyOut)
         return nullptr;
 
@@ -201,43 +224,53 @@ bool FeedbackRenderer::flush(StepBatch& batch)
     return ok;
 }
 
+void FeedbackRenderer::release(id<MTLBuffer> buffer, StepBatch& batch, std::vector<id<MTLBuffer>>& scratch)
+{
+    auto found = std::find(scratch.begin(), scratch.end(), buffer);
+    if (found == scratch.end())
+        return;
+    scratch.erase(found);
+    batch.freeBuffers.push_back(buffer);
+}
+
+FeedbackRenderer::SmallBlur FeedbackRenderer::pyramidLevel(
+    id<MTLComputeCommandEncoder> encoder, Pyramid& pyramid, int level, StepBatch& batch, std::vector<id<MTLBuffer>>& scratch)
+{
+    while (int(pyramid.levels.size()) <= level)
+    {
+        const SmallBlur above = pyramid.levels.back();
+        SmallBlur next{nil, (above.width + 1) / 2, (above.height + 1) / 2, above.factor * 2};
+        next.buffer = acquireForBatch(batch, size_t(next.width) * size_t(next.height) * 16);
+        scratch.push_back(next.buffer);
+        BlurResizeParams p{above.width, next.width, above.width, above.height, 2};
+        Encode(encoder, mBlurDown, {above.buffer, next.buffer}, p, next.width, next.height);
+        pyramid.levels.push_back(next);
+    }
+    return pyramid.levels[size_t(level)];
+}
+
 FeedbackRenderer::SmallBlur FeedbackRenderer::encodeSmallBlur(
     id<MTLComputeCommandEncoder> encoder,
-    id<MTLBuffer> source,
-    const CanvasKey& canvas,
+    Pyramid& pyramid,
     float sigmaX,
     float sigmaY,
     StepBatch& batch,
     std::vector<id<MTLBuffer>>& scratch)
 {
     // Very wide blurs run on a smaller image, so their cost doesn't grow with the radius.
-    int factor = 1;
-    while (std::max(sigmaX, sigmaY) / factor > kMaxDirectSigma)
-        factor *= 2;
+    int level = 0;
+    while (std::max(sigmaX, sigmaY) / float(1 << level) > kMaxDirectSigma)
+        level++;
+    SmallBlur result = pyramidLevel(encoder, pyramid, level, batch, scratch);
+    const int factor = result.factor;
 
-    // The box filter already contributes some blur, so the Gaussian only supplies the rest.
+    // Halving averages 2x2 blocks, which add up to a box of `factor`. That already contributes some
+    // blur, so the Gaussian only supplies the rest.
     auto lowSigma = [&](float s)
     {
         float boxVariance = (float(factor * factor) - 1.0f) / 12.0f;
         return std::sqrt(std::max(s * s - boxVariance, 0.0f)) / float(factor);
     };
-
-    SmallBlur result{source, (canvas.width + factor - 1) / factor, (canvas.height + factor - 1) / factor, factor};
-    const size_t lowBytes = size_t(result.width) * size_t(result.height) * 16;
-    auto acquire = [&]()
-    {
-        id<MTLBuffer> buffer = acquireForBatch(batch, lowBytes);
-        scratch.push_back(buffer);
-        return buffer;
-    };
-
-    if (factor > 1)
-    {
-        BlurResizeParams p{canvas.width, result.width, canvas.width, canvas.height, factor};
-        id<MTLBuffer> low = acquire();
-        Encode(encoder, mBlurDown, {result.buffer, low}, p, result.width, result.height);
-        result.buffer = low;
-    }
 
     for (int axis = 0; axis < 2; axis++)
     {
@@ -252,35 +285,20 @@ FeedbackRenderer::SmallBlur FeedbackRenderer::encodeSmallBlur(
         p.dirX = axis == 0 ? 1 : 0;
         p.dirY = axis == 0 ? 0 : 1;
         FillWeights(p, sigma);
-        id<MTLBuffer> next = acquire();
+        id<MTLBuffer> next = acquireForBatch(batch, size_t(result.width) * size_t(result.height) * 16);
+        scratch.push_back(next);
         Encode(encoder, mBlurAxis, {result.buffer, next}, p, result.width, result.height);
+        if (result.owned)
+            release(result.buffer, batch, scratch);
         result.buffer = next;
+        result.owned = true;
     }
     return result;
 }
 
-id<MTLBuffer> FeedbackRenderer::encodeBlur(
-    id<MTLComputeCommandEncoder> encoder,
-    id<MTLBuffer> source,
-    const CanvasKey& canvas,
-    float sigmaX,
-    float sigmaY,
-    StepBatch& batch,
-    std::vector<id<MTLBuffer>>& scratch)
-{
-    const SmallBlur small = encodeSmallBlur(encoder, source, canvas, sigmaX, sigmaY, batch, scratch);
-    if (small.factor == 1)
-        return small.buffer;
-    BlurResizeParams p{small.width, canvas.width, small.width, small.height, small.factor};
-    id<MTLBuffer> full = acquireForBatch(batch, canvas.bytes());
-    scratch.push_back(full);
-    Encode(encoder, mBlurUp, {small.buffer, full}, p, canvas.width, canvas.height);
-    return full;
-}
-
 id<MTLBuffer> FeedbackRenderer::encodeSpread(
     id<MTLComputeCommandEncoder> encoder,
-    id<MTLBuffer> source,
+    Pyramid& pyramid,
     const CanvasKey& canvas,
     float widthX,
     float widthY,
@@ -290,20 +308,61 @@ id<MTLBuffer> FeedbackRenderer::encodeSpread(
     const float width = std::max(widthX, widthY);
     // Nothing is worth spreading further than across the canvas.
     const float widest = std::max(float(std::max(canvas.width, canvas.height)) * 0.5f, 4.0f * width);
-    id<MTLBuffer> sum = acquireForBatch(batch, canvas.bytes());
-    scratch.push_back(sum);
-    bool first = true;
+
+    // Each part blurred at its own size, gathered by size from the smallest.
+    std::map<int, std::vector<std::pair<SmallBlur, float>>, std::greater<int>> bySize;
     for (const SpreadPart& part : SpreadParts(width, widest))
     {
         const float sigmaX = part.sigma * widthX, sigmaY = part.sigma * widthY;
-        SmallBlur small{source, canvas.width, canvas.height, 1};
-        if (std::max(sigmaX, sigmaY) >= kMinSigma)
-            small = encodeSmallBlur(encoder, source, canvas, sigmaX, sigmaY, batch, scratch);
-        AddScaledParams p{small.width, canvas.width, small.width, small.height, small.factor, part.weight, first ? 1 : 0};
-        Encode(encoder, mAddScaled, {small.buffer, sum}, p, canvas.width, canvas.height);
-        first = false;
+        const SmallBlur small = std::max(sigmaX, sigmaY) >= kMinSigma
+                                    ? encodeSmallBlur(encoder, pyramid, sigmaX, sigmaY, batch, scratch)
+                                    : pyramidLevel(encoder, pyramid, 0, batch, scratch);
+        bySize[small.factor].push_back({small, part.weight});
     }
-    return first ? source : sum;
+    if (bySize.empty())
+        return pyramid.levels[0].buffer;
+
+    // At each size, the sum so far scaled up, plus the parts of that size; then the next size up.
+    SmallBlur sum{};
+    bool any = false;
+    auto addInto = [&](const SmallBlur& into, const SmallBlur& from, float weight, bool first)
+    {
+        AddScaledParams p{from.width, into.width, from.width, from.height, from.factor / into.factor, weight, first ? 1 : 0};
+        Encode(encoder, mAddScaled, {from.buffer, into.buffer}, p, into.width, into.height);
+        if (from.owned)
+            release(from.buffer, batch, scratch);
+    };
+    auto sized = [&](int factor)
+    {
+        SmallBlur s{nil, (canvas.width + factor - 1) / factor, (canvas.height + factor - 1) / factor, factor, true};
+        s.buffer = acquireForBatch(batch, size_t(s.width) * size_t(s.height) * 16);
+        scratch.push_back(s.buffer);
+        return s;
+    };
+    for (const auto& [factor, parts] : bySize)
+    {
+        SmallBlur next = sized(factor);
+        bool first = true;
+        if (any)
+        {
+            addInto(next, sum, 1.0f, true);
+            first = false;
+        }
+        for (const auto& [part, weight] : parts)
+        {
+            addInto(next, part, weight, first);
+            first = false;
+        }
+        sum = next;
+        any = true;
+    }
+    if (sum.factor > 1)
+    {
+        SmallBlur full = sized(1);
+        addInto(full, sum, 1.0f, true);
+        sum = full;
+    }
+    return sum.buffer;
 }
 
 id<MTLBuffer> FeedbackRenderer::step(
@@ -364,28 +423,8 @@ id<MTLBuffer> FeedbackRenderer::step(
         p.inverse[0] = p.inverse[3] = 1.0f;
         if (MovesTrail(f))
             InvertTransform(f, canvas, &p);
-        id<MTLBuffer> mapBuffer = current;
-        if (!displaces)
-            mapBuffer = mEmpty; // no map: zero size, so nothing shifts
-        else if (f.displaceSource == MAP_LAYER)
-        {
-            mapBuffer = map.buffer;
-            p.mapIsStraight = 1;
-            p.mapPitch = map.pitch;
-            p.mapOffsetX = map.offsetX;
-            p.mapOffsetY = map.offsetY;
-            p.mapWidth = map.width;
-            p.mapHeight = map.height;
-            p.mapWarped = map.warped;
-            if (map.warped)
-                std::copy(map.fromCanvas, map.fromCanvas + 9, p.mapFromCanvas);
-        }
-        else
-        {
-            p.mapPitch = width;
-            p.mapWidth = width;
-            p.mapHeight = height;
-        }
+        // No map: zero size, so nothing shifts.
+        id<MTLBuffer> mapBuffer = displaces ? FillMap(p.map, map, f.displaceSource, current, width, height) : mEmpty;
         id<MTLBuffer> next = acquire();
         Encode(encoder, mDisplace, {current, mapBuffer, next}, p, width, height);
         current = next;
@@ -412,49 +451,30 @@ id<MTLBuffer> FeedbackRenderer::step(
     // Blur
     const float sigmaX = BlurSigma(f.blurRadius) * scaleX;
     const float sigmaY = BlurSigma(f.blurRadius) * scaleY;
-    auto blurBy = [&](id<MTLBuffer> source, float share)
+    // Every blur of this image shares one pyramid of it.
+    Pyramid pyramid{{SmallBlur{current, width, height, 1}}};
+    auto blurBy = [&](float share)
     {
         if (std::max(sigmaX, sigmaY) * share < kMinSigma)
-            return source;
-        return f.blurType == BLUR_SPREAD
-                   ? encodeSpread(encoder, source, canvas, sigmaX * share, sigmaY * share, batch, scratch)
-                   : encodeBlur(encoder, source, canvas, sigmaX * share, sigmaY * share, batch, scratch);
+            return current;
+        return encodeSpread(encoder, pyramid, canvas, sigmaX * share, sigmaY * share, batch, scratch);
     };
     // A layer with nothing there blurs nothing, as black would.
     const bool blurMapMissing = f.blurSource == MAP_LAYER && !blurMap.buffer;
     if (std::max(sigmaX, sigmaY) >= kMinSigma && !blurMapMissing)
     {
         if (f.blurSource == MAP_NONE)
-            current = blurBy(current, 1.0f);
+            current = blurBy(1.0f);
         else
         {
             BlurMapParams p{};
             p.pitch = width;
             p.width = width;
             p.height = height;
-            id<MTLBuffer> mapBuffer = current;
-            if (f.blurSource == MAP_LAYER)
-            {
-                mapBuffer = blurMap.buffer;
-                p.mapIsStraight = 1;
-                p.mapPitch = blurMap.pitch;
-                p.mapOffsetX = blurMap.offsetX;
-                p.mapOffsetY = blurMap.offsetY;
-                p.mapWidth = blurMap.width;
-                p.mapHeight = blurMap.height;
-                p.mapWarped = blurMap.warped;
-                if (blurMap.warped)
-                    std::copy(blurMap.fromCanvas, blurMap.fromCanvas + 9, p.mapFromCanvas);
-            }
-            else
-            {
-                p.mapPitch = width;
-                p.mapWidth = width;
-                p.mapHeight = height;
-            }
+            id<MTLBuffer> mapBuffer = FillMap(p.map, blurMap, f.blurSource, current, width, height);
             id<MTLBuffer> next = acquire();
             Encode(encoder, mBlurByMap,
-                   {current, blurBy(current, 0.125f), blurBy(current, 0.25f), blurBy(current, 0.5f), blurBy(current, 1.0f),
+                   {current, blurBy(0.125f), blurBy(0.25f), blurBy(0.5f), blurBy(1.0f),
                     mapBuffer, next},
                    p, width, height);
             current = next;

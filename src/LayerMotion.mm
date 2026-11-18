@@ -71,8 +71,6 @@ LayerMotion::LayerMotion(PF_InData* in_data, PF_OutData* out_data, AEGP_LayerIDV
             layers->AEGP_GetLayerParentComp(mLayer, &comp) || comps->AEGP_GetItemFromComp(comp, &item) ||
             items->AEGP_GetItemDimensions(item, &mCompWidth, &mCompHeight))
             return;
-        mCompItem = item;
-        mAdjustment = (flags & AEGP_LayerFlag_ADJUSTMENT_LAYER) != 0;
         if (other != AEGP_LayerIDVal_NONE &&
             (layers->AEGP_GetLayerFromLayerID(comp, other, &mLayer) || !mLayer || layers->AEGP_GetLayerFlags(mLayer, &flags) ||
              layers->AEGP_GetLayerObjectType(mLayer, &type)))
@@ -127,40 +125,53 @@ uint64_t LayerMotion::fingerprint(A_long time)
     return hash;
 }
 
-bool LayerMotion::timestamp(AEGP_TimeStamp* out)
+CompWatch::CompWatch(PF_InData* in_data, PF_OutData* out_data)
+    : mInData(in_data)
 {
     try
     {
-        if (!mRender)
-            mRender.emplace(mInData, kAEGPRenderSuite, kAEGPRenderSuiteVersion5, mOutData);
-        return (*mRender)->AEGP_GetCurrentTimestamp(out) == A_Err_NONE;
+        mFace.emplace(in_data, kAEGPPFInterfaceSuite, kAEGPPFInterfaceSuiteVersion1, out_data);
+        AEFX_SuiteScoper<AEGP_LayerSuite9> layers(in_data, kAEGPLayerSuite, kAEGPLayerSuiteVersion9, out_data);
+        AEFX_SuiteScoper<AEGP_CompSuite13> comps(in_data, kAEGPCompSuite, kAEGPCompSuiteVersion13, out_data);
+        AEGP_LayerH layer = nullptr;
+        AEGP_LayerFlags flags = 0;
+        AEGP_CompH comp = nullptr;
+        AEGP_ItemH item = nullptr;
+        if ((*mFace)->AEGP_GetEffectLayer(in_data->effect_ref, &layer) || !layer ||
+            layers->AEGP_GetLayerFlags(layer, &flags) || (flags & AEGP_LayerFlag_ADJUSTMENT_LAYER) == 0 ||
+            layers->AEGP_GetLayerParentComp(layer, &comp) || comps->AEGP_GetItemFromComp(comp, &item))
+            return;
+        mRender.emplace(in_data, kAEGPRenderSuite, kAEGPRenderSuiteVersion5, out_data);
+        mHaveNow = (*mRender)->AEGP_GetCurrentTimestamp(&mNow) == A_Err_NONE;
+        mCompItem = item;
     }
     catch (...)
     {
-        return false;
+        mCompItem = nullptr;
     }
 }
 
-bool LayerMotion::unchangedSince(const AEGP_TimeStamp& made, A_long endExclusive)
+bool CompWatch::timestamp(AEGP_TimeStamp* out) const
 {
-    try
-    {
-        if (!mCompItem || !mFace)
-            return false;
-        if (!mRender)
-            mRender.emplace(mInData, kAEGPRenderSuite, kAEGPRenderSuiteVersion5, mOutData);
-        A_Time end{};
-        if ((*mFace)->AEGP_ConvertEffectToCompTime(mInData->effect_ref, endExclusive, A_u_long(mInData->time_scale), &end))
-            return false;
-        // From the comp's start, which takes in any time before the layer's.
-        const A_Time start{0, end.scale};
-        A_Boolean changed = true;
-        if ((*mRender)->AEGP_HasItemChangedSinceTimestamp(mCompItem, &start, &end, &made, &changed))
-            return false;
-        return !changed;
-    }
-    catch (...)
-    {
+    if (!mHaveNow)
         return false;
-    }
+    *out = mNow;
+    return true;
+}
+
+bool CompWatch::unchangedSince(const AEGP_TimeStamp& made, A_long endExclusive) const
+{
+    if (!mCompItem)
+        return false;
+    if (mHaveNow && std::memcmp(&made, &mNow, sizeof(made)) == 0)
+        return true;
+    A_Time end{};
+    if ((*mFace)->AEGP_ConvertEffectToCompTime(mInData->effect_ref, endExclusive, A_u_long(mInData->time_scale), &end))
+        return false;
+    // From the comp's start, which takes in any time before the layer's.
+    const A_Time start{0, end.scale};
+    A_Boolean changed = true;
+    if ((*mRender)->AEGP_HasItemChangedSinceTimestamp(mCompItem, &start, &end, &made, &changed))
+        return false;
+    return !changed;
 }

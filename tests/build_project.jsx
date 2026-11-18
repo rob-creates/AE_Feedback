@@ -32,8 +32,12 @@
         return layer;
     }
 
-    function useMap(fx, layer) {
-        find(fx, MAP_LAYER).setValue(layer.index);
+    // Points a map layer control, Map Layer unless `control` says otherwise, at `layer`. With `stage` -1,
+    // at Effects & Masks.
+    function useMap(fx, layer, control, stage) {
+        var p = find(fx, control || MAP_LAYER);
+        p.setValue(layer.index);
+        if (stage !== undefined) p.setLayerInputStage(stage);
     }
 
     function addEllipse(layer, size) {
@@ -87,8 +91,7 @@
         });
         // Displaced by the trail itself: Map Layer is its own layer, at Effects & Masks.
         var selfDisp = dotComp("self_disp", 96, { "Alpha Max": 0.9, "Max Horizontal": 12, "Max Vertical": -8 });
-        useMap(selfDisp.fx, selfDisp.layer);
-        find(selfDisp.fx, MAP_LAYER).setLayerInputStage(-1);
+        useMap(selfDisp.fx, selfDisp.layer, MAP_LAYER, -1);
 
         // A still dot whose trail is its hue turned half way: from frame 1, each blend mode lays the
         // dot's colour over its opposite, which run_tests.py works out for itself. Then the dot over its
@@ -236,16 +239,14 @@
         var deepOff = newComp("deep_unlimited", 4000, 1920, 1080);
         feedback(movingDot(deepOff, "dot", RED, 1920, 1080, [100, 100], [1800, 980], 60), { "Alpha Max": 1, "Sub-steps": 7 });
 
-        // A dot seen only on the first frame, so the trail after it is that one copy spreading out:
-        // Gaussian, Spread, and Spread split into sub-steps. Masks apply before effects, so the mask's
+        // A dot seen only on the first frame, so the trail after it is that one copy spreading out, on its
+        // own and split into sub-steps. Masks apply before effects, so the mask's
         // opacity hides the dot from the effect.
-        var flashes = { "flash_gaussian": {}, "flash_spread": { "Blur Type": 2 }, "flash_spread_sub": { "Blur Type": 2, "Sub-steps": 3 } };
+        var flashes = { "flash_spread": {}, "flash_spread_sub": { "Sub-steps": 3 } };
         for (var name in flashes) {
             var fc = newComp(name, 40);
-            var flash = fc.layers.addSolid(RED, "flash", W, H, 1, fc.duration);
-            var fm = flash.Masks.addProperty("Mask");
-            fm.property("maskShape").setValue(dot(W / 2, H / 2, 6));
-            var fo = fm.property("Mask Opacity");
+            var flash = movingDot(fc, "flash", RED, W, H, [W / 2, H / 2], [W / 2, H / 2], 6);
+            var fo = flash.Masks.property(1).property("Mask Opacity");
             fo.setValueAtTime(0, 100);
             fo.setValueAtTime(1 / FPS, 0);
             fo.setInterpolationTypeAtKey(1, KeyframeInterpolationType.HOLD);
@@ -276,12 +277,11 @@
             var bmap = b.comp.layers.addSolid(blurMaps[bm][0], "blur map", blurMaps[bm][1], H, 1, b.comp.duration);
             bmap.property("Position").setValue([blurMaps[bm][1] / 2, H / 2]);
             bmap.enabled = false;
-            find(b.fx, BLUR_MAP_LAYER).setValue(bmap.index);
+            useMap(b.fx, bmap, BLUR_MAP_LAYER);
         }
         // The trail's own luminance as the blur map: its own layer at Effects & Masks.
         var blurSelf = dotComp("blurmap_trail", 72, { "Alpha Max": 0.9, "Blur Radius": 6 });
-        find(blurSelf.fx, BLUR_MAP_LAYER).setValue(blurSelf.layer.index);
-        find(blurSelf.fx, BLUR_MAP_LAYER).setLayerInputStage(-1);
+        useMap(blurSelf.fx, blurSelf.layer, BLUR_MAP_LAYER, -1);
 
         // Alpha Min: on its own, against the same blur without it, and split into sub-steps.
         dotComp("alpha_min", 96, { "Alpha Max": 1, "Alpha Min": 0.2, "Blur Radius": 3 });
@@ -314,8 +314,7 @@
         dotComp("layer_none", 72, { "Alpha Max": 0.9, "Max Horizontal": 100, "Horizontal Channel": 4 });
         // Its own layer with Effects & Masks is the layer as the effect leaves it: the trail.
         var ownAll = dotComp("layer_own_effects", 72, { "Alpha Max": 0.9, "Max Horizontal": 100, "Horizontal Channel": 4 });
-        useMap(ownAll.fx, ownAll.layer);
-        find(ownAll.fx, MAP_LAYER).setLayerInputStage(-1);
+        useMap(ownAll.fx, ownAll.layer, MAP_LAYER, -1);
 
         // Shape layers rasterise continuously, unlike the solids above: a moving ellipse, alone,
         // with sub-steps, and with a map. Each is also rendered at half resolution in live_session.
