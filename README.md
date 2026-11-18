@@ -9,6 +9,10 @@ Feedback Effect for Adobe After Effects
   precomp, or put Feedback on an adjustment layer above it.
 - Map Layer is read where it is in the comp. Where the map is transparent, nothing moves.
 - Map Layer set to the effect's own layer, at Effects & Masks, uses the trail as the map.
+- Jumping to a frame recalculates the whole trail before it, so the trail is always complete, though a
+  long one that never fades takes a while. Turn on Limit Pre-Roll to recalculate only the last
+  Pre-Roll Limit frames instead: quicker, but a long trail can look shorter after a jump. Playing
+  forward keeps the full trail either way.
 
 ## Building
 

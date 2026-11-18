@@ -12,6 +12,7 @@ struct FrameParams
     float alpha; // the fade alone
     float alphaSlope, alphaOffset; // the whole alpha curve: slope * alpha + offset
     float blurRadius; // full-resolution pixels
+    int blurType;
     float inputBlack, inputWhite, gamma, outputBlack, outputWhite;
     float hueDegrees, saturation, lightness;
     int displaceFromLayer;
@@ -136,6 +137,23 @@ public:
 private:
     FeedbackRenderer() = default;
 
+    // A blurred image, `factor` times smaller than the canvas.
+    struct SmallBlur
+    {
+        id<MTLBuffer> buffer;
+        int width, height, factor;
+    };
+
+    // Wide blurs are worked out on a smaller image, which this leaves small.
+    SmallBlur encodeSmallBlur(
+        id<MTLComputeCommandEncoder> encoder,
+        id<MTLBuffer> source,
+        const CanvasKey& canvas,
+        float sigmaX,
+        float sigmaY,
+        StepBatch& batch,
+        std::vector<id<MTLBuffer>>& scratch);
+
     id<MTLBuffer> encodeBlur(
         id<MTLComputeCommandEncoder> encoder,
         id<MTLBuffer> source,
@@ -145,9 +163,20 @@ private:
         StepBatch& batch,
         std::vector<id<MTLBuffer>>& scratch);
 
+    // Spread: Gaussians from far narrower to far wider than `width` mixed into a long-tailed blur
+    // whose widths add, as a Cauchy distribution's do.
+    id<MTLBuffer> encodeSpread(
+        id<MTLComputeCommandEncoder> encoder,
+        id<MTLBuffer> source,
+        const CanvasKey& canvas,
+        float widthX,
+        float widthY,
+        StepBatch& batch,
+        std::vector<id<MTLBuffer>>& scratch);
+
     id<MTLBuffer> acquireForBatch(StepBatch& batch, size_t bytes);
 
-    id<MTLComputePipelineState> mDisplace, mEdge, mBlurDown, mBlurAxis, mBlurUp, mGradeAndComposite, mComposite, mReframe, mCopyOut;
+    id<MTLComputePipelineState> mDisplace, mEdge, mBlurDown, mBlurAxis, mBlurUp, mAddScaled, mGradeAndComposite, mComposite, mReframe, mCopyOut;
     id<MTLBuffer> mEmpty; // bound wherever a kernel's optional buffer is absent
     std::unique_ptr<FeedbackCache> mCache;
 };

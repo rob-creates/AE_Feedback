@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <initializer_list>
+#include <vector>
 
 #include "ShaderTypes.h"
 
@@ -77,6 +78,34 @@ void FillWeights(BlurAxisParams& p, float sigma)
         p.weights[i] /= total;
 }
 
+// Spread's mix: a Cauchy distribution of width 1 is Gaussians whose sigmas s are spread so that
+// P(s <= x) = erfc(1 / (sqrt(2) x)). Here that's split into octaves, each one Gaussian at its middle,
+// from far narrower than 1 to `widest` (in multiples of `width`'s pixels), and weighed to add to 1.
+struct SpreadPart
+{
+    float sigma, weight; // sigma in multiples of the width
+};
+
+std::vector<SpreadPart> SpreadParts(float width, float widest)
+{
+    auto below = [](double x) { return x > 0.0 ? std::erfc(1.0 / (std::sqrt(2.0) * x)) : 0.0; };
+    const double last = std::max(double(widest) / std::max(double(width), 1e-6), 1.0);
+    std::vector<SpreadPart> parts;
+    double total = 0.0;
+    for (double lo = 0.0, hi = 0.25; lo < last; lo = hi, hi *= 2.0)
+    {
+        const double top = std::min(hi, last);
+        const double weight = below(top) - below(lo);
+        if (weight <= 1e-5)
+            continue;
+        parts.push_back({float(lo > 0.0 ? std::sqrt(lo * top) : 0.125), float(weight)});
+        total += weight;
+    }
+    for (SpreadPart& part : parts)
+        part.weight = float(part.weight / total);
+    return parts;
+}
+
 // Where Transform moves a canvas pixel from, as `inverse * position + offset`.
 void InvertTransform(const FrameParams& f, const CanvasKey& canvas, DisplaceParams* p)
 {
@@ -129,11 +158,12 @@ std::unique_ptr<FeedbackRenderer> FeedbackRenderer::create(id<MTLDevice> device,
     r->mBlurDown = pipeline(@"blurDown");
     r->mBlurAxis = pipeline(@"blurAxis");
     r->mBlurUp = pipeline(@"blurUp");
+    r->mAddScaled = pipeline(@"addScaled");
     r->mGradeAndComposite = pipeline(@"gradeAndComposite");
     r->mComposite = pipeline(@"composite");
     r->mReframe = pipeline(@"reframe");
     r->mCopyOut = pipeline(@"copyOut");
-    if (!r->mDisplace || !r->mEdge || !r->mBlurDown || !r->mBlurAxis || !r->mBlurUp || !r->mGradeAndComposite || !r->mComposite ||
+    if (!r->mDisplace || !r->mEdge || !r->mBlurDown || !r->mBlurAxis || !r->mBlurUp || !r->mAddScaled || !r->mGradeAndComposite || !r->mComposite ||
         !r->mReframe || !r->mCopyOut)
         return nullptr;
 
@@ -170,7 +200,7 @@ bool FeedbackRenderer::flush(StepBatch& batch)
     return ok;
 }
 
-id<MTLBuffer> FeedbackRenderer::encodeBlur(
+FeedbackRenderer::SmallBlur FeedbackRenderer::encodeSmallBlur(
     id<MTLComputeCommandEncoder> encoder,
     id<MTLBuffer> source,
     const CanvasKey& canvas,
@@ -179,13 +209,6 @@ id<MTLBuffer> FeedbackRenderer::encodeBlur(
     StepBatch& batch,
     std::vector<id<MTLBuffer>>& scratch)
 {
-    auto acquire = [&](size_t bytes)
-    {
-        id<MTLBuffer> buffer = acquireForBatch(batch, bytes);
-        scratch.push_back(buffer);
-        return buffer;
-    };
-
     // Very wide blurs run on a smaller image, so their cost doesn't grow with the radius.
     int factor = 1;
     while (std::max(sigmaX, sigmaY) / factor > kMaxDirectSigma)
@@ -198,18 +221,21 @@ id<MTLBuffer> FeedbackRenderer::encodeBlur(
         return std::sqrt(std::max(s * s - boxVariance, 0.0f)) / float(factor);
     };
 
-    const int w = (canvas.width + factor - 1) / factor;
-    const int h = (canvas.height + factor - 1) / factor;
-    const size_t lowBytes = size_t(w) * size_t(h) * 16;
-
-    id<MTLBuffer> current = source;
+    SmallBlur result{source, (canvas.width + factor - 1) / factor, (canvas.height + factor - 1) / factor, factor};
+    const size_t lowBytes = size_t(result.width) * size_t(result.height) * 16;
+    auto acquire = [&]()
+    {
+        id<MTLBuffer> buffer = acquireForBatch(batch, lowBytes);
+        scratch.push_back(buffer);
+        return buffer;
+    };
 
     if (factor > 1)
     {
-        BlurResizeParams p{canvas.width, w, canvas.width, canvas.height, factor};
-        id<MTLBuffer> low = acquire(lowBytes);
-        Encode(encoder, mBlurDown, {current, low}, p, w, h);
-        current = low;
+        BlurResizeParams p{canvas.width, result.width, canvas.width, canvas.height, factor};
+        id<MTLBuffer> low = acquire();
+        Encode(encoder, mBlurDown, {result.buffer, low}, p, result.width, result.height);
+        result.buffer = low;
     }
 
     for (int axis = 0; axis < 2; axis++)
@@ -218,26 +244,65 @@ id<MTLBuffer> FeedbackRenderer::encodeBlur(
         if (sigma < kMinSigma)
             continue;
         BlurAxisParams p{};
-        p.srcPitch = w;
-        p.dstPitch = w;
-        p.width = w;
-        p.height = h;
+        p.srcPitch = result.width;
+        p.dstPitch = result.width;
+        p.width = result.width;
+        p.height = result.height;
         p.dirX = axis == 0 ? 1 : 0;
         p.dirY = axis == 0 ? 0 : 1;
         FillWeights(p, sigma);
-        id<MTLBuffer> next = acquire(lowBytes);
-        Encode(encoder, mBlurAxis, {current, next}, p, w, h);
-        current = next;
+        id<MTLBuffer> next = acquire();
+        Encode(encoder, mBlurAxis, {result.buffer, next}, p, result.width, result.height);
+        result.buffer = next;
     }
+    return result;
+}
 
-    if (factor > 1)
+id<MTLBuffer> FeedbackRenderer::encodeBlur(
+    id<MTLComputeCommandEncoder> encoder,
+    id<MTLBuffer> source,
+    const CanvasKey& canvas,
+    float sigmaX,
+    float sigmaY,
+    StepBatch& batch,
+    std::vector<id<MTLBuffer>>& scratch)
+{
+    const SmallBlur small = encodeSmallBlur(encoder, source, canvas, sigmaX, sigmaY, batch, scratch);
+    if (small.factor == 1)
+        return small.buffer;
+    BlurResizeParams p{small.width, canvas.width, small.width, small.height, small.factor};
+    id<MTLBuffer> full = acquireForBatch(batch, canvas.bytes());
+    scratch.push_back(full);
+    Encode(encoder, mBlurUp, {small.buffer, full}, p, canvas.width, canvas.height);
+    return full;
+}
+
+id<MTLBuffer> FeedbackRenderer::encodeSpread(
+    id<MTLComputeCommandEncoder> encoder,
+    id<MTLBuffer> source,
+    const CanvasKey& canvas,
+    float widthX,
+    float widthY,
+    StepBatch& batch,
+    std::vector<id<MTLBuffer>>& scratch)
+{
+    const float width = std::max(widthX, widthY);
+    // Nothing is worth spreading further than across the canvas.
+    const float widest = std::max(float(std::max(canvas.width, canvas.height)) * 0.5f, 4.0f * width);
+    id<MTLBuffer> sum = acquireForBatch(batch, canvas.bytes());
+    scratch.push_back(sum);
+    bool first = true;
+    for (const SpreadPart& part : SpreadParts(width, widest))
     {
-        BlurResizeParams p{w, canvas.width, w, h, factor};
-        id<MTLBuffer> full = acquire(canvas.bytes());
-        Encode(encoder, mBlurUp, {current, full}, p, canvas.width, canvas.height);
-        current = full;
+        const float sigmaX = part.sigma * widthX, sigmaY = part.sigma * widthY;
+        SmallBlur small{source, canvas.width, canvas.height, 1};
+        if (std::max(sigmaX, sigmaY) >= kMinSigma)
+            small = encodeSmallBlur(encoder, source, canvas, sigmaX, sigmaY, batch, scratch);
+        AddScaledParams p{small.width, canvas.width, small.width, small.height, small.factor, part.weight, first ? 1 : 0};
+        Encode(encoder, mAddScaled, {small.buffer, sum}, p, canvas.width, canvas.height);
+        first = false;
     }
-    return current;
+    return first ? source : sum;
 }
 
 id<MTLBuffer> FeedbackRenderer::step(
@@ -345,7 +410,8 @@ id<MTLBuffer> FeedbackRenderer::step(
     const float sigmaX = BlurSigma(f.blurRadius) * scaleX;
     const float sigmaY = BlurSigma(f.blurRadius) * scaleY;
     if (std::max(sigmaX, sigmaY) >= kMinSigma)
-        current = encodeBlur(encoder, current, canvas, sigmaX, sigmaY, batch, scratch);
+        current = f.blurType == BLUR_SPREAD ? encodeSpread(encoder, current, canvas, sigmaX, sigmaY, batch, scratch)
+                                            : encodeBlur(encoder, current, canvas, sigmaX, sigmaY, batch, scratch);
 
     // Levels, HSL and Alpha, then composite with this frame's input. Neutral settings skip the maths,
     // so they're exactly a no-op.
@@ -423,7 +489,6 @@ bool FeedbackRenderer::copyOut(
     p.dstPitch = output.pitch;
     p.offsetX = output.offsetX;
     p.offsetY = output.offsetY;
-    p.canvasWidth = canvas.width;
     p.canvasHeight = canvas.height;
     int width = std::min(output.width, canvas.width - output.offsetX);
     int height = std::min(output.height, canvas.height - output.offsetY);

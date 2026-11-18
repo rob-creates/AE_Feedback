@@ -23,6 +23,14 @@ enum CompositeMode
     COMPOSITE_DIFFERENCE = 10
 };
 
+// Gaussian softens each frame's copy by the same amount, so the spread grows only with the square root of
+// the frame count. Spread has long tails, so its widths add straight up: n frames spread n times as far.
+enum BlurType
+{
+    BLUR_GAUSSIAN = 1,
+    BLUR_SPREAD = 2
+};
+
 enum EdgeType
 {
     EDGE_COLOUR = 1,
@@ -85,6 +93,18 @@ struct BlurResizeParams
     int srcWidth;
     int srcHeight;
     int factor;
+};
+
+// Adds a weighted share of a smaller image, scaled up, to a full-size one. With `first`, replaces it.
+struct AddScaledParams
+{
+    int srcPitch;
+    int dstPitch;
+    int srcWidth;
+    int srcHeight;
+    int factor;
+    float weight;
+    int first;
 };
 
 struct BlurAxisParams
@@ -160,6 +180,5 @@ struct CopyOutParams
     // With the trail in comp space, each output pixel looks up where the layer puts it in comp.
     int warped;
     float canvasFromOutput[9]; // row-major 3x3, to canvas pixel coordinates
-    int canvasWidth;
-    int canvasHeight;
+    int canvasHeight; // the canvas's width is srcPitch
 };

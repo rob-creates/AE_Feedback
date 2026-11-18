@@ -274,6 +274,22 @@ kernel void blurUp(
     dst[xy.y * p.dstPitch + xy.x] = bilinearClamped(src, p.srcPitch, p.srcWidth, p.srcHeight, pos);
 }
 
+// Adds a weighted share of a blurred image, scaled up from its smaller size, to the sum.
+kernel void addScaled(
+    device const float4* src [[buffer(0)]],
+    device float4* dst [[buffer(1)]],
+    constant AddScaledParams& p [[buffer(2)]],
+    uint2 xy [[thread_position_in_grid]])
+{
+    float4 v;
+    if (p.factor > 1)
+        v = bilinearClamped(src, p.srcPitch, p.srcWidth, p.srcHeight, (float2(xy) + 0.5f) / float(p.factor) - 0.5f);
+    else
+        v = src[xy.y * p.srcPitch + xy.x];
+    const uint i = xy.y * p.dstPitch + xy.x;
+    dst[i] = p.first != 0 ? v * p.weight : dst[i] + v * p.weight;
+}
+
 namespace
 {
 // Levels, then HSL, then Alpha.
@@ -401,7 +417,7 @@ kernel void copyOut(
     {
         float2 at;
         v = project(p.canvasFromOutput, float2(xy), at)
-                ? bilinearPremultiplied(src, p.srcPitch, p.canvasWidth, p.canvasHeight, at, false)
+                ? bilinearPremultiplied(src, p.srcPitch, p.srcPitch, p.canvasHeight, at, false)
                 : float4(0.0);
     }
     else

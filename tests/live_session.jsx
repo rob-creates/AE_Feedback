@@ -113,6 +113,16 @@
     travelling.layer("dot").property("Position").setValueAtKey(2, [560, 60]);
     queue(travelling, 20, "comp_motion_after");
 
+    // Changing what's beneath an adjustment layer, or inside a precomp, changes every frame of the trail.
+    var below = comp("adjust_below");
+    queue(below, 40, "below_before", null, 41);
+    below.layer("dot").source.mainSource.color = [0.1, 0.2, 1];
+    queue(below, 40, "below_after");
+    var outer = comp("precomp_outer");
+    queue(outer, 40, "inner_before", null, 41);
+    comp("precomp_inner").layer("dot").source.mainSource.color = [0.1, 0.2, 1];
+    queue(outer, 40, "inner_after");
+
     // Saved so that a fresh aerender can show what those last frames should be.
     app.project.save(new File(OUT + "/feedback_live_edited.aep"));
     app.endSuppressDialogs(false);

@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "AE_EffectSuites.h"
+#include "AE_GeneralPlug.h"
 
 inline bool SameScale(const PF_RationalScale& a, const PF_RationalScale& b)
 {
@@ -54,6 +55,7 @@ public:
         CanvasKey key;
         PF_State history;
         uint64_t motion;
+        AEGP_TimeStamp made; // the project's timestamp when the image's inputs were read
         id<MTLBuffer> buffer;
     };
 
@@ -65,7 +67,8 @@ public:
 
     // Takes ownership of the buffer. Evicted buffers are dropped rather than recycled, because
     // a render further up the stack may still be reading them.
-    void publish(const CanvasKey& key, A_long time, const PF_State& history, uint64_t motion, id<MTLBuffer> buffer);
+    void publish(const CanvasKey& key, A_long time, const PF_State& history, uint64_t motion, const AEGP_TimeStamp& made,
+                 id<MTLBuffer> buffer);
 
     id<MTLBuffer> acquireScratch(size_t bytes);
     void releaseScratch(id<MTLBuffer> buffer);
@@ -77,6 +80,7 @@ private:
         A_long time;
         PF_State history;
         uint64_t motion;
+        AEGP_TimeStamp made;
         id<MTLBuffer> buffer;
         uint64_t lastUsed;
     };

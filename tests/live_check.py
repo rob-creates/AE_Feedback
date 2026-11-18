@@ -93,6 +93,12 @@ def main(label):
     check("after the move@20", live("comp_motion_after", 20), ref("edited_motion", 20))
     report(None, f"the move itself changed the frame by a peak of {difference(live('comp_motion_before', 20), ref('edited_motion', 20))[0]}/255")
 
+    print("Changing what's beneath an adjustment layer, or inside a precomp, during the session:")
+    for comp, step in (("adjust_below", "below"), ("precomp_outer", "inner")):
+        render("feedback_live_edited.aep", comp, OUT / label / f"edited_{step}", 0, 40)
+        check(f"{comp} before the change@40", live(f"{step}_before", 40), ref(comp, 40))
+        check(f"{comp} after the change@40", live(f"{step}_after", 40), ref(f"edited_{step}", 40))
+
     print("A project saved by an earlier version of the effect:")
     render("old_project.aep", "trail", OUT / label / "old_project", 0, 60)
     check("opens and renders the same@60", ref("old_project", 60), ref("trail", 60))

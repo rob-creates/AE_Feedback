@@ -24,7 +24,6 @@
 #include <functional>
 #include <memory>
 #include <optional>
-#include <tuple>
 #include <mutex>
 #include <numeric>
 #include <string>
@@ -59,6 +58,7 @@ enum
     PARAM_ALPHA_MIN,
     PARAM_ALPHA_END,
     PARAM_BLUR_START,
+    PARAM_BLUR_TYPE,
     PARAM_BLUR,
     PARAM_BLUR_END,
     PARAM_LEVELS_START,
@@ -95,15 +95,17 @@ enum
     PARAM_EDGE_BLEND,
     PARAM_EDGE_END,
     PARAM_SUBSTEPS,
+    PARAM_LIMIT_PREROLL,
     PARAM_REBUILD_LIMIT,
     PARAM_COUNT
 };
 
 // Saved projects find each control by this ID, so a control keeps its ID wherever it moves. In the
 // order above. ID 17 belonged to a Source popup, 33 and 34 to Position X and Y sliders, and 44 to a
-// Position where the centre went rather than how far it moved, and they mustn't be reused.
-const int kDiskIds[PARAM_COUNT] = {0,  1,  27, 2,  26, 28, 29, 3,  30, 4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15,
-                                   31, 32, 47, 45, 35, 46, 36, 37, 16, 18, 19, 20, 21, 22, 23, 38, 39, 40, 41, 42, 43, 24, 25};
+// Position where the centre went rather than how far it moved, and 48 to a comp-space checkbox, and they
+// mustn't be reused.
+const int kDiskIds[PARAM_COUNT] = {0,  1,  27, 2,  26, 28, 29, 50, 3,  30, 4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15,
+                                   31, 32, 47, 45, 35, 46, 36, 37, 16, 18, 19, 20, 21, 22, 23, 38, 39, 40, 41, 42, 43, 24, 49, 25};
 
 int DiskId(int param)
 {
@@ -121,6 +123,8 @@ const int kLongestRebuildLimit = 100000;
 // Limits on the canvas, at full resolution for the spread and as actual pixels for the side. These
 // only bite on extreme settings, such as large displacement, and trim what lies furthest out.
 const float kMaxSpread = 1000.0f;
+// How far Spread reaches in a frame, in multiples of its width.
+const float kSpreadReach = 6.0f;
 const A_long kMaxCanvasSide = 8192;
 // A comp-space trail keeps this much beyond the comp's edges, in full-resolution pixels, so a blur
 // near an edge still sees what's just outside.
@@ -176,6 +180,7 @@ struct SampleFacts
 struct FrameFacts
 {
     float alpha, blurRadius, amountX, amountY;
+    int blurType;
     float edgeSize; // 0 when edges are off
     bool moves; // Transform moves the trail
     std::vector<SampleFacts> samples; // oldest first; the last one is at the frame's own time
@@ -240,7 +245,7 @@ struct FrameCheckout
 {
     A_long time;
     std::vector<SubstepCheckout> substeps; // oldest first; the last one is at the frame's own time
-    uint64_t motion; // with the trail in comp space: the fingerprint an image of this frame is kept with
+    uint64_t motion = 0; // with the trail in comp space: the fingerprint an image of this frame is kept with
 };
 
 struct PreRenderData
@@ -262,9 +267,14 @@ struct PreRenderData
     id<MTLBuffer> resumeImage;
     CanvasKey resumeCanvas;
 
-    // With the trail in comp space, the canvas is the comp, and the output is the layer's view of it.
-    bool compSpace = false;
+    // With the trail in comp space (canvas.compSpace), the canvas is the comp, and the output is the
+    // layer's view of it.
     Projective layerToCompNow;
+
+    // On an adjustment layer, images are kept with the project's timestamp from before their inputs
+    // were read, and checked against the comp.
+    bool watchesComp = false;
+    AEGP_TimeStamp made{};
 };
 
 // The pixels of a layer, at the current resolution, to and from the comp's. AE's moves are at full
@@ -283,8 +293,22 @@ Projective Between(const Projective& move, A_long fromLeft, A_long fromTop, A_lo
         .after(Projective::translate(0.5 + fromLeft, 0.5 + fromTop));
 }
 
+// Has `image`, placed at `rect` in a layer that `layerToComp` puts in the comp, looked up from canvas
+// pixels through that move instead of by offset. False if the move can't be undone.
+bool WarpOntoCanvas(PlacedImage* image, const Projective& layerToComp, const PF_LRect& rect, const CanvasKey& canvas,
+                    PF_InData* in_data)
+{
+    Projective toLayer;
+    if (!AtResolution(layerToComp, in_data).inverse(&toLayer))
+        return false;
+    image->warped = true;
+    Between(toLayer, canvas.left, canvas.top, rect.left, rect.top).toFloats(image->fromCanvas);
+    return true;
+}
+
 // Fingerprints of where the layer went, for comp-space trails: for a frame, the frames that can still
-// be seen in it, from `window` frames back. Each frame's reading is kept, so asking again is cheap.
+// be seen in it, from `window` frames back. Each frame's reading and each sum is kept, and a frame next
+// to one already summed only adds and takes away the ends, so asking for a run of frames is cheap.
 class MotionPrints
 {
 public:
@@ -296,28 +320,54 @@ public:
 
     uint64_t at(A_long time)
     {
+        if (auto found = mSums.find(time); found != mSums.end())
+            return found->second;
         uint64_t sum = 0;
-        for (A_long t = std::max(mFirst, time - mWindow * mStep); t <= time; t += mStep)
+        auto later = mSums.find(time + mStep), earlier = mSums.find(time - mStep);
+        if (aligned(time) && later != mSums.end() && aligned(time + mStep))
         {
-            auto found = mFrames.find(t);
-            if (found == mFrames.end())
-            {
-                uint64_t print = mMotion.fingerprint(t, t, mStep);
-                if (mMap)
-                    print = print * 0xC2B2AE3D27D4EB4Full + mMap->fingerprint(t, t, mStep);
-                found = mFrames.emplace(t, print * 0x9E3779B97F4A7C15ull + uint64_t(t)).first;
-            }
-            sum += found->second;
+            sum = later->second - frame(time + mStep);
+            if (oldest(time) < oldest(time + mStep))
+                sum += frame(oldest(time));
         }
+        else if (aligned(time) && earlier != mSums.end() && aligned(time - mStep))
+        {
+            sum = earlier->second + frame(time);
+            if (oldest(time) > oldest(time - mStep))
+                sum -= frame(oldest(time - mStep));
+        }
+        else
+        {
+            for (A_long t = oldest(time); t <= time; t += mStep)
+                sum += frame(t);
+        }
+        mSums.emplace(time, sum);
         return sum;
     }
 
 private:
+    A_long oldest(A_long time) const { return std::max(mFirst, time - mWindow * mStep); }
+    // Whether the frames summed for `time` fall on its own steps, so a neighbour's differ only at the ends.
+    bool aligned(A_long time) const { return mStep > 0 && (time - oldest(time)) % mStep == 0; }
+
+    uint64_t frame(A_long t)
+    {
+        auto found = mFrames.find(t);
+        if (found == mFrames.end())
+        {
+            uint64_t print = mMotion.fingerprint(t);
+            if (mMap)
+                print = print * 0xC2B2AE3D27D4EB4Full + mMap->fingerprint(t);
+            found = mFrames.emplace(t, print * 0x9E3779B97F4A7C15ull + uint64_t(t)).first;
+        }
+        return found->second;
+    }
+
     LayerMotion& mMotion;
     LayerMotion* mMap;
     A_long mFirst, mStep;
     int mWindow;
-    std::unordered_map<A_long, uint64_t> mFrames;
+    std::unordered_map<A_long, uint64_t> mFrames, mSums;
 };
 
 struct MetalData
@@ -560,6 +610,7 @@ FrameParams ReadFrameParams(PF_InData* in_data, const SampleTime& time, PF_Err* 
     f.alpha = r.slider(PARAM_ALPHA_MAX);
     SetAlphaCurve(f.alpha, r.slider(PARAM_ALPHA_MIN), &f);
     f.blurRadius = r.slider(PARAM_BLUR);
+    f.blurType = r.popup(PARAM_BLUR_TYPE);
     f.inputBlack = r.slider(PARAM_INPUT_BLACK);
     f.inputWhite = r.slider(PARAM_INPUT_WHITE);
     f.gamma = r.slider(PARAM_GAMMA);
@@ -605,8 +656,9 @@ FrameParams DivideIntoSubsteps(FrameParams f, int n, bool frameEnd)
         f.alphaOffset = RootOffset(f.alphaOffset, f.alphaSlope, subSlope, share);
         f.alphaSlope = subSlope;
     }
-    // Blurs add by variance, so n small ones of radius r / sqrt(n) equal one of radius r.
-    f.blurRadius *= std::sqrt(share);
+    // Gaussian blurs add by variance, so n small ones of radius r / sqrt(n) equal one of radius r.
+    // Spread's widths add, so n of r / n do.
+    f.blurRadius *= f.blurType == BLUR_SPREAD ? share : std::sqrt(share);
     f.amountX *= share;
     f.amountY *= share;
     f.hueDegrees *= share;
@@ -664,19 +716,26 @@ PF_Err GlobalSetup(PF_OutData* out_data)
     return PF_Err_NONE;
 }
 
-// Scale Width does nothing while Uniform Scale is on, so it's greyed out, as in AE's Transform effect.
+// A control that does nothing while another is set is greyed out, as in AE's Transform effect: Scale
+// Width while Uniform Scale is on, and Pre-Roll Limit while Limit Pre-Roll is off.
+PF_Err GreyOut(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], int param, bool grey)
+{
+    PF_ParamDef def = *params[param];
+    if (grey == ((def.ui_flags & PF_PUI_DISABLED) != 0))
+        return PF_Err_NONE;
+    if (grey)
+        def.ui_flags |= PF_PUI_DISABLED;
+    else
+        def.ui_flags &= ~PF_PUI_DISABLED;
+    AEFX_SuiteScoper<PF_ParamUtilsSuite3> utils(in_data, kPFParamUtilsSuite, kPFParamUtilsSuiteVersion3, out_data);
+    return utils->PF_UpdateParamUI(in_data->effect_ref, param, &def);
+}
+
 PF_Err UpdateParamsUI(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[])
 {
-    PF_ParamDef width = *params[PARAM_SCALE_WIDTH];
-    const bool uniform = params[PARAM_UNIFORM_SCALE]->u.bd.value != 0;
-    if (uniform == ((width.ui_flags & PF_PUI_DISABLED) != 0))
-        return PF_Err_NONE;
-    if (uniform)
-        width.ui_flags |= PF_PUI_DISABLED;
-    else
-        width.ui_flags &= ~PF_PUI_DISABLED;
-    AEFX_SuiteScoper<PF_ParamUtilsSuite3> utils(in_data, kPFParamUtilsSuite, kPFParamUtilsSuiteVersion3, out_data);
-    return utils->PF_UpdateParamUI(in_data->effect_ref, PARAM_SCALE_WIDTH, &width);
+    PF_Err err = GreyOut(in_data, out_data, params, PARAM_SCALE_WIDTH, params[PARAM_UNIFORM_SCALE]->u.bd.value != 0);
+    ERR(GreyOut(in_data, out_data, params, PARAM_REBUILD_LIMIT, params[PARAM_LIMIT_PREROLL]->u.bd.value == 0));
+    return err;
 }
 
 PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
@@ -726,6 +785,7 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
     endTopic(PARAM_ALPHA_END);
 
     topic("Blur", PARAM_BLUR_START);
+    popup("Blur Type", 2, BLUR_GAUSSIAN, "Gaussian|Spread", PARAM_BLUR_TYPE);
     slider("Blur Radius", 0, 500, 0, 50, 0, 2, PARAM_BLUR);
     endTopic(PARAM_BLUR_END);
 
@@ -779,7 +839,12 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
     endTopic(PARAM_EDGE_END);
 
     fixedInteger("Sub-steps", 0, kMaxSubsteps, kMaxSubsteps, 0, PARAM_SUBSTEPS);
-    fixedInteger("Trail Rebuild Limit (Frames)", 1, kLongestRebuildLimit, 3000, kDefaultRebuildLimit, PARAM_REBUILD_LIMIT);
+    // Off, jumping to a frame recalculates the whole trail before it, however long that takes. On, only
+    // the last Pre-Roll Limit frames are, which is quicker but can show a shorter trail.
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_CHECKBOXX("Limit Pre-Roll", FALSE, PF_ParamFlag_SUPERVISE | PF_ParamFlag_CANNOT_TIME_VARY,
+                     DiskId(PARAM_LIMIT_PREROLL));
+    fixedInteger("Pre-Roll Limit (Frames)", 1, kLongestRebuildLimit, 3000, kDefaultRebuildLimit, PARAM_REBUILD_LIMIT);
 
     out_data->num_params = PARAM_COUNT;
     return err;
@@ -902,10 +967,19 @@ PF_Err CheckoutWholeLayer(
     return err;
 }
 
-// Finds the image for `time`, if one exists whose history is still current.
 // Where a comp-space trail's layer went up to a frame; null for trails kept in the layer.
 using MotionAt = std::function<uint64_t(A_long)>;
 
+// What else an image must match, beyond the effect's history, to be used.
+struct StillCurrent
+{
+    MotionAt motion;
+    // For an adjustment layer: that nothing in the comp up to the end has changed since the image
+    // was made. Null otherwise.
+    std::function<bool(const AEGP_TimeStamp& made, A_long endExclusive)> unchanged;
+};
+
+// Finds the image for `time`, if one exists whose history is still current.
 id<MTLBuffer> FindCached(
     PF_InData* in_data,
     const PF_ParamUtilsSuite3& utils,
@@ -913,19 +987,20 @@ id<MTLBuffer> FindCached(
     const CanvasKey& canvas,
     A_long time,
     A_long step,
-    const MotionAt& motion,
+    const StillCurrent& current,
     CanvasKey* imageCanvas)
 {
     const auto candidates = cache.candidates(canvas, time);
     PF_State history;
     if (candidates.empty() || !ReadHistory(in_data, utils, time + step, &history))
         return nil;
-    const uint64_t moved = motion ? motion(time) : 0;
+    const uint64_t moved = current.motion ? current.motion(time) : 0;
     for (const auto& candidate : candidates)
     {
         A_Boolean same = 0;
         utils.PF_AreStatesIdentical(in_data->effect_ref, &candidate.history, &history, &same);
-        if (same && candidate.motion == moved)
+        if (same && candidate.motion == moved &&
+            (!current.unchanged || current.unchanged(candidate.made, time + step)))
         {
             cache.touch(candidate.buffer);
             *imageCanvas = candidate.key;
@@ -945,13 +1020,13 @@ int FindResume(
     A_long now,
     A_long step,
     int frames,
-    const MotionAt& motion,
+    const StillCurrent& current,
     __strong id<MTLBuffer>* image,
     CanvasKey* imageCanvas)
 {
     for (int k = 0; k < frames; k++)
     {
-        *image = FindCached(in_data, utils, cache, canvas, now - k * step, step, motion, imageCanvas);
+        *image = FindCached(in_data, utils, cache, canvas, now - k * step, step, current, imageCanvas);
         if (*image)
             return k;
     }
@@ -1048,6 +1123,7 @@ PF_Err ReadFrameFacts(
     ParamReader r{in_data, FrameSample(in_data, time)};
     facts->alpha = r.slider(PARAM_ALPHA_MAX);
     facts->blurRadius = r.slider(PARAM_BLUR);
+    facts->blurType = r.popup(PARAM_BLUR_TYPE);
     facts->amountX = r.slider(PARAM_AMOUNT_X);
     facts->amountY = r.slider(PARAM_AMOUNT_Y);
     const float edgeStrength = r.slider(PARAM_EDGE_STRENGTH);
@@ -1064,10 +1140,11 @@ PF_Err ReadFrameFacts(
         if (!facts->moves)
         {
             ParamReader at{in_data, sample.time};
-            float moveX, moveY, scaleX, scaleY, rotation;
-            ReadMove(at, &moveX, &moveY, &scaleX, &scaleY, &rotation);
+            FrameParams f{};
+            ReadMove(at, &f.moveX, &f.moveY, &f.scaleX, &f.scaleY, &f.rotationDegrees);
             ERR(at.err);
-            facts->moves = moveX != 0.0f || moveY != 0.0f || scaleX != 1.0f || scaleY != 1.0f || rotation != 0.0f;
+            SetLinear(f.rotationDegrees, f.scaleX, f.scaleY, f.linear);
+            facts->moves = MovesTrail(f);
         }
         ERR(LayerBounds(in_data, extra, request, PARAM_INPUT, sample.time, nextId, &sample.inputRect));
         if (!err && fromLayer)
@@ -1322,8 +1399,17 @@ PF_Err WalkTrail(
 
         const float sigmaX = BlurSigma(facts.blurRadius) * scaleX;
         const float sigmaY = BlurSigma(facts.blurRadius) * scaleY;
-        varianceX += sigmaX * sigmaX;
-        varianceY += sigmaY * sigmaY;
+        if (facts.blurType == BLUR_SPREAD)
+        {
+            // Spread's reach adds up frame by frame. What its tails carry further is too faint to keep.
+            shiftX += kSpreadReach * sigmaX;
+            shiftY += kSpreadReach * sigmaY;
+        }
+        else
+        {
+            varianceX += sigmaX * sigmaX;
+            varianceY += sigmaY * sigmaY;
+        }
         if (!fromLayer || hasMap)
         {
             shiftX += std::abs(facts.amountX) * scaleX;
@@ -1535,19 +1621,22 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
         {
             ParamReader r{in_data, FrameSample(in_data, now)};
             data->samplesPerFrame = r.integer(PARAM_SUBSTEPS) + 1;
-            rebuildLimit = r.integer(PARAM_REBUILD_LIMIT);
+            rebuildLimit = r.checkbox(PARAM_LIMIT_PREROLL) ? r.integer(PARAM_REBUILD_LIMIT) : INT_MAX;
             ERR(r.err);
         }
         // The trail stays where the layer left it in the comp. Layers AE already draws in comp space
         // need nothing moved, so their trail stays as it is. So does a 3D layer's, which AE puts
         // through the camera after this effect, so the trail goes with the layer.
         LayerMotion motion(in_data, out_data);
-        data->compSpace = motion.usable() && !motion.drawnInComp();
+        data->watchesComp = motion.watchesComp();
+        if (data->watchesComp)
+            motion.timestamp(&data->made);
+        data->canvas.compSpace = motion.usable() && !motion.drawnInComp();
         const MapChoice mapChoice = ReadMapChoice(in_data, out_data);
         data->displaceFromLayer = mapChoice.fromLayer;
         // Map Layer goes where it is in the comp. If that can't be read, it goes where this layer is.
         std::optional<LayerMotion> mapMotion;
-        if (data->compSpace && mapChoice.layer != AEGP_LayerIDVal_NONE)
+        if (data->canvas.compSpace && mapChoice.layer != AEGP_LayerIDVal_NONE)
         {
             mapMotion.emplace(in_data, out_data, mapChoice.layer);
             if (!mapMotion->usable())
@@ -1575,7 +1664,7 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
 
         PF_LRect area = walk.hasArea ? walk.area : extra->input->output_request.rect;
         SnapCanvas(walk, &area);
-        if (data->compSpace)
+        if (data->canvas.compSpace)
         {
             // The comp and a margin, the same for every frame. What drifts further out is dropped.
             const double sx = ScaleValue(in_data->downsample_x), sy = ScaleValue(in_data->downsample_y);
@@ -1588,7 +1677,6 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
         extra->output->result_rect = Intersect(extra->input->output_request.rect, area);
 
         data->outputRect = extra->output->result_rect;
-        data->canvas.compSpace = data->compSpace;
         data->canvas.left = area.left;
         data->canvas.top = area.top;
         data->canvas.width = area.right - area.left;
@@ -1607,7 +1695,7 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
         // With the trail in comp space, the output is the layer's view of the comp, around the layer.
         MotionPrints prints(motion, mapMotion ? &*mapMotion : nullptr, firstTime, step, int(walk.window.size()));
         MotionAt motionAt;
-        if (!err && data->compSpace)
+        if (!err && data->canvas.compSpace)
         {
             motionAt = [&prints](A_long t) { return prints.at(t); };
             // Where the layer went changes the frame, though AE's history doesn't show it.
@@ -1616,7 +1704,7 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             if (!motion.layerToComp(now, A_u_long(in_data->time_scale), &data->layerToCompNow))
                 err = PF_Err_INTERNAL_STRUCT_DAMAGED;
         }
-        if (!err && data->compSpace)
+        if (!err && data->canvas.compSpace)
         {
             const PF_LRect output = LayerViewOfComp(AtResolution(data->layerToCompNow, in_data), area, data->currentInputRect);
             extra->output->max_result_rect = output;
@@ -1628,8 +1716,11 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
         int resumeK = -1;
         if (!err)
         {
+            StillCurrent current{motionAt, nullptr};
+            if (data->watchesComp)
+                current.unchanged = [&motion](const AEGP_TimeStamp& made, A_long end) { return motion.unchangedSince(made, end); };
             resumeK = FindResume(
-                in_data, utils, metal->renderer->cache(), data->canvas, now, step, int(walk.window.size()), motionAt,
+                in_data, utils, metal->renderer->cache(), data->canvas, now, step, int(walk.window.size()), current,
                 &data->resumeImage, &data->resumeCanvas);
             ERR(CheckOutFrames(
                 in_data, extra, request, walk, resumeK >= 0 ? resumeK : int(walk.window.size()), &nextId, data.get()));
@@ -1637,7 +1728,7 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
         // Where the layer is at each moment to be computed, and what each frame's image is kept with.
         for (FrameCheckout& frame : data->frames)
         {
-            if (err || !data->compSpace)
+            if (err || !data->canvas.compSpace)
                 break;
             frame.motion = prints.at(frame.time);
             for (SubstepCheckout& sub : frame.substeps)
@@ -1780,21 +1871,14 @@ PF_Err ComputeSample(
         ERR(render.place(mapWorld, sub.mapRect, &map));
 
     // In comp space, the input and map are where the layer is at this moment, and Centre goes with it.
-    if (!err && render.data.compSpace)
+    if (!err && render.data.canvas.compSpace)
     {
         const CanvasKey& canvas = render.data.canvas;
-        const Projective toComp = AtResolution(sub.layerToComp, in_data);
-        Projective toLayer, toMap;
-        if (!toComp.inverse(&toLayer) || !AtResolution(sub.mapToComp, in_data).inverse(&toMap))
+        if ((input.buffer && !WarpOntoCanvas(&input, sub.layerToComp, sub.inputRect, canvas, in_data)) ||
+            (map.buffer && !WarpOntoCanvas(&map, sub.mapToComp, sub.mapRect, canvas, in_data)))
             err = PF_Err_INTERNAL_STRUCT_DAMAGED;
-        for (auto [image, rect, move] : {std::tuple<PlacedImage*, PF_LRect, const Projective*>{&input, sub.inputRect, &toLayer},
-                                         {&map, sub.mapRect, &toMap}})
-            if (!err && image->buffer)
-            {
-                image->warped = true;
-                Between(*move, canvas.left, canvas.top, rect.left, rect.top).toFloats(image->fromCanvas);
-            }
 
+        const Projective toComp = AtResolution(sub.layerToComp, in_data);
         double centreX, centreY;
         if (!err && toComp.apply(params.centreX, params.centreY, &centreX, &centreY))
         {
@@ -1838,15 +1922,9 @@ PF_Err ShowImage(GpuRender& render, id<MTLBuffer> image, PF_EffectWorld* output)
         {
             PlacedImage input{};
             ERR(render.place(render.currentInput, render.data.currentInputRect, &input));
-            Projective toLayer;
-            if (!err && render.data.compSpace)
-            {
-                if (!AtResolution(render.data.layerToCompNow, render.in_data).inverse(&toLayer))
-                    err = PF_Err_INTERNAL_STRUCT_DAMAGED;
-                input.warped = true;
-                Between(toLayer, canvas.left, canvas.top, render.data.currentInputRect.left, render.data.currentInputRect.top)
-                    .toFloats(input.fromCanvas);
-            }
+            if (!err && render.data.canvas.compSpace &&
+                !WarpOntoCanvas(&input, render.data.layerToCompNow, render.data.currentInputRect, canvas, render.in_data))
+                err = PF_Err_INTERNAL_STRUCT_DAMAGED;
             if (!err)
             {
                 shown = renderer.compositeInput(render.queue, canvas, image, input, mode);
@@ -1861,11 +1939,11 @@ PF_Err ShowImage(GpuRender& render, id<MTLBuffer> image, PF_EffectWorld* output)
     ERR(render.place(output, render.data.outputRect, &placedOutput));
     // In comp space, each output pixel shows the comp where the layer puts it.
     float canvasFromOutput[9];
-    if (render.data.compSpace)
+    if (render.data.canvas.compSpace)
         Between(AtResolution(render.data.layerToCompNow, render.in_data), render.data.outputRect.left,
                 render.data.outputRect.top, canvas.left, canvas.top)
             .toFloats(canvasFromOutput);
-    if (!err && !renderer.copyOut(render.queue, canvas, shown, placedOutput, render.data.compSpace ? canvasFromOutput : nullptr))
+    if (!err && !renderer.copyOut(render.queue, canvas, shown, placedOutput, render.data.canvas.compSpace ? canvasFromOutput : nullptr))
         err = PF_Err_INTERNAL_STRUCT_DAMAGED;
     if (shownIsScratch)
         renderer.cache().releaseScratch(shown);
@@ -1918,16 +1996,28 @@ PF_Err RenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* 
         CanvasKey imageCanvas = canvas;
         // A comp-space image is only of use if the layer went where it did when PreRender looked.
         MotionAt motionAt;
-        if (data->compSpace)
-            motionAt = [data](A_long t)
+        if (data->canvas.compSpace)
+            motionAt = [data, step](A_long t)
             {
-                for (const FrameCheckout& frame : data->frames)
-                    if (frame.time == t)
-                        return frame.motion;
+                // [k] is k frames before the current one.
+                const auto& frames = data->frames;
+                if (step > 0 && !frames.empty() && (frames.front().time - t) % step == 0)
+                {
+                    const A_long k = (frames.front().time - t) / step;
+                    if (k >= 0 && k < A_long(frames.size()) && frames[size_t(k)].time == t)
+                        return frames[size_t(k)].motion;
+                }
                 return uint64_t(1); // never a match: zero is a layer-space image
             };
+        std::optional<LayerMotion> layer;
+        StillCurrent current{motionAt, nullptr};
+        if (data->watchesComp)
+        {
+            layer.emplace(in_data, out_data);
+            current.unchanged = [&layer](const AEGP_TimeStamp& made, A_long end) { return layer->unchangedSince(made, end); };
+        }
         int resumeK = err ? -1
-                          : FindResume(in_data, utils, cache, canvas, in_data->current_time, step, frameCount, motionAt,
+                          : FindResume(in_data, utils, cache, canvas, in_data->current_time, step, frameCount, current,
                                        &image, &imageCanvas);
         if (resumeK < 0)
         {
@@ -1995,7 +2085,7 @@ PF_Err RenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* 
                 ERR(FlushSteps(render));
                 if (!err)
                 {
-                    cache.publish(canvas, frame.time, history, data->compSpace ? frame.motion : 0, image);
+                    cache.publish(canvas, frame.time, history, frame.motion, data->made, image);
                     imageIsScratch = false;
                 }
             }
@@ -2093,8 +2183,9 @@ extern "C" DllExport PF_Err EffectMain(
         case PF_Cmd_ABOUT:
             PF_SPRINTF(out_data->return_msg,
                        "Feedback 1.0\rFeeds a processed copy of the output into each frame.\r\r"
-                       "Trail Rebuild Limit: how many frames are recalculated when you jump to a frame. "
-                       "Playing forward keeps the full trail. Raise it if a trail looks shorter after jumping.");
+                       "Limit Pre-Roll: off, jumping to a frame recalculates the whole trail before it. On, "
+                       "only the last Pre-Roll Limit frames are, which is quicker but can show a shorter trail. "
+                       "Playing forward keeps the full trail either way.");
             break;
         case PF_Cmd_GLOBAL_SETUP:
             err = GlobalSetup(out_data);

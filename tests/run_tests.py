@@ -32,7 +32,8 @@ COMPS = ["trail", "behind", "screen_sub", "add_sub", "grade_blur", "self_disp", 
          "two_layers", "duplicate_fx", "neutral_ref", "neutral_luma", "neutral_red", "neutral_alpha_transparent",
          "neutral_alpha_half", "map_solid_opaque", "map_source_default", "map_solid_masked", "map_effects",
          "empty_layer", "empty_mapped", "layer_own", "layer_none", "layer_own_effects",
-         "perf_long", "limit_600", "limit_800", "limit_100",
+         "perf_long", "limit_600", "limit_800", "limit_100", "preroll_unlimited",
+         "flash_gaussian", "flash_spread", "flash_spread_sub", "adjust_below", "precomp_outer",
          "trim_48", "trim_48_plain", "trim_24", "trim_24_plain", "trim_start", "trim_start_plain",
          "trim_stretch", "trim_stretch_plain",
          *[f"blend_{m}{v}" for m in ("multiply", "lighten", "darken", "overlay", "add_subtract", "difference")
@@ -47,7 +48,7 @@ NEUTRAL = ["neutral_ref", "neutral_luma", "neutral_red", "neutral_alpha_transpar
 COLD = {"trail": 60, "behind": 60, "screen_sub": 60, "add_sub": 60, "grade_blur": 60, "self_disp": 60, "keyed": 70,
         "alpha_min": 60, "alpha_min_fade": 60, "alpha_min_sub": 60,
         "duplicate_fx": 40, "perf_long": 299, "limit_600": 699,
-        "limit_800": 699, "limit_100": 299, "trim_48": 60, "trim_start": 60, "trim_stretch": 60,
+        "limit_800": 699, "limit_100": 299, "preroll_unlimited": 699, "flash_spread": 32, "trim_48": 60, "trim_start": 60, "trim_stretch": 60,
         "blend_difference": 3, "blend_overlay_sub": 29, "comp_space_2d": 20, "layer_3d": 20, "transform_rotate": 12, "transform_sub": 60, "edge_trail": 60}
 DEEP = 3999  # deep_alpha1's last frame
 
@@ -135,6 +136,8 @@ def report(ok, text):
 
 
 def cmd_check(label):
+    def alpha_at(comp, frame, x, y):
+        return int(load(label, comp, frame)[y, x, 3])
     print("Rendering a frame alone matches playing up to it:")
     for comp, frame in COLD.items():
         try:
@@ -144,7 +147,7 @@ def cmd_check(label):
             continue
         text = f"{comp}@{frame}: peak {peak}/255 across {count} pixels"
         if comp in ("limit_600", "limit_100"):
-            report(None, text + " (Alpha Max 1.0, beyond Trail Rebuild Limit)")
+            report(None, text + " (Alpha Max 1.0, beyond Pre-Roll Limit)")
         elif comp == "duplicate_fx":
             # A rebuild stops once the effect's own Alpha has faded older frames to nothing, but the
             # second copy's input is a trail already, which fades slower. The faintest tail differs.
@@ -159,7 +162,7 @@ def cmd_check(label):
     report(max(before) <= 1, f"frames 0-48 match to within rounding (peak {max(before)})")
     report(min(after) > 0, f"frames 50-95 all differ (smallest peak {min(after)})")
 
-    print("Trail Rebuild Limit sets how far a rebuild reaches:")
+    print("Pre-Roll Limit sets how far a rebuild reaches, with Limit Pre-Roll on:")
     for comp, frame, limit in (("limit_600", 699, 600), ("limit_800", 699, 800), ("limit_100", 299, 100)):
         played = visible(load(label, comp, frame))
         alone = visible(load(label, comp + "_cold", frame))
@@ -168,6 +171,24 @@ def cmd_check(label):
     counts = [visible(load(label, "limit_100", f)) for f in range(299)]
     worst = min(b / a for a, b in zip(counts, counts[1:]) if a)
     report(worst > 0.99, f"playing forward, the limit doesn't cut the trail: worst frame-to-frame change x{worst:.3f}")
+
+    print("Spread's widths add, so a copy spreads in step with its age, where a Gaussian's spreads with its root:")
+    def half_radius(comp, frame):
+        """The radius around the centre holding half the trail's alpha."""
+        a = load(label, comp, frame)[..., 3].astype(np.float64)
+        y, x = np.indices(a.shape)
+        r = np.hypot(x - a.shape[1] / 2, y - a.shape[0] / 2).ravel()
+        order = np.argsort(r)
+        mass = np.cumsum(a.ravel()[order])
+        return float(r[order][np.searchsorted(mass, mass[-1] / 2)])
+    for comp, lo, hi in (("flash_gaussian", 1.6, 2.4), ("flash_spread", 3.0, 4.5)):
+        radii = [half_radius(comp, f) for f in (4, 8, 16, 32)]
+        growth = radii[3] / radii[1]
+        report(lo <= growth <= hi, f"{comp}: half-alpha radius {[round(r, 1) for r in radii]} at frames 4, 8, 16, 32, "
+                                   f"x{growth:.2f} from 8 to 32 (between {lo} and {hi})")
+    whole, split = half_radius("flash_spread", 16), half_radius("flash_spread_sub", 16)
+    report(abs(split / whole - 1) <= 0.1, f"flash_spread_sub: sub-steps keep Spread's reach: half-alpha radius {split:.1f} "
+                                          f"against {whole:.1f} at frame 16")
 
     print("Alpha Max 1.0, 4000 frames in, rendered alone:")
     took = json.loads((OUT / label / "timing.json").read_text())["timing"]["deep_alpha1"]
@@ -247,7 +268,7 @@ def cmd_check(label):
                 worst.append((k, None, 0))
                 continue
             y, x = int(round(ys.mean())), int(round(xs.mean()))
-            seen, want = int(load(label, comp, 20)[y, x, 3]), 255 * 0.9 ** k
+            seen, want = alpha_at(comp, 20, x, y), 255 * 0.9 ** k
             worst.append((k, (x, y), seen - want))
         bad = [w for w in worst if w[1] is None or abs(w[2]) > 8]
         report(not bad, f"{comp}: copies 1-5 frames back against the bare layer's centres, alpha off by "
@@ -256,10 +277,7 @@ def cmd_check(label):
     # pixel or two at its corner, though 3D footage and shape layers draw at full size in After Effects.
     # It's still rendered for the cold and half-resolution checks.
     # Each frame's copy 20 pixels further up and left, from the dot's centre at 400,260.
-    image, off = load(label, "map_offset", 11), []
-    for k in range(1, 9):
-        x, y = 400 - 20 * k, 260 - 20 * k
-        off.append(round(int(image[y, x, 3]) - 255 * 0.9 ** k))
+    off = [round(alpha_at("map_offset", 11, 400 - 20 * k, 260 - 20 * k) - 255 * 0.9 ** k) for k in range(1, 9)]
     report(all(abs(o) <= 12 for o in off), f"map_offset: Map Layer shifts the trail beyond the layer's corner, "
                                            f"alpha off by {off} for copies 1-8 frames back")
 
@@ -331,8 +349,6 @@ def cmd_check(label):
                f"{mode}: centre RGB {whole} without sub-steps, {split} with 3; worked out {want_whole.round(0)} and {want_split.round(0)}")
 
     print("Transform carries each frame's dot, fading by Alpha Max 0.9 a frame:")
-    def alpha_at(comp, frame, x, y):
-        return int(load(label, comp, frame)[y, x, 3])
     for k in range(1, 6):
         seen, want = alpha_at("transform_position", 11, 200 + 20 * k, 180), 255 * 0.9 ** k
         report(abs(seen - want) <= 4, f"Position 20 to the right, {k} frames back at x={200 + 20 * k}: alpha {seen}, expected {want:.0f}")

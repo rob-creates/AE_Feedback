@@ -213,16 +213,55 @@
         }, 1);
         setStage("map_effects", -1);
 
-        // Long trails, for PreRender cost and the 600-frame limit.
+        // Long trails, for PreRender cost and Pre-Roll Limit, at its default of 600 and set.
         var perf = newComp("perf_long", 300, 1920, 1080);
         var perfLayer = movingDot(perf, "dot", RED, 1920, 1080, [100, 100], [1800, 980], 60);
         feedback(perfLayer, { "Alpha Max": 0.98, "Sub-steps": 2 });
-        dotComp("limit_600", 700, { "Alpha Max": 1 });
-        dotComp("limit_800", 700, { "Alpha Max": 1, "Trail Rebuild Limit (Frames)": 800 });
-        dotComp("limit_100", 300, { "Alpha Max": 1, "Trail Rebuild Limit (Frames)": 100 });
-        // Nothing fades, so a frame deep into it looks back over the whole comp. Rendered alone.
+        dotComp("limit_600", 700, { "Alpha Max": 1, "Limit Pre-Roll": true });
+        dotComp("limit_800", 700, { "Alpha Max": 1, "Limit Pre-Roll": true, "Pre-Roll Limit (Frames)": 800 });
+        dotComp("limit_100", 300, { "Alpha Max": 1, "Limit Pre-Roll": true, "Pre-Roll Limit (Frames)": 100 });
+        // With Limit Pre-Roll off, as it is by default, jumping to a frame rebuilds the whole trail.
+        dotComp("preroll_unlimited", 700, { "Alpha Max": 1 });
+        // Nothing fades, so a frame deep into it looks back over the whole comp, as far as the limit lets
+        // it. Rendered alone.
         var deep = newComp("deep_alpha1", 4000, 1920, 1080);
-        feedback(movingDot(deep, "dot", RED, 1920, 1080, [100, 100], [1800, 980], 60), { "Alpha Max": 1, "Sub-steps": 7 });
+        feedback(movingDot(deep, "dot", RED, 1920, 1080, [100, 100], [1800, 980], 60),
+                 { "Alpha Max": 1, "Sub-steps": 7, "Limit Pre-Roll": true });
+
+        // The same with Limit Pre-Roll off, as it is by default. Not in the suite: rendered by hand, to see
+        // whether rebuilding the whole of it at once is something AE copes with.
+        var deepOff = newComp("deep_unlimited", 4000, 1920, 1080);
+        feedback(movingDot(deepOff, "dot", RED, 1920, 1080, [100, 100], [1800, 980], 60), { "Alpha Max": 1, "Sub-steps": 7 });
+
+        // A dot seen only on the first frame, so the trail after it is that one copy spreading out:
+        // Gaussian, Spread, and Spread split into sub-steps. Masks apply before effects, so the mask's
+        // opacity hides the dot from the effect.
+        var flashes = { "flash_gaussian": {}, "flash_spread": { "Blur Type": 2 }, "flash_spread_sub": { "Blur Type": 2, "Sub-steps": 3 } };
+        for (var name in flashes) {
+            var fc = newComp(name, 40);
+            var flash = fc.layers.addSolid(RED, "flash", W, H, 1, fc.duration);
+            var fm = flash.Masks.addProperty("Mask");
+            fm.property("maskShape").setValue(dot(W / 2, H / 2, 6));
+            var fo = fm.property("Mask Opacity");
+            fo.setValueAtTime(0, 100);
+            fo.setValueAtTime(1 / FPS, 0);
+            fo.setInterpolationTypeAtKey(1, KeyframeInterpolationType.HOLD);
+            var settings = { "Alpha Max": 1, "Blur Radius": 4 };
+            for (var k in flashes[name]) settings[k] = flashes[name][k];
+            feedback(flash, settings);
+        }
+
+        // The effect on an adjustment layer over a moving dot, and on a precomp of one. The live session
+        // changes what's beneath each after playing through.
+        var below = newComp("adjust_below", 48);
+        movingDot(below, "dot", RED, W, H, ACROSS[0], ACROSS[1], 30);
+        var adjust = below.layers.addSolid(GREY, "adjust", W, H, 1, below.duration);
+        adjust.adjustmentLayer = true;
+        feedback(adjust, { "Alpha Max": 0.9 });
+        var inner = newComp("precomp_inner", 48);
+        movingDot(inner, "dot", RED, W, H, ACROSS[0], ACROSS[1], 30);
+        var outer = newComp("precomp_outer", 48);
+        feedback(outer.layers.add(inner), { "Alpha Max": 0.9 });
 
         // Alpha Min: on its own, against the same blur without it, and split into sub-steps.
         dotComp("alpha_min", 96, { "Alpha Max": 1, "Alpha Min": 0.2, "Blur Radius": 3 });

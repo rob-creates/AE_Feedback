@@ -3,7 +3,6 @@
 #include <cmath>
 #include <cstring>
 
-#include "AEFX_SuiteHelper.h"
 
 Projective Projective::after(const Projective& first) const
 {
@@ -56,8 +55,10 @@ LayerMotion::LayerMotion(PF_InData* in_data, PF_OutData* out_data, AEGP_LayerIDV
 {
     try
     {
-        AEFX_SuiteScoper<AEGP_PFInterfaceSuite1> face(in_data, kAEGPPFInterfaceSuite, kAEGPPFInterfaceSuiteVersion1, out_data);
-        AEFX_SuiteScoper<AEGP_LayerSuite9> layers(in_data, kAEGPLayerSuite, kAEGPLayerSuiteVersion9, out_data);
+        mFace.emplace(in_data, kAEGPPFInterfaceSuite, kAEGPPFInterfaceSuiteVersion1, out_data);
+        mLayers.emplace(in_data, kAEGPLayerSuite, kAEGPLayerSuiteVersion9, out_data);
+        auto& face = *mFace;
+        auto& layers = *mLayers;
         AEFX_SuiteScoper<AEGP_CompSuite13> comps(in_data, kAEGPCompSuite, kAEGPCompSuiteVersion13, out_data);
         AEFX_SuiteScoper<AEGP_ItemSuite9> items(in_data, kAEGPItemSuite, kAEGPItemSuiteVersion9, out_data);
 
@@ -70,6 +71,8 @@ LayerMotion::LayerMotion(PF_InData* in_data, PF_OutData* out_data, AEGP_LayerIDV
             layers->AEGP_GetLayerParentComp(mLayer, &comp) || comps->AEGP_GetItemFromComp(comp, &item) ||
             items->AEGP_GetItemDimensions(item, &mCompWidth, &mCompHeight))
             return;
+        mCompItem = item;
+        mAdjustment = (flags & AEGP_LayerFlag_ADJUSTMENT_LAYER) != 0;
         if (other != AEGP_LayerIDVal_NONE &&
             (layers->AEGP_GetLayerFromLayerID(comp, other, &mLayer) || !mLayer || layers->AEGP_GetLayerFlags(mLayer, &flags) ||
              layers->AEGP_GetLayerObjectType(mLayer, &type)))
@@ -88,25 +91,49 @@ bool LayerMotion::layerToComp(A_long value, A_u_long scale, Projective* out)
 {
     if (!mUsable)
         return false;
+    if (mDrawnInComp)
+    {
+        *out = Projective{};
+        return true;
+    }
+    const auto key = std::make_pair(value, scale);
+    if (auto found = mRead.find(key); found != mRead.end())
+    {
+        *out = found->second;
+        return true;
+    }
+    A_Time compTime{};
+    A_Matrix4 world{};
+    if ((*mFace)->AEGP_ConvertEffectToCompTime(mInData->effect_ref, value, scale, &compTime) ||
+        (*mLayers)->AEGP_GetLayerToWorldXform(mLayer, &compTime, &world))
+        return false;
+    // A 2D layer's world is the comp itself. AE's matrices act on row vectors, (x, y, z, 1) * M.
+    *out = Projective{{world.mat[0][0], world.mat[1][0], world.mat[3][0], world.mat[0][1], world.mat[1][1],
+                       world.mat[3][1], 0, 0, 1}};
+    mRead.emplace(key, *out);
+    return true;
+}
+
+uint64_t LayerMotion::fingerprint(A_long time)
+{
+    Projective p;
+    if (!layerToComp(time, A_u_long(mInData->time_scale), &p))
+        return 0;
+    uint64_t hash = 1469598103934665603ull; // FNV-1a
+    unsigned char bytes[sizeof(p.m)];
+    std::memcpy(bytes, p.m, sizeof(p.m));
+    for (unsigned char b : bytes)
+        hash = (hash ^ b) * 1099511628211ull;
+    return hash;
+}
+
+bool LayerMotion::timestamp(AEGP_TimeStamp* out)
+{
     try
     {
-        AEFX_SuiteScoper<AEGP_PFInterfaceSuite1> face(mInData, kAEGPPFInterfaceSuite, kAEGPPFInterfaceSuiteVersion1, mOutData);
-        AEFX_SuiteScoper<AEGP_LayerSuite9> layers(mInData, kAEGPLayerSuite, kAEGPLayerSuiteVersion9, mOutData);
-
-        A_Time compTime{};
-        A_Matrix4 world{};
-        if (mDrawnInComp)
-        {
-            *out = Projective{};
-            return true;
-        }
-        if (face->AEGP_ConvertEffectToCompTime(mInData->effect_ref, value, scale, &compTime) ||
-            layers->AEGP_GetLayerToWorldXform(mLayer, &compTime, &world))
-            return false;
-        // A 2D layer's world is the comp itself. AE's matrices act on row vectors, (x, y, z, 1) * M.
-        *out = Projective{{world.mat[0][0], world.mat[1][0], world.mat[3][0], world.mat[0][1], world.mat[1][1],
-                           world.mat[3][1], 0, 0, 1}};
-        return true;
+        if (!mRender)
+            mRender.emplace(mInData, kAEGPRenderSuite, kAEGPRenderSuiteVersion5, mOutData);
+        return (*mRender)->AEGP_GetCurrentTimestamp(out) == A_Err_NONE;
     }
     catch (...)
     {
@@ -114,20 +141,26 @@ bool LayerMotion::layerToComp(A_long value, A_u_long scale, Projective* out)
     }
 }
 
-uint64_t LayerMotion::fingerprint(A_long from, A_long to, A_long step)
+bool LayerMotion::unchangedSince(const AEGP_TimeStamp& made, A_long endExclusive)
 {
-    uint64_t hash = 1469598103934665603ull; // FNV-1a
-    if (step <= 0)
-        return 0;
-    for (A_long t = from; t <= to; t += step)
+    try
     {
-        Projective p;
-        if (!layerToComp(t, A_u_long(mInData->time_scale), &p))
-            return 0;
-        unsigned char bytes[sizeof(p.m)];
-        std::memcpy(bytes, p.m, sizeof(p.m));
-        for (unsigned char b : bytes)
-            hash = (hash ^ b) * 1099511628211ull;
+        if (!mCompItem || !mFace)
+            return false;
+        if (!mRender)
+            mRender.emplace(mInData, kAEGPRenderSuite, kAEGPRenderSuiteVersion5, mOutData);
+        A_Time end{};
+        if ((*mFace)->AEGP_ConvertEffectToCompTime(mInData->effect_ref, endExclusive, A_u_long(mInData->time_scale), &end))
+            return false;
+        // From the comp's start, which takes in any time before the layer's.
+        const A_Time start{0, end.scale};
+        A_Boolean changed = true;
+        if ((*mRender)->AEGP_HasItemChangedSinceTimestamp(mCompItem, &start, &end, &made, &changed))
+            return false;
+        return !changed;
     }
-    return hash;
+    catch (...)
+    {
+        return false;
+    }
 }

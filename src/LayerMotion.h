@@ -3,7 +3,11 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
+#include <optional>
+#include <utility>
 
+#include "AEFX_SuiteHelper.h"
 #include "AE_Effect.h"
 #include "AE_GeneralPlug.h"
 
@@ -40,12 +44,23 @@ public:
     A_long compHeight() const { return mCompHeight; }
 
     // Layer pixels to comp pixels, both at full resolution, at a time in the effect's own units. A
-    // layer drawn in comp space already has its pixels where they are in the comp.
+    // layer drawn in comp space already has its pixels where they are in the comp. Each moment is
+    // read from AE once.
     bool layerToComp(A_long value, A_u_long scale, Projective* out);
 
-    // Changes whenever where the layer goes at any frame from `from` to `to` changes. Zero if it
+    // Changes whenever where the layer is at `time`, in the comp's time scale, changes. Zero if it
     // can't be read.
-    uint64_t fingerprint(A_long from, A_long to, A_long step);
+    uint64_t fingerprint(A_long time);
+
+    // An adjustment layer's input is whatever is beneath it, and AE's history of the effect's inputs
+    // doesn't change when that does. So its images are kept with when they were made, and only used
+    // while nothing in the comp has changed since, up to their frame.
+    bool watchesComp() const { return mAdjustment; }
+    // The project's timestamp, which goes up with every change that affects rendering.
+    bool timestamp(AEGP_TimeStamp* out);
+    // False if anything in the comp before `endExclusive`, in the effect's time, has changed since
+    // `made`, or if that can't be told.
+    bool unchangedSince(const AEGP_TimeStamp& made, A_long endExclusive);
 
 private:
     PF_InData* mInData;
@@ -53,5 +68,12 @@ private:
     AEGP_LayerH mLayer = nullptr;
     bool mUsable = false;
     bool mDrawnInComp = false;
+    bool mAdjustment = false;
+    AEGP_ItemH mCompItem = nullptr;
     A_long mCompWidth = 0, mCompHeight = 0;
+    // Held for the life of this object, which lasts one call.
+    std::optional<AEFX_SuiteScoper<AEGP_PFInterfaceSuite1>> mFace;
+    std::optional<AEFX_SuiteScoper<AEGP_LayerSuite9>> mLayers;
+    std::optional<AEFX_SuiteScoper<AEGP_RenderSuite5>> mRender;
+    std::map<std::pair<A_long, A_u_long>, Projective> mRead;
 };
