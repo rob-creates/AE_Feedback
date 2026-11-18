@@ -90,4 +90,16 @@ print(f"{a} against {b}: {n} frames, largest differences {worst[:6]}")
 PY
 fi
 rm -rf __pycache__
+
+# A run takes about 10 GB, so only the two newest are kept, and never this run or its baseline. A run
+# is a folder in out/ with a timing.json.
+keep=0
+for timing in $(ls -t out/*/timing.json 2>/dev/null); do
+    run=${timing:h:t}
+    keep=$((keep + 1))
+    if [ $keep -gt 2 ] && [ "$run" != "$LABEL" ] && [ "$run" != "$BASE" ]; then
+        rm -rf "out/$run"
+        echo "removed the old run $run"
+    fi
+done
 exit $failed
