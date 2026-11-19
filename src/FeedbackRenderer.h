@@ -2,6 +2,7 @@
 #pragma once
 
 #import <Metal/Metal.h>
+#include <algorithm>
 #include <cmath>
 #include <memory>
 
@@ -68,6 +69,17 @@ inline Affine TrailTransform(const FrameParams& f, float resolutionX, float reso
     t.tx = f.centreX + f.moveX * resolutionX - (t.a * f.centreX + t.b * f.centreY);
     t.ty = f.centreY + f.moveY * resolutionY - (t.c * f.centreX + t.d * f.centreY);
     return t;
+}
+
+// The least scale a step takes, which stands for 0: a move that can't be undone can't say where each
+// pixel came from.
+constexpr float kMinScale = 1e-4f;
+
+// Scale at 0 shrinks the trail to nothing. Taken at kMinScale, the pixel at the move's fixed point would
+// still sample itself, and stay, so the moved trail is cleared outright instead.
+inline bool CollapsesTrail(const FrameParams& f)
+{
+    return std::min(f.scaleX, f.scaleY) <= kMinScale;
 }
 
 inline bool MovesTrail(const FrameParams& f)

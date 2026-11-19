@@ -131,8 +131,10 @@
         for (var f = 0; f < 16; f++) find(stamp, "Update").setValueAtTime(f / FPS, f % 4 === 0);
         // Update off throughout leaves nothing, with sub-steps and Add, where the layer would go on top.
         dotComp("update_off", 24, { "Alpha Max": 0.9, "Composite": 3, "Sub-steps": 1, "Update": false });
-        // Scale 0 shrinks the trail to nothing each frame, so only the dot itself shows.
-        stillDot("transform_scale_zero", 4, [360, 180], 5, { "Alpha Max": 0.9, "Scale Height": 0 });
+        // Scale 0 shrinks the trail to nothing each frame: a dot on Centre, stamped once, is gone by the
+        // next frame, its very centre included.
+        var zero = stillDot("transform_scale_zero", 4, [W / 2, H / 2], 5, { "Alpha Max": 0.9, "Scale Height": 0 });
+        for (var z = 0; z < 4; z++) find(zero, "Update").setValueAtTime(z / FPS, z === 0);
 
         // Edges of a still dot, over its trail, in front of the dot itself: only its outline shows.
         stillDot("edge_luminance", 4, [W / 2, H / 2], 40,

@@ -422,11 +422,10 @@ def cmd_check(label):
     report(peak == 0, f"Update off throughout, with Add and sub-steps, leaves nothing: peak alpha {peak}")
 
     print("Scale 0:")
-    im = load(label, "transform_scale_zero", 3)
-    outside = im[..., 3].copy()
-    outside[170:191, 350:371] = 0
-    report(im[180, 360, 3] == 255 and outside.max() == 0,
-           f"only the dot itself shows: alpha {im[180, 360, 3]} at its centre, {outside.max()} anywhere else")
+    first = load(label, "transform_scale_zero", 0)[180, 320, 3]
+    left = max(int(load(label, "transform_scale_zero", f)[..., 3].max()) for f in (1, 3))
+    report(first == 255 and left == 0,
+           f"a dot on Centre, stamped once (alpha {first}), leaves nothing after it, Centre included: peak alpha {left}")
 
     print("Edges: the dot's outline over its trail, in front of the dot:")
     for comp, least in (("edge_luminance", 40), ("edge_colour", 200)):

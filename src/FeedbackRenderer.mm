@@ -147,6 +147,14 @@ id<MTLBuffer> FillMask(Mask& m, const PlacedImage& image, int source, id<MTLBuff
 // Where Transform moves a canvas pixel from, as `inverse * position + offset`.
 void InvertTransform(const FrameParams& f, const CanvasKey& canvas, DisplaceParams* p)
 {
+    // Every pixel comes from far beyond the canvas, so nothing moved survives. A Transform mask's
+    // partial move, part way to there, is beyond it too, as it would be at any scale near 0.
+    if (CollapsesTrail(f))
+    {
+        std::fill(std::begin(p->inverse), std::end(p->inverse), 0.0f);
+        p->offsetX = p->offsetY = -1e7f;
+        return;
+    }
     const Affine layer = TrailTransform(f, ScaleValue(canvas.downsampleX), ScaleValue(canvas.downsampleY));
     // The same move with the canvas's corner as the origin.
     Affine t = layer;

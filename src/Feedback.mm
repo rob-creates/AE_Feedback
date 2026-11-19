@@ -538,10 +538,6 @@ float RootOffset(float offset, float slope, float subSlope, float share)
     return std::abs(slope - 1.0f) < 1e-5f ? offset * share : offset * (subSlope - 1.0f) / (slope - 1.0f);
 }
 
-// The least scale a step takes. At 0 the move couldn't be undone to find where each pixel came from;
-// this shrinks the trail to nothing in a frame all the same.
-const float kMinScale = 1e-4f;
-
 // Position is how far the trail moves each frame, which AE gives at the current resolution. With
 // Uniform Scale on, Scale Height sets both. The step scales, then turns clockwise on screen, where y
 // points down, about the centre, then moves along.
