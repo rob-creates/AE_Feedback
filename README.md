@@ -12,10 +12,16 @@ Feedback Effect for Adobe After Effects
 - Map Layer set to the effect's own layer, at Effects & Masks, uses the trail as the map.
 - The blur spreads a copy in step with its age: a small Blur Radius leaves new copies almost sharp,
   and older ones spread further each frame, with soft, long-tailed edges.
-- Blur Map Layer scales Blur Radius by its luminance at each pixel: black blurs nothing, white blurs
-  by the whole radius, and transparent parts blur nothing. Like Map Layer, it's read where it is in
-  the comp, and the effect's own layer at Effects & Masks uses the trail. Left at None, the whole
-  image blurs by the radius.
+- Each group (Alpha, Blur, Levels, HSL, Transform, Displacement and Edge) has a Mask Layer. Its
+  luminance at each pixel is how much of the group applies there: black leaves the trail as it was,
+  white applies the whole group, and transparent parts apply none of it. A grey Transform mask moves
+  a pixel part of the way; a grey Blur mask blurs it by that share of the radius. Like Map Layer, a
+  mask is read where it is in the comp, and the effect's own layer at Effects & Masks uses the
+  trail. Left at None, the group applies everywhere. Where an Alpha mask is dark the trail doesn't
+  fade, so jumping to a frame recalculates the trail from its start, or from Pre-Roll Limit.
+- Update Every (Frames), under Timing, moves the trail on only every so many frames, counted from the
+  layer's in-point, each time by that many frames' worth, so the trail keeps its length in seconds.
+  In between, the trail holds while the layer plays over it. Sub-steps divide each update.
 - Jumping to a frame recalculates the whole trail before it, so the trail is always complete, though a
   long one that never fades takes a while. Turn on Limit Pre-Roll to recalculate only the last
   Pre-Roll Limit frames instead: quicker, but a long trail can look shorter after a jump. Playing

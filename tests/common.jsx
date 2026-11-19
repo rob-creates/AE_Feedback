@@ -1,7 +1,7 @@
 // Shared by build_project.jsx and live_session.jsx.
 var FPS = 24;
 var MAP_LAYER = "Map Layer";
-var BLUR_MAP_LAYER = "Blur Map Layer";
+var BLUR_MAP_LAYER = "Blur Mask Layer";
 
 function find(group, name) {
     for (var i = 1; i <= group.numProperties; i++) {

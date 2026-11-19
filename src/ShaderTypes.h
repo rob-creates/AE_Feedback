@@ -61,6 +61,13 @@ struct MapLookup
     float fromCanvas[9]; // row-major 3x3, to map pixel coordinates
 };
 
+// A group's mask: how much of the group each pixel gets, from its luminance. Without `use`, all of it.
+struct Mask
+{
+    int use;
+    MapLookup map;
+};
+
 struct DisplaceParams
 {
     int srcPitch;
@@ -77,19 +84,25 @@ struct DisplaceParams
     float offsetX;
     float offsetY;
     MapLookup map;
+    Mask transformMask; // each pixel moves this much of the way Transform takes it
+    Mask displaceMask; // and shifts this much of its displacement
 };
 
 struct EdgeParams
 {
     int srcPitch;
     int dstPitch;
-    int width;
-    int height;
     int type;
     int blend;
     float distanceX; // canvas pixels between the samples either side
     float distanceY;
     float strength;
+    // The image the samples read: the source blurred to their spacing, `smoothFactor` times smaller.
+    int smoothPitch;
+    int smoothWidth;
+    int smoothHeight;
+    int smoothFactor;
+    Mask mask; // scales the edges
 };
 
 // Moving to and from the smaller image that wide blurs run on.
@@ -114,7 +127,7 @@ struct AddScaledParams
     int first;
 };
 
-// Blurs each pixel by its own share of the radius: Blur Map Layer's luminance, from none at black to
+// Blurs each pixel by its own share of the radius: Blur Mask Layer's luminance, from none at black to
 // all of it at white. Blends the two blurs either side of that share, of the unblurred image and blurs
 // at 1/8, 1/4, 1/2 and all of the radius.
 struct BlurMapParams
@@ -153,6 +166,10 @@ struct GradeParams
     float lightness; // offset
     float alphaSlope; // new alpha = slope * alpha + offset
     float alphaOffset;
+    // How much of each a pixel gets, between leaving it as it was and the whole change.
+    Mask levelsMask;
+    Mask hslMask;
+    Mask alphaMask;
 };
 
 struct CompositeParams

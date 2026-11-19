@@ -156,6 +156,12 @@ inline bool mapPosition(constant MapLookup& m, uint2 xy, thread float2& at)
     return true;
 }
 
+// Where a canvas position falls in an image `factor` times smaller, by pixel centres.
+inline float2 toSmaller(float2 pos, int factor)
+{
+    return (pos + 0.5f) / float(factor) - 0.5f;
+}
+
 // Transparent beyond the image, rather than repeating its edge.
 inline float4 sampleOrClear(device const float4* src, int pitch, int w, int h, float2 pos)
 {
@@ -163,13 +169,27 @@ inline float4 sampleOrClear(device const float4* src, int pitch, int w, int h, f
         return bilinearClamped(src, pitch, w, h, pos);
     return float4(0.0);
 }
+// How much of a group a pixel gets: its mask's luminance, premultiplied so transparent parts of the
+// mask leave the pixel alone, as does anywhere beyond it. All of it without a mask.
+inline float maskAt(device const float4* buffer, constant Mask& m, uint2 xy)
+{
+    if (m.use == 0)
+        return 1.0f;
+    float2 at;
+    if (!mapPosition(m.map, xy, at))
+        return 0.0f;
+    const float4 v = bilinearPremultiplied(buffer, m.map.pitch, m.map.width, m.map.height, at, m.map.isStraight != 0);
+    return saturate(luma(v.xyz));
+}
 } // namespace
 
 kernel void displace(
     device const float4* src [[buffer(0)]],
     device const float4* map [[buffer(1)]],
-    device float4* dst [[buffer(2)]],
-    constant DisplaceParams& p [[buffer(3)]],
+    device const float4* transformMask [[buffer(2)]],
+    device const float4* displaceMask [[buffer(3)]],
+    device float4* dst [[buffer(4)]],
+    constant DisplaceParams& p [[buffer(5)]],
     uint2 xy [[thread_position_in_grid]])
 {
     int2 canvas = int2(xy);
@@ -183,26 +203,32 @@ kernel void displace(
             mapShift(v, p.channelX, p.map.isStraight != 0) * p.amountX,
             mapShift(v, p.channelY, p.map.isStraight != 0) * p.amountY);
     }
-    // Displacement says where each pixel comes from, and Transform where that was before it moved.
-    const float2 shifted = float2(canvas) + shift;
-    const float2 pos = float2(
+    // Displacement says where each pixel comes from, and Transform where that was before it moved. Each
+    // mask takes a pixel part of the way.
+    const float2 shifted = float2(canvas) + shift * maskAt(displaceMask, p.displaceMask, xy);
+    const float2 moved = float2(
         p.inverse[0] * shifted.x + p.inverse[1] * shifted.y + p.offsetX,
         p.inverse[2] * shifted.x + p.inverse[3] * shifted.y + p.offsetY);
+    const float2 pos = mix(shifted, moved, maskAt(transformMask, p.transformMask, xy));
     // Anything brought in from beyond the canvas is transparent.
     dst[xy.y * p.dstPitch + xy.x] = sampleOrClear(src, p.srcPitch, p.width, p.height, pos);
 }
 
 // Finds edges with a Sobel filter whose taps are `distance` apart, and puts them over the image.
 // A sharp step gives an edge of 1 at Strength 1, however far apart the taps are.
+// The taps read `smooth`, the image blurred to their spacing, so detail finer than it can't alias.
 kernel void edge(
     device const float4* src [[buffer(0)]],
-    device float4* dst [[buffer(1)]],
-    constant EdgeParams& p [[buffer(2)]],
+    device const float4* smooth [[buffer(1)]],
+    device const float4* mask [[buffer(2)]],
+    device float4* dst [[buffer(3)]],
+    constant EdgeParams& p [[buffer(4)]],
     uint2 xy [[thread_position_in_grid]])
 {
     const float2 c = float2(xy);
     const float2 d = float2(p.distanceX, p.distanceY);
-#define AT(dx, dy) sampleOrClear(src, p.srcPitch, p.width, p.height, c + float2(dx, dy) * d)
+#define AT(dx, dy)                                                                                     \
+    sampleOrClear(smooth, p.smoothPitch, p.smoothWidth, p.smoothHeight, toSmaller(c + float2(dx, dy) * d, p.smoothFactor))
     const float4 nw = AT(-1, -1), n = AT(0, -1), ne = AT(1, -1);
     const float4 w = AT(-1, 0), e = AT(1, 0);
     const float4 sw = AT(-1, 1), s = AT(0, 1), se = AT(1, 1);
@@ -225,6 +251,7 @@ kernel void edge(
     // premultiplied colour. Strong edges otherwise turn Multiply into a brightening.
     if (p.blend >= COMPOSITE_MULTIPLY)
         edges.xyz = min(edges.xyz, float3(edges.w));
+    edges *= maskAt(mask, p.mask, xy);
     const float4 image = src[xy.y * p.srcPitch + xy.x];
     dst[xy.y * p.dstPitch + xy.x] = sanitize(blendImages(image, edges, p.blend));
 }
@@ -278,7 +305,7 @@ kernel void addScaled(
 {
     float4 v;
     if (p.factor > 1)
-        v = bilinearClamped(src, p.srcPitch, p.srcWidth, p.srcHeight, (float2(xy) + 0.5f) / float(p.factor) - 0.5f);
+        v = bilinearClamped(src, p.srcPitch, p.srcWidth, p.srcHeight, toSmaller(float2(xy), p.factor));
     else
         v = src[xy.y * p.srcPitch + xy.x];
     const uint i = xy.y * p.dstPitch + xy.x;
@@ -318,8 +345,8 @@ kernel void blurByMap(
 
 namespace
 {
-// Levels, then HSL, then Alpha.
-inline float4 applyGrade(float4 c, constant GradeParams& p)
+// Levels, then HSL, then Alpha, each to the share of it its mask gives this pixel.
+inline float4 applyGrade(float4 c, constant GradeParams& p, float levelsShare, float hslShare, float alphaShare)
 {
     if ((p.applyLevels != 0 || p.applyHSL != 0) && c.w > 1e-5f)
     {
@@ -330,7 +357,7 @@ inline float4 applyGrade(float4 c, constant GradeParams& p)
         {
             float3 v = max((rgb - p.inputBlack) / max(p.inputWhite - p.inputBlack, 1e-5f), 0.0f);
             v = pow(v, p.inverseGamma);
-            rgb = p.outputBlack + v * (p.outputWhite - p.outputBlack);
+            rgb = mix(rgb, p.outputBlack + v * (p.outputWhite - p.outputBlack), levelsShare);
         }
 
         if (p.applyHSL != 0)
@@ -342,7 +369,7 @@ inline float4 applyGrade(float4 c, constant GradeParams& p)
             hsl.x = fract(hsl.x + p.hueShift);
             hsl.y = saturate(hsl.y * p.saturation);
             hsl.z = saturate(hsl.z + p.lightness);
-            rgb = hslToRgb(hsl) * scale;
+            rgb = mix(rgb, hslToRgb(hsl) * scale, hslShare);
         }
 
         c = float4(rgb.bgr * a, a);
@@ -352,6 +379,7 @@ inline float4 applyGrade(float4 c, constant GradeParams& p)
     float gain = p.alphaSlope;
     if (p.alphaOffset != 0.0f)
         gain = c.w > 1e-5f ? saturate(c.w * p.alphaSlope + p.alphaOffset) / c.w : 0.0f;
+    gain = mix(1.0f, gain, alphaShare);
 
     return sanitize(c * gain);
 }
@@ -399,11 +427,16 @@ inline float4 applyComposite(float4 f, device const float4* input, int2 xy, cons
 kernel void gradeAndComposite(
     device const float4* src [[buffer(0)]],
     device const float4* input [[buffer(1)]],
-    device float4* dst [[buffer(2)]],
-    constant StepParams& p [[buffer(3)]],
+    device const float4* levelsMask [[buffer(2)]],
+    device const float4* hslMask [[buffer(3)]],
+    device const float4* alphaMask [[buffer(4)]],
+    device float4* dst [[buffer(5)]],
+    constant StepParams& p [[buffer(6)]],
     uint2 xy [[thread_position_in_grid]])
 {
-    const float4 graded = applyGrade(src[xy.y * p.grade.srcPitch + xy.x], p.grade);
+    constant GradeParams& g = p.grade;
+    const float4 graded = applyGrade(src[xy.y * g.srcPitch + xy.x], g, maskAt(levelsMask, g.levelsMask, xy),
+                                     maskAt(hslMask, g.hslMask, xy), maskAt(alphaMask, g.alphaMask, xy));
     dst[xy.y * p.composite.dstPitch + xy.x] = applyComposite(graded, input, int2(xy), p.composite);
 }
 

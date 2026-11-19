@@ -7,15 +7,28 @@
 
 #include "FeedbackCache.h"
 
+// The layers a step reads besides its input: Map Layer for displacement, and each group's mask.
+enum MapSlot
+{
+    SLOT_DISPLACE,
+    SLOT_ALPHA_MASK,
+    SLOT_BLUR_MASK,
+    SLOT_LEVELS_MASK,
+    SLOT_HSL_MASK,
+    SLOT_TRANSFORM_MASK,
+    SLOT_DISPLACE_MASK,
+    SLOT_EDGE_MASK,
+    SLOT_COUNT
+};
+
 struct FrameParams
 {
     float alpha; // the fade alone
     float alphaSlope, alphaOffset; // the whole alpha curve: slope * alpha + offset
     float blurRadius; // full-resolution pixels
-    int blurSource; // MapSource: what scales the radius at each pixel
+    int sources[SLOT_COUNT]; // MapSource: what each map and mask reads
     float inputBlack, inputWhite, gamma, outputBlack, outputWhite;
     float hueDegrees, saturation, lightness;
-    int displaceSource; // MapSource
     int channelX, channelY;
     float amountX, amountY; // full-resolution pixels
     float centreX, centreY; // layer pixels at the current resolution, as AE gives a point
@@ -27,6 +40,7 @@ struct FrameParams
     float moveX, moveY;
     int edgeType;
     float edgeSize; // full-resolution pixels between the samples either side
+    float edgeSmoothing; // 0 samples the image as it is, 1 blurs it by half the spacing first
     float edgeStrength; // 0 is off
     int edgeBlend;
     int compositeMode;
@@ -69,6 +83,23 @@ inline float BlurSigma(float radius)
     return radius * 0.5f;
 }
 
+// A Gaussian is cut off this many sigma out, past which too little of it is left to matter.
+const float kGaussianTails = 3.0f;
+
+// Edge samples `spacing` apart read the image blurred by this much. At full smoothing, detail finer
+// than their spacing can't alias.
+inline float EdgeSmoothingSigma(float spacing, float smoothing)
+{
+    return spacing * 0.5f * smoothing;
+}
+
+// How far beyond itself an edge pass can reach: one sample out, plus the tails of what it reads at
+// full smoothing.
+inline float EdgeReach(float spacing)
+{
+    return spacing + kGaussianTails * EdgeSmoothingSigma(spacing, 1.0f);
+}
+
 // A buffer plus where it sits on the canvas. A null buffer means nothing is there. A warped image is
 // found through a projective map from canvas pixels instead of an offset.
 struct PlacedImage
@@ -105,8 +136,7 @@ public:
         const CanvasKey& canvas,
         id<MTLBuffer> prev,
         const PlacedImage& input,
-        const PlacedImage& map,
-        const PlacedImage& blurMap,
+        const PlacedImage (&maps)[SLOT_COUNT],
         const FrameParams& params);
 
     // Runs what's queued and waits for it. Returns false if the GPU work failed.
@@ -157,11 +187,13 @@ private:
                            std::vector<id<MTLBuffer>>& scratch);
 
     // Wide blurs are worked out on a smaller image, which this leaves small.
+    // `maxDirectSigma` is the widest blur run at a level before moving to the next smaller one.
     SmallBlur encodeSmallBlur(
         id<MTLComputeCommandEncoder> encoder,
         Pyramid& pyramid,
         float sigmaX,
         float sigmaY,
+        float maxDirectSigma,
         StepBatch& batch,
         std::vector<id<MTLBuffer>>& scratch);
 

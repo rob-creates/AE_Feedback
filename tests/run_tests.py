@@ -43,14 +43,17 @@ COMPS = ["trail", "behind", "screen_sub", "add_sub", "grade_blur", "self_disp", 
          "transform_sub_scale", "transform_sub_skew", "edge_multiply", "square_path", "square_path_plain",
          "map_offset",
          *[f"comp_space_{v}{p}" for v in ("2d", "parented") for p in ("", "_plain")], "layer_3d", "layer_3d_plain",
-         "edge_luminance", "edge_colour", "edge_trail"]
+         "edge_luminance", "edge_colour", "edge_unsmoothed", "edge_trail", "hold_position", "hold_trail", "hold_add_sub",
+         "mask_none", "mask_alpha_none",
+         *[f"mask_{g}_{v}" for g in ("alpha", "levels", "hsl", "transform", "displace", "edge") for v in ("full", "left")]]
 NEUTRAL = ["neutral_ref", "neutral_luma", "neutral_red", "neutral_alpha_transparent", "neutral_alpha_half"]
 # Rendered again alone in a new process: a full rebuild, with nothing cached.
 COLD = {"trail": 60, "behind": 60, "screen_sub": 60, "add_sub": 60, "grade_blur": 60, "self_disp": 60, "keyed": 70,
         "alpha_min": 60, "alpha_min_fade": 60, "alpha_min_sub": 60,
         "duplicate_fx": 40, "perf_long": 299, "limit_600": 699,
         "limit_800": 699, "limit_100": 299, "preroll_unlimited": 699, "flash_spread": 32, "blurmap_left": 60, "blurmap_trail": 60, "trim_48": 60, "trim_start": 60, "trim_stretch": 60,
-        "blend_difference": 3, "blend_overlay_sub": 29, "comp_space_2d": 20, "layer_3d": 20, "transform_rotate": 12, "transform_sub": 60, "edge_trail": 60}
+        "blend_difference": 3, "blend_overlay_sub": 29, "comp_space_2d": 20, "layer_3d": 20, "transform_rotate": 12, "transform_sub": 60, "edge_trail": 60,
+        "hold_trail": 61, "hold_add_sub": 62}
 DEEP = 3999  # deep_alpha1's last frame
 
 
@@ -237,19 +240,30 @@ def cmd_check(label):
     peak, _ = difference(load(label, "layer_own_effects", 71), load(label, "neutral_ref", 71))
     report(peak > 8, f"displaced by the trail, it differs from no shift by peak {peak}/255")
 
-    print("Blur Map Layer:")
+    print("Blur Mask Layer:")
     for comp, ref in (("blurmap_black", "blur_sharp"), ("blurmap_white", "blur_whole")):
         peak, count = difference(load(label, comp, 60), load(label, ref, 60))
         report(peak <= 1, f"{comp} matches {ref}: peak {peak}/255 across {count} pixels")
     left, sharp, whole = (load(label, c, 60) for c in ("blurmap_left", "blur_sharp", "blur_whole"))
     w = left.shape[1] // 2
-    # Kept clear of the map's edge, where the blur reaches across it.
-    blurred = difference(left[:, : w - 30], whole[:, : w - 30])[0]
-    unblurred = difference(left[:, w + 30 :], sharp[:, w + 30 :])[0]
+    # Kept clear of the map's edge, where the blur's long tails reach across it.
+    blurred = difference(left[:, : w - 60], whole[:, : w - 60])[0]
+    unblurred = difference(left[:, w + 60 :], sharp[:, w + 60 :])[0]
     report(blurred <= 1 and unblurred <= 1, f"blurmap_left blurs the left half only: off by {blurred}/255 from the "
                                             f"blur there and {unblurred}/255 from none on the right")
     peak, _ = difference(load(label, "blurmap_trail", 60), load(label, "blur_whole", 60))
     report(peak > 8, f"blurmap_trail blurs by the trail's own luminance, less than the whole radius: differs by peak {peak}/255")
+
+    print("Each group's mask applies it where the mask is white, and nowhere else:")
+    for group in ("alpha", "levels", "hsl", "transform", "displace", "edge"):
+        left, full = load(label, f"mask_{group}_left", 35), load(label, f"mask_{group}_full", 35)
+        plain = load(label, "mask_alpha_none" if group == "alpha" else "mask_none", 35)
+        w = left.shape[1] // 2
+        # Kept clear of the mask's edge, which edges reach across.
+        masked = difference(left[:, : w - 40], full[:, : w - 40])[0]
+        unmasked = difference(left[:, w + 40 :], plain[:, w + 40 :])[0]
+        report(difference(full, plain)[0] > 8 and masked <= 1 and unmasked <= 1,
+               f"{group}: off by {masked}/255 from the whole group on the left, {unmasked}/255 from none on the right")
 
     print("Without a GPU:")
     peak, count = difference(load(label, "software_trail", 23), load(label, "software_plain", 23))
@@ -395,13 +409,30 @@ def cmd_check(label):
             seen, want = alpha_at(comp, 11, int(round(x)), int(round(y))), 255 * 0.9 ** k
             report(seen >= want - 4, f"{text} with 3 sub-steps, {k} frames back at ({x:.0f}, {y:.0f}): alpha {seen}, at least {want - 4:.0f}")
 
+    print("Update Every 4 frames, with Position 20 a frame:")
+    for k in range(1, 4):
+        seen, want = alpha_at("hold_position", 12, 100 + 80 * k, 180), 255 * 0.9 ** (4 * k)
+        report(abs(seen - want) <= 4, f"{k} updates back at x={100 + 80 * k}: alpha {seen}, expected {want:.0f}")
+    seen = alpha_at("hold_position", 12, 120, 180)
+    report(seen == 0, f"nothing where a single frame's move would land, at x=120: alpha {seen}")
+    held = max(difference(load(label, "hold_position", 12), load(label, "hold_position", f))[0] for f in (13, 14, 15))
+    report(held == 0, f"frames 13 to 15 hold frame 12's trail: peak {held}/255")
+    # Frame 62 holds frame 60's trail, but its own dot, whose leading edge is clear of frame 60's.
+    seen = alpha_at("hold_trail", 62, 519, 246)
+    report(seen == 255, f"a held frame shows its own input: alpha {seen} at the leading edge of frame 62's dot")
+
     print("Edges: the dot's outline over its trail, in front of the dot:")
     for comp, least in (("edge_luminance", 40), ("edge_colour", 200)):
         im = load(label, comp, 1)
-        centre, ring, beyond = im[180, 320], im[180, 361], im[180, 370]
-        report(centre[0] > 240 and centre[1] < 40 and ring[3] > least and beyond[3] == 0,
-               f"{comp}: centre RGBA {centre} is the dot, outline alpha {ring[3]}, beyond it {beyond[3]}")
+        # Just outside the dot, whose edge is at x 360, the outline is a soft ridge a few pixels wide, so
+        # it's measured by all of it.
+        ring = int(im[180, 361:368, 3].astype(int).sum())
+        centre, beyond = im[180, 320], im[180, 370]
+        report(centre[0] > 240 and centre[1] < 40 and ring > least and beyond[3] == 0,
+               f"{comp}: centre RGBA {centre} is the dot, outline alpha {ring} in all, beyond it {beyond[3]}")
     report(im[180, 361, 0] > 3 * im[180, 361, 1], f"edge_colour keeps the dot's colour: outline RGB {im[180, 361, :3]}")
+    ring = load(label, "edge_unsmoothed", 1)[180, 361:364, 3]
+    report(ring[0] > 200 and ring[2] == 0, f"Edge Smoothing 0: a sharp outline, alpha {list(ring)} just outside the dot")
     inside = load(label, "edge_multiply", 1)[180, 358, :3]
     report(np.all(inside <= np.array([255, 26, 26]) + 2), f"strong edges multiplied over the dot only darken it: RGB {inside} just inside its edge")
 

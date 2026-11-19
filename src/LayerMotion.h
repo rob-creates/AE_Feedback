@@ -37,9 +37,6 @@ public:
     LayerMotion(PF_InData* in_data, PF_OutData* out_data, AEGP_LayerIDVal other = AEGP_LayerIDVal_NONE);
 
     bool usable() const { return mUsable; }
-    // Shape and text layers, and collapsed precomps, are drawn in comp space already, so their
-    // effects see the comp as it is and need nothing moved.
-    bool drawnInComp() const { return mDrawnInComp; }
     A_long compWidth() const { return mCompWidth; }
     A_long compHeight() const { return mCompHeight; }
 
@@ -57,6 +54,8 @@ private:
     PF_OutData* mOutData;
     AEGP_LayerH mLayer = nullptr;
     bool mUsable = false;
+    // Shape and text layers, and collapsed precomps, are drawn in comp space already, so their
+    // layer-to-comp transform is the identity.
     bool mDrawnInComp = false;
     A_long mCompWidth = 0, mCompHeight = 0;
     // Held for the life of this object, which lasts one call.

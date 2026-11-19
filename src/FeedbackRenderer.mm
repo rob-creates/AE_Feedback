@@ -12,7 +12,9 @@
 namespace
 {
 const float kMinSigma = 0.05f;
-const float kMaxDirectSigma = FEEDBACK_BLUR_MAX_RADIUS / 3.0f;
+const float kMaxDirectSigma = FEEDBACK_BLUR_MAX_RADIUS / kGaussianTails;
+// Edges resample what they read anyway, so it only needs to be as fine as its blur.
+const float kEdgeMaxDirectSigma = 1.0f;
 
 // The buffers bind in order from index 0, followed by the parameters.
 template <typename Params>
@@ -69,7 +71,7 @@ void FillWeights(BlurAxisParams& p, float sigma)
         return;
     }
 
-    p.radius = std::min(int(std::ceil(sigma * 3.0f)), FEEDBACK_BLUR_MAX_RADIUS);
+    p.radius = std::min(int(std::ceil(sigma * kGaussianTails)), FEEDBACK_BLUR_MAX_RADIUS);
     float total = 0.0f;
     for (int i = 0; i <= p.radius; i++)
     {
@@ -128,6 +130,18 @@ id<MTLBuffer> FillMap(MapLookup& m, const PlacedImage& image, int source, id<MTL
     if (image.warped)
         std::copy(image.fromCanvas, image.fromCanvas + 9, m.fromCanvas);
     return image.buffer;
+}
+
+// Describes a group's mask for a kernel, and returns the buffer to bind for it. None masks nothing, so
+// the group applies in full; a layer with nothing there reads as black, so it doesn't apply at all.
+id<MTLBuffer> FillMask(Mask& m, const PlacedImage& image, int source, id<MTLBuffer> trail, int width, int height,
+                       id<MTLBuffer> empty)
+{
+    m.use = source != MAP_NONE;
+    if (!m.use)
+        return empty;
+    id<MTLBuffer> buffer = FillMap(m.map, image, source, trail, width, height);
+    return buffer ? buffer : empty;
 }
 
 // Where Transform moves a canvas pixel from, as `inverse * position + offset`.
@@ -254,12 +268,13 @@ FeedbackRenderer::SmallBlur FeedbackRenderer::encodeSmallBlur(
     Pyramid& pyramid,
     float sigmaX,
     float sigmaY,
+    float maxDirectSigma,
     StepBatch& batch,
     std::vector<id<MTLBuffer>>& scratch)
 {
     // Very wide blurs run on a smaller image, so their cost doesn't grow with the radius.
     int level = 0;
-    while (std::max(sigmaX, sigmaY) / float(1 << level) > kMaxDirectSigma)
+    while (std::max(sigmaX, sigmaY) / float(1 << level) > maxDirectSigma)
         level++;
     SmallBlur result = pyramidLevel(encoder, pyramid, level, batch, scratch);
     const int factor = result.factor;
@@ -315,7 +330,7 @@ id<MTLBuffer> FeedbackRenderer::encodeSpread(
     {
         const float sigmaX = part.sigma * widthX, sigmaY = part.sigma * widthY;
         const SmallBlur small = std::max(sigmaX, sigmaY) >= kMinSigma
-                                    ? encodeSmallBlur(encoder, pyramid, sigmaX, sigmaY, batch, scratch)
+                                    ? encodeSmallBlur(encoder, pyramid, sigmaX, sigmaY, kMaxDirectSigma, batch, scratch)
                                     : pyramidLevel(encoder, pyramid, 0, batch, scratch);
         bySize[small.factor].push_back({small, part.weight});
     }
@@ -370,10 +385,14 @@ id<MTLBuffer> FeedbackRenderer::step(
     const CanvasKey& canvas,
     id<MTLBuffer> prev,
     const PlacedImage& input,
-    const PlacedImage& map,
-    const PlacedImage& blurMap,
+    const PlacedImage (&maps)[SLOT_COUNT],
     const FrameParams& f)
 {
+    const PlacedImage& map = maps[SLOT_DISPLACE];
+    const PlacedImage& blurMap = maps[SLOT_BLUR_MASK];
+    const int displaceSource = f.sources[SLOT_DISPLACE], blurSource = f.sources[SLOT_BLUR_MASK];
+    auto mask = [&](Mask& m, int slot, id<MTLBuffer> trail)
+    { return FillMask(m, maps[slot], f.sources[slot], trail, canvas.width, canvas.height, mEmpty); };
     const int width = canvas.width;
     const int height = canvas.height;
     const float scaleX = ScaleValue(canvas.downsampleX);
@@ -407,7 +426,7 @@ id<MTLBuffer> FeedbackRenderer::step(
     const float amountX = f.amountX * scaleX;
     const float amountY = f.amountY * scaleY;
     // None displaces nothing, and nor does a layer with nothing there.
-    const bool mapMissing = f.displaceSource == MAP_NONE || (f.displaceSource == MAP_LAYER && !map.buffer);
+    const bool mapMissing = displaceSource == MAP_NONE || (displaceSource == MAP_LAYER && !map.buffer);
     const bool displaces = (amountX != 0.0f || amountY != 0.0f) && !mapMissing;
     if (displaces || MovesTrail(f))
     {
@@ -424,9 +443,11 @@ id<MTLBuffer> FeedbackRenderer::step(
         if (MovesTrail(f))
             InvertTransform(f, canvas, &p);
         // No map: zero size, so nothing shifts.
-        id<MTLBuffer> mapBuffer = displaces ? FillMap(p.map, map, f.displaceSource, current, width, height) : mEmpty;
+        id<MTLBuffer> mapBuffer = displaces ? FillMap(p.map, map, displaceSource, current, width, height) : mEmpty;
+        id<MTLBuffer> transformMask = mask(p.transformMask, SLOT_TRANSFORM_MASK, current);
+        id<MTLBuffer> displaceMask = mask(p.displaceMask, SLOT_DISPLACE_MASK, current);
         id<MTLBuffer> next = acquire();
-        Encode(encoder, mDisplace, {current, mapBuffer, next}, p, width, height);
+        Encode(encoder, mDisplace, {current, mapBuffer, transformMask, displaceMask, next}, p, width, height);
         current = next;
     }
 
@@ -436,15 +457,29 @@ id<MTLBuffer> FeedbackRenderer::step(
         EdgeParams p{};
         p.srcPitch = width;
         p.dstPitch = width;
-        p.width = width;
-        p.height = height;
         p.type = f.edgeType;
         p.blend = f.edgeBlend;
         p.distanceX = std::max(f.edgeSize * scaleX, 0.05f);
         p.distanceY = std::max(f.edgeSize * scaleY, 0.05f);
         p.strength = f.edgeStrength;
+        // Single pixels far apart alias whatever's finer than their spacing, and feedback builds that
+        // up into a grid. Blurred to their spacing first, each sample stands for the area around it.
+        Pyramid edgePyramid{{SmallBlur{current, width, height, 1}}};
+        const SmallBlur smooth =
+            encodeSmallBlur(encoder, edgePyramid, EdgeSmoothingSigma(p.distanceX, f.edgeSmoothing),
+                            EdgeSmoothingSigma(p.distanceY, f.edgeSmoothing), kEdgeMaxDirectSigma, batch, scratch);
+        p.smoothPitch = smooth.width;
+        p.smoothWidth = smooth.width;
+        p.smoothHeight = smooth.height;
+        p.smoothFactor = smooth.factor;
+        id<MTLBuffer> edgeMask = mask(p.mask, SLOT_EDGE_MASK, current);
         id<MTLBuffer> next = acquire();
-        Encode(encoder, mEdge, {current, next}, p, width, height);
+        Encode(encoder, mEdge, {current, smooth.buffer, edgeMask, next}, p, width, height);
+        if (smooth.owned)
+            release(smooth.buffer, batch, scratch);
+        // The halved images are free for the blur's own pyramid.
+        for (size_t i = 1; i < edgePyramid.levels.size(); i++)
+            release(edgePyramid.levels[i].buffer, batch, scratch);
         current = next;
     }
 
@@ -460,10 +495,10 @@ id<MTLBuffer> FeedbackRenderer::step(
         return encodeSpread(encoder, pyramid, canvas, sigmaX * share, sigmaY * share, batch, scratch);
     };
     // A layer with nothing there blurs nothing, as black would.
-    const bool blurMapMissing = f.blurSource == MAP_LAYER && !blurMap.buffer;
+    const bool blurMapMissing = blurSource == MAP_LAYER && !blurMap.buffer;
     if (std::max(sigmaX, sigmaY) >= kMinSigma && !blurMapMissing)
     {
-        if (f.blurSource == MAP_NONE)
+        if (blurSource == MAP_NONE)
             current = blurBy(1.0f);
         else
         {
@@ -471,7 +506,7 @@ id<MTLBuffer> FeedbackRenderer::step(
             p.pitch = width;
             p.width = width;
             p.height = height;
-            id<MTLBuffer> mapBuffer = FillMap(p.map, blurMap, f.blurSource, current, width, height);
+            id<MTLBuffer> mapBuffer = FillMap(p.map, blurMap, blurSource, current, width, height);
             id<MTLBuffer> next = acquire();
             Encode(encoder, mBlurByMap,
                    {current, blurBy(0.125f), blurBy(0.25f), blurBy(0.5f), blurBy(1.0f),
@@ -504,7 +539,11 @@ id<MTLBuffer> FeedbackRenderer::step(
     last.composite.splitsInput = f.splitsInput;
     last.composite.frameAlpha = f.frameAlpha;
     last.composite.stepAlpha = f.stepAlpha;
-    Encode(encoder, mGradeAndComposite, {current, input.buffer ? input.buffer : mEmpty, result}, last, width, height);
+    id<MTLBuffer> levelsMask = mask(grade.levelsMask, SLOT_LEVELS_MASK, current);
+    id<MTLBuffer> hslMask = mask(grade.hslMask, SLOT_HSL_MASK, current);
+    id<MTLBuffer> alphaMask = mask(grade.alphaMask, SLOT_ALPHA_MASK, current);
+    Encode(encoder, mGradeAndComposite,
+           {current, input.buffer ? input.buffer : mEmpty, levelsMask, hslMask, alphaMask, result}, last, width, height);
 
     [encoder endEncoding];
 

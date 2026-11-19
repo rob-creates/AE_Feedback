@@ -126,11 +126,20 @@
         // Moving, turning and drifting with sub-steps, for rebuilds.
         dotComp("transform_sub", 72, { "Alpha Max": 0.9, "Rotation": 10, "Scale Height": 98, "Position": [0, 2], "Sub-steps": 3 });
 
+        // Updating every 4 frames: each update moves the trail 4 frames' worth, and it holds in between.
+        stillDot("hold_position", 16, [100, 180], 5, { "Alpha Max": 0.9, "Position": [20, 0], "Update Every (Frames)": 4 });
+        // A moving dot over a trail updated every 3 frames, alone and with Add's sub-steps, for rebuilds.
+        dotComp("hold_trail", 72, { "Alpha Max": 0.9, "Update Every (Frames)": 3 });
+        dotComp("hold_add_sub", 72, { "Alpha Max": 0.8, "Composite": 3, "Sub-steps": 1, "Update Every (Frames)": 3 });
+
         // Edges of a still dot, over its trail, in front of the dot itself: only its outline shows.
         stillDot("edge_luminance", 4, [W / 2, H / 2], 40,
             { "Alpha Max": 1, "Composite": 2, "Edge Type": 2, "Edge Sample Size": 2, "Edge Strength": 1, "Edge Blend": 1 });
         stillDot("edge_colour", 4, [W / 2, H / 2], 40,
             { "Alpha Max": 1, "Composite": 2, "Edge Sample Size": 2, "Edge Strength": 1, "Edge Blend": 1 });
+        // Without smoothing, the samples read the image as it is, and the outline ends sharply.
+        stillDot("edge_unsmoothed", 4, [W / 2, H / 2], 40,
+            { "Alpha Max": 1, "Composite": 2, "Edge Sample Size": 2, "Edge Smoothing": 0, "Edge Strength": 1, "Edge Blend": 1 });
         // Strong edges multiplied over the dot's trail must darken it, never brighten it.
         stillDot("edge_multiply", 4, [W / 2, H / 2], 40,
             { "Alpha Max": 1, "Composite": 2, "Edge Sample Size": 2, "Edge Strength": 4, "Edge Blend": 5 });
@@ -267,21 +276,53 @@
         var outer = newComp("precomp_outer", 48);
         feedback(outer.layers.add(inner), { "Alpha Max": 0.9 });
 
-        // Blur Map Layer scales the blur by its luminance: black blurs nothing, white the whole radius, and a
+        // Blur Mask Layer scales the blur by its luminance: black blurs nothing, white the whole radius, and a
         // white map over the left half alone blurs only there. Beside the same dot unblurred and blurred.
         dotComp("blur_sharp", 72, { "Alpha Max": 0.9 });
         dotComp("blur_whole", 72, { "Alpha Max": 0.9, "Blur Radius": 6 });
-        var blurMaps = { "blurmap_black": [[0, 0, 0], W], "blurmap_white": [[1, 1, 1], W], "blurmap_left": [[1, 1, 1], W / 2] };
+        // Each map reaches past the comp's edges, over the margin the trail keeps beyond them
+        // (kCompMargin, 64, in Feedback.mm, with room to spare), from `left` to `right`.
+        var M = 128;
+        var blurMaps = { "blurmap_black": [[0, 0, 0], -M, W + M], "blurmap_white": [[1, 1, 1], -M, W + M],
+                         "blurmap_left": [[1, 1, 1], -M, W / 2] };
         for (var bm in blurMaps) {
             var b = dotComp(bm, 72, { "Alpha Max": 0.9, "Blur Radius": 6 });
-            var bmap = b.comp.layers.addSolid(blurMaps[bm][0], "blur map", blurMaps[bm][1], H, 1, b.comp.duration);
-            bmap.property("Position").setValue([blurMaps[bm][1] / 2, H / 2]);
+            var spec = blurMaps[bm], mapW = spec[2] - spec[1];
+            var bmap = b.comp.layers.addSolid(spec[0], "blur map", mapW, H + 2 * M, 1, b.comp.duration);
+            bmap.property("Position").setValue([(spec[1] + spec[2]) / 2, H / 2]);
             bmap.enabled = false;
             useMap(b.fx, bmap, BLUR_MAP_LAYER);
         }
         // The trail's own luminance as the blur map: its own layer at Effects & Masks.
         var blurSelf = dotComp("blurmap_trail", 72, { "Alpha Max": 0.9, "Blur Radius": 6 });
         useMap(blurSelf.fx, blurSelf.layer, BLUR_MAP_LAYER, -1);
+
+        // Each group's mask: a white solid over the left half applies the group there alone. Beside the same
+        // dot with the group in full, and without it: Alpha Max 1 for Alpha, and mask_none for the rest.
+        // Displacement shifts by a white map, so by the whole Max Vertical everywhere.
+        function solidOver(c, colour, left, right) {
+            var s = c.layers.addSolid(colour, "mask", right - left, H + 2 * M, 1, c.duration);
+            s.property("Position").setValue([(left + right) / 2, H / 2]);
+            s.enabled = false;
+            return s;
+        }
+        dotComp("mask_none", 36, { "Alpha Max": 0.9 });
+        dotComp("mask_alpha_none", 36, { "Alpha Max": 1 });
+        var maskGroups = {
+            "alpha": ["Alpha Mask Layer", { "Alpha Max": 0.7 }],
+            "levels": ["Levels Mask Layer", { "Alpha Max": 0.9, "Gamma": 2 }],
+            "hsl": ["HSL Mask Layer", { "Alpha Max": 0.9, "Hue Shift": 90 }],
+            "transform": ["Transform Mask Layer", { "Alpha Max": 0.9, "Position": [0, 3] }],
+            "displace": ["Displacement Mask Layer", { "Alpha Max": 0.9, "Max Vertical": 3 }],
+            "edge": ["Edge Mask Layer", { "Alpha Max": 0.9, "Edge Strength": 0.5 }]
+        };
+        for (var g in maskGroups) {
+            for (var masked = 0; masked < 2; masked++) {
+                var mc = dotComp("mask_" + g + (masked ? "_left" : "_full"), 36, maskGroups[g][1]);
+                if (g === "displace") useMap(mc.fx, solidOver(mc.comp, [1, 1, 1], -M, W + M));
+                if (masked) useMap(mc.fx, solidOver(mc.comp, [1, 1, 1], -M, W / 2), maskGroups[g][0]);
+            }
+        }
 
         // Alpha Min: on its own, against the same blur without it, and split into sub-steps.
         dotComp("alpha_min", 96, { "Alpha Max": 1, "Alpha Min": 0.2, "Blur Radius": 3 });
