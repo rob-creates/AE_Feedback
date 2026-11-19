@@ -188,12 +188,14 @@ private:
 
     // Wide blurs are worked out on a smaller image, which this leaves small.
     // `maxDirectSigma` is the widest blur run at a level before moving to the next smaller one.
+    // `repeatEdge` repeats the border beyond the image, rather than reading it as transparent.
     SmallBlur encodeSmallBlur(
         id<MTLComputeCommandEncoder> encoder,
         Pyramid& pyramid,
         float sigmaX,
         float sigmaY,
         float maxDirectSigma,
+        bool repeatEdge,
         StepBatch& batch,
         std::vector<id<MTLBuffer>>& scratch);
 

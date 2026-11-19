@@ -19,9 +19,10 @@ Feedback Effect for Adobe After Effects
   mask is read where it is in the comp, and the effect's own layer at Effects & Masks uses the
   trail. Left at None, the group applies everywhere. Where an Alpha mask is dark the trail doesn't
   fade, so jumping to a frame recalculates the trail from its start, or from Pre-Roll Limit.
-- Update Every (Frames), under Timing, moves the trail on only every so many frames, counted from the
-  layer's in-point, each time by that many frames' worth, so the trail keeps its length in seconds.
-  In between, the trail holds while the layer plays over it. Sub-steps divide each update.
+- Update, under Input, is on by default. Turned off, the layer stops adding to the trail, as if it
+  were empty, while the trail goes on moving, fading and changing as usual. Keyframe it on and off to
+  stamp the layer into a smoothly moving trail, in time with music for instance.
+- Transform's Scale goes down to 0, which shrinks the whole trail away in a single frame.
 - Jumping to a frame recalculates the whole trail before it, so the trail is always complete, though a
   long one that never fades takes a while. Turn on Limit Pre-Roll to recalculate only the last
   Pre-Roll Limit frames instead: quicker, but a long trail can look shorter after a jump. Playing

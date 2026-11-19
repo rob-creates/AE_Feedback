@@ -269,6 +269,7 @@ FeedbackRenderer::SmallBlur FeedbackRenderer::encodeSmallBlur(
     float sigmaX,
     float sigmaY,
     float maxDirectSigma,
+    bool repeatEdge,
     StepBatch& batch,
     std::vector<id<MTLBuffer>>& scratch)
 {
@@ -299,6 +300,7 @@ FeedbackRenderer::SmallBlur FeedbackRenderer::encodeSmallBlur(
         p.height = result.height;
         p.dirX = axis == 0 ? 1 : 0;
         p.dirY = axis == 0 ? 0 : 1;
+        p.repeatEdge = repeatEdge ? 1 : 0;
         FillWeights(p, sigma);
         id<MTLBuffer> next = acquireForBatch(batch, size_t(result.width) * size_t(result.height) * 16);
         scratch.push_back(next);
@@ -330,7 +332,7 @@ id<MTLBuffer> FeedbackRenderer::encodeSpread(
     {
         const float sigmaX = part.sigma * widthX, sigmaY = part.sigma * widthY;
         const SmallBlur small = std::max(sigmaX, sigmaY) >= kMinSigma
-                                    ? encodeSmallBlur(encoder, pyramid, sigmaX, sigmaY, kMaxDirectSigma, batch, scratch)
+                                    ? encodeSmallBlur(encoder, pyramid, sigmaX, sigmaY, kMaxDirectSigma, false, batch, scratch)
                                     : pyramidLevel(encoder, pyramid, 0, batch, scratch);
         bySize[small.factor].push_back({small, part.weight});
     }
@@ -467,7 +469,7 @@ id<MTLBuffer> FeedbackRenderer::step(
         Pyramid edgePyramid{{SmallBlur{current, width, height, 1}}};
         const SmallBlur smooth =
             encodeSmallBlur(encoder, edgePyramid, EdgeSmoothingSigma(p.distanceX, f.edgeSmoothing),
-                            EdgeSmoothingSigma(p.distanceY, f.edgeSmoothing), kEdgeMaxDirectSigma, batch, scratch);
+                            EdgeSmoothingSigma(p.distanceY, f.edgeSmoothing), kEdgeMaxDirectSigma, true, batch, scratch);
         p.smoothPitch = smooth.width;
         p.smoothWidth = smooth.width;
         p.smoothHeight = smooth.height;

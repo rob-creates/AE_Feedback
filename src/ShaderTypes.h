@@ -147,6 +147,7 @@ struct BlurAxisParams
     int dirX;
     int dirY;
     int radius;
+    int repeatEdge; // Repeats the canvas's border beyond it, rather than reading it as transparent.
     float weights[FEEDBACK_BLUR_MAX_RADIUS + 1];
 };
 

@@ -126,25 +126,27 @@
         // Moving, turning and drifting with sub-steps, for rebuilds.
         dotComp("transform_sub", 72, { "Alpha Max": 0.9, "Rotation": 10, "Scale Height": 98, "Position": [0, 2], "Sub-steps": 3 });
 
-        // Updating every 4 frames: each update moves the trail 4 frames' worth, and it holds in between.
-        stillDot("hold_position", 16, [100, 180], 5, { "Alpha Max": 0.9, "Position": [20, 0], "Update Every (Frames)": 4 });
-        // A moving dot over a trail updated every 3 frames, alone and with Add's sub-steps, for rebuilds.
-        dotComp("hold_trail", 72, { "Alpha Max": 0.9, "Update Every (Frames)": 3 });
-        dotComp("hold_add_sub", 72, { "Alpha Max": 0.8, "Composite": 3, "Sub-steps": 1, "Update Every (Frames)": 3 });
+        // Update on only every 4th frame: the trail moves every frame, but takes in the dot only then.
+        var stamp = stillDot("update_stamp", 16, [100, 180], 5, { "Alpha Max": 0.9, "Position": [20, 0] });
+        for (var f = 0; f < 16; f++) find(stamp, "Update").setValueAtTime(f / FPS, f % 4 === 0);
+        // Update off throughout leaves nothing, with sub-steps and Add, where the layer would go on top.
+        dotComp("update_off", 24, { "Alpha Max": 0.9, "Composite": 3, "Sub-steps": 1, "Update": false });
+        // Scale 0 shrinks the trail to nothing each frame, so only the dot itself shows.
+        stillDot("transform_scale_zero", 4, [360, 180], 5, { "Alpha Max": 0.9, "Scale Height": 0 });
 
         // Edges of a still dot, over its trail, in front of the dot itself: only its outline shows.
         stillDot("edge_luminance", 4, [W / 2, H / 2], 40,
-            { "Alpha Max": 1, "Composite": 2, "Edge Type": 2, "Edge Sample Size": 2, "Edge Strength": 1, "Edge Blend": 1 });
+            { "Alpha Max": 1, "Composite": 2, "Edge Type": 2, "Edge Sample Size": 2, "Edge Smoothing": 100, "Edge Strength": 1, "Edge Blend": 1 });
         stillDot("edge_colour", 4, [W / 2, H / 2], 40,
-            { "Alpha Max": 1, "Composite": 2, "Edge Sample Size": 2, "Edge Strength": 1, "Edge Blend": 1 });
+            { "Alpha Max": 1, "Composite": 2, "Edge Sample Size": 2, "Edge Smoothing": 100, "Edge Strength": 1, "Edge Blend": 1 });
         // Without smoothing, the samples read the image as it is, and the outline ends sharply.
         stillDot("edge_unsmoothed", 4, [W / 2, H / 2], 40,
             { "Alpha Max": 1, "Composite": 2, "Edge Sample Size": 2, "Edge Smoothing": 0, "Edge Strength": 1, "Edge Blend": 1 });
         // Strong edges multiplied over the dot's trail must darken it, never brighten it.
         stillDot("edge_multiply", 4, [W / 2, H / 2], 40,
-            { "Alpha Max": 1, "Composite": 2, "Edge Sample Size": 2, "Edge Strength": 4, "Edge Blend": 5 });
+            { "Alpha Max": 1, "Composite": 2, "Edge Sample Size": 2, "Edge Smoothing": 100, "Edge Strength": 4, "Edge Blend": 5 });
         // A moving dot with edges added to its trail, for rebuilds.
-        dotComp("edge_trail", 72, { "Alpha Max": 0.9, "Edge Strength": 0.5, "Edge Sample Size": 3, "Sub-steps": 1 });
+        dotComp("edge_trail", 72, { "Alpha Max": 0.9, "Edge Strength": 0.5, "Edge Sample Size": 3, "Edge Smoothing": 100, "Sub-steps": 1 });
 
         // Inverted Levels on a still dot, behind the trail so the trail shows: it flips every frame,
         // with or without sub-steps.

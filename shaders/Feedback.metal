@@ -227,8 +227,10 @@ kernel void edge(
 {
     const float2 c = float2(xy);
     const float2 d = float2(p.distanceX, p.distanceY);
+    // Beyond the canvas repeats its border. Read as transparent, the canvas's own boundary would be an
+    // edge, and feedback would send it back in as a wave.
 #define AT(dx, dy)                                                                                     \
-    sampleOrClear(smooth, p.smoothPitch, p.smoothWidth, p.smoothHeight, toSmaller(c + float2(dx, dy) * d, p.smoothFactor))
+    bilinearClamped(smooth, p.smoothPitch, p.smoothWidth, p.smoothHeight, toSmaller(c + float2(dx, dy) * d, p.smoothFactor))
     const float4 nw = AT(-1, -1), n = AT(0, -1), ne = AT(1, -1);
     const float4 w = AT(-1, 0), e = AT(1, 0);
     const float4 sw = AT(-1, 1), s = AT(0, 1), se = AT(1, 1);
@@ -283,11 +285,17 @@ kernel void blurAxis(
     int2 size = int2(p.width, p.height);
     int2 dir = int2(p.dirX, p.dirY);
     float4 sum = src[c.y * p.srcPitch + c.x] * p.weights[0];
-    // Beyond the canvas is transparent; repeating the edge would smear it inwards.
+    // Beyond the canvas is transparent, since repeating the edge would smear it inwards, except for
+    // the edges' smoothing, where a fade at the border would read as an edge.
     for (int i = 1; i <= p.radius; i++)
     {
         int2 a = c + dir * i;
         int2 b = c - dir * i;
+        if (p.repeatEdge != 0)
+        {
+            a = clamp(a, int2(0), size - 1);
+            b = clamp(b, int2(0), size - 1);
+        }
         if (all(a >= 0) && all(a < size))
             sum += src[a.y * p.srcPitch + a.x] * p.weights[i];
         if (all(b >= 0) && all(b < size))

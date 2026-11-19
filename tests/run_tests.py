@@ -43,7 +43,7 @@ COMPS = ["trail", "behind", "screen_sub", "add_sub", "grade_blur", "self_disp", 
          "transform_sub_scale", "transform_sub_skew", "edge_multiply", "square_path", "square_path_plain",
          "map_offset",
          *[f"comp_space_{v}{p}" for v in ("2d", "parented") for p in ("", "_plain")], "layer_3d", "layer_3d_plain",
-         "edge_luminance", "edge_colour", "edge_unsmoothed", "edge_trail", "hold_position", "hold_trail", "hold_add_sub",
+         "edge_luminance", "edge_colour", "edge_unsmoothed", "edge_trail", "update_stamp", "update_off", "transform_scale_zero",
          "mask_none", "mask_alpha_none",
          *[f"mask_{g}_{v}" for g in ("alpha", "levels", "hsl", "transform", "displace", "edge") for v in ("full", "left")]]
 NEUTRAL = ["neutral_ref", "neutral_luma", "neutral_red", "neutral_alpha_transparent", "neutral_alpha_half"]
@@ -53,7 +53,7 @@ COLD = {"trail": 60, "behind": 60, "screen_sub": 60, "add_sub": 60, "grade_blur"
         "duplicate_fx": 40, "perf_long": 299, "limit_600": 699,
         "limit_800": 699, "limit_100": 299, "preroll_unlimited": 699, "flash_spread": 32, "blurmap_left": 60, "blurmap_trail": 60, "trim_48": 60, "trim_start": 60, "trim_stretch": 60,
         "blend_difference": 3, "blend_overlay_sub": 29, "comp_space_2d": 20, "layer_3d": 20, "transform_rotate": 12, "transform_sub": 60, "edge_trail": 60,
-        "hold_trail": 61, "hold_add_sub": 62}
+        "update_stamp": 13}
 DEEP = 3999  # deep_alpha1's last frame
 
 
@@ -409,17 +409,24 @@ def cmd_check(label):
             seen, want = alpha_at(comp, 11, int(round(x)), int(round(y))), 255 * 0.9 ** k
             report(seen >= want - 4, f"{text} with 3 sub-steps, {k} frames back at ({x:.0f}, {y:.0f}): alpha {seen}, at least {want - 4:.0f}")
 
-    print("Update Every 4 frames, with Position 20 a frame:")
-    for k in range(1, 4):
-        seen, want = alpha_at("hold_position", 12, 100 + 80 * k, 180), 255 * 0.9 ** (4 * k)
-        report(abs(seen - want) <= 4, f"{k} updates back at x={100 + 80 * k}: alpha {seen}, expected {want:.0f}")
-    seen = alpha_at("hold_position", 12, 120, 180)
-    report(seen == 0, f"nothing where a single frame's move would land, at x=120: alpha {seen}")
-    held = max(difference(load(label, "hold_position", 12), load(label, "hold_position", f))[0] for f in (13, 14, 15))
-    report(held == 0, f"frames 13 to 15 hold frame 12's trail: peak {held}/255")
-    # Frame 62 holds frame 60's trail, but its own dot, whose leading edge is clear of frame 60's.
-    seen = alpha_at("hold_trail", 62, 519, 246)
-    report(seen == 255, f"a held frame shows its own input: alpha {seen} at the leading edge of frame 62's dot")
+    print("Update on every 4th frame, with Position 20 a frame:")
+    for frame, newest in ((12, 0), (13, 1)):
+        for k in range(4):
+            x = 100 + 20 * (newest + 4 * k)
+            seen, want = alpha_at("update_stamp", frame, x, 180), 255 * 0.9 ** (newest + 4 * k)
+            report(abs(seen - want) <= 4, f"frame {frame}, stamped {newest + 4 * k} frames back at x={x}: alpha {seen}, expected {want:.0f}")
+        gap = 100 + 20 * (newest + 2)
+        seen = alpha_at("update_stamp", frame, gap, 180)
+        report(seen == 0, f"frame {frame}: nothing from a frame with Update off, at x={gap}: alpha {seen}")
+    peak = max(int(load(label, "update_off", f)[..., 3].max()) for f in (0, 12, 23))
+    report(peak == 0, f"Update off throughout, with Add and sub-steps, leaves nothing: peak alpha {peak}")
+
+    print("Scale 0:")
+    im = load(label, "transform_scale_zero", 3)
+    outside = im[..., 3].copy()
+    outside[170:191, 350:371] = 0
+    report(im[180, 360, 3] == 255 and outside.max() == 0,
+           f"only the dot itself shows: alpha {im[180, 360, 3]} at its centre, {outside.max()} anywhere else")
 
     print("Edges: the dot's outline over its trail, in front of the dot:")
     for comp, least in (("edge_luminance", 40), ("edge_colour", 200)):
