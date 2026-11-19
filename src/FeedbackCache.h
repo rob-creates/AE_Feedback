@@ -1,6 +1,7 @@
-// Recent feedback images, identified by what produced them rather than by which effect
-// instance made them. An entry is only reused when AE confirms the entire input and parameter
-// history up to its frame is unchanged, so a stale or foreign entry can never be picked up.
+// Recent feedback images, identified by what produced them rather than by which effect instance made
+// them, except on adjustment layers (CanvasKey::owner). An entry is only reused when AE confirms the
+// entire input and parameter history up to its frame is unchanged, so a stale or foreign entry can
+// never be picked up.
 #pragma once
 
 #import <Metal/Metal.h>
@@ -30,11 +31,15 @@ struct CanvasKey
     PF_RationalScale downsampleX, downsampleY;
     A_long firstTime;
     bool compSpace = false; // in comp pixels rather than the layer's
+    // Zero for most layers, whose images any instance with the same history can use. An adjustment
+    // layer's history doesn't take in what's beneath it, so its images are kept to the instance that
+    // made them, as EffectInstance tells them apart.
+    uint64_t owner = 0;
 
     bool compatible(const CanvasKey& o) const
     {
         return SameScale(downsampleX, o.downsampleX) && SameScale(downsampleY, o.downsampleY) &&
-               firstTime == o.firstTime && compSpace == o.compSpace;
+               firstTime == o.firstTime && compSpace == o.compSpace && owner == o.owner;
     }
 
     bool operator==(const CanvasKey& o) const
@@ -60,6 +65,11 @@ public:
     };
 
     explicit FeedbackCache(id<MTLDevice> device);
+
+    // The most pixels a canvas may have, so that a step's buffers fit comfortably in what the GPU can
+    // use on this machine. Memory is shared with the rest of the system, so a canvas that doesn't fit
+    // would page rather than fail, and slow everything to a crawl.
+    size_t canvasPixelLimit() const { return mCanvasPixelLimit; }
 
     // All images for this frame; the caller decides which, if any, matches the current history.
     std::vector<Candidate> candidates(const CanvasKey& key, A_long time);
@@ -88,6 +98,8 @@ private:
     void evictLocked();
 
     id<MTLDevice> mDevice;
+    size_t mBudgetBytes; // for kept images
+    size_t mCanvasPixelLimit;
     std::mutex mMutex;
     std::vector<Entry> mEntries;
     std::vector<id<MTLBuffer>> mScratch;

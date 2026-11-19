@@ -99,6 +99,14 @@ def main(label):
         check(f"{comp} before the change@40", live(f"{step}_before", 40), ref(comp, 40))
         check(f"{comp} after the change@40", live(f"{step}_after", 40), ref(f"edited_{step}", 40))
 
+    print("Editing between frames, and a keyframe beneath an adjustment layer, during the session:")
+    for comp, step, frame in (("subframe_motion", "between", 20), ("adjust_key_below", "key_below", 40)):
+        render("feedback_live_edited.aep", comp, OUT / label / f"edited_{step}", 0, frame)
+        check(f"{comp} before the edit@{frame}", live(f"{step}_before", frame), ref(comp, frame))
+        check(f"{comp} after the edit@{frame}", live(f"{step}_after", frame), ref(f"edited_{step}", frame))
+        report(None, f"the edit itself changed the frame by a peak of "
+                     f"{difference(live(f'{step}_before', frame), ref(f'edited_{step}', frame))[0]}/255")
+
     print("A project saved by an earlier version of the effect:")
     render("old_project.aep", "trail", OUT / label / "old_project", 0, 60)
     check("opens and renders the same@60", ref("old_project", 60), ref("trail", 60))

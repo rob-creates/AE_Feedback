@@ -16,9 +16,10 @@ const float kMaxDirectSigma = FEEDBACK_BLUR_MAX_RADIUS / kGaussianTails;
 // Edges resample what they read anyway, so it only needs to be as fine as its blur.
 const float kEdgeMaxDirectSigma = 1.0f;
 
-// The buffers bind in order from index 0, followed by the parameters.
+// The buffers bind in order from index 0, followed by the parameters. A missing buffer, which couldn't
+// be allocated, leaves the kernel out rather than have it read or write nothing, and returns false.
 template <typename Params>
-void Encode(
+bool Encode(
     id<MTLComputeCommandEncoder> encoder,
     id<MTLComputePipelineState> pipeline,
     std::initializer_list<id<MTLBuffer>> buffers,
@@ -26,6 +27,9 @@ void Encode(
     int width,
     int height)
 {
+    for (id<MTLBuffer> buffer : buffers)
+        if (!buffer)
+            return false;
     NSUInteger index = 0;
     for (id<MTLBuffer> buffer : buffers)
         [encoder setBuffer:buffer offset:0 atIndex:index++];
@@ -33,6 +37,7 @@ void Encode(
     [encoder setComputePipelineState:pipeline];
     [encoder dispatchThreads:MTLSizeMake(width, height, 1)
         threadsPerThreadgroup:MTLSizeMake(pipeline.threadExecutionWidth, 1, 1)];
+    return true;
 }
 
 bool Succeeded(id<MTLCommandBuffer> commands)
@@ -54,9 +59,9 @@ bool RunOnce(
 {
     id<MTLCommandBuffer> commands = [queue commandBuffer];
     id<MTLComputeCommandEncoder> encoder = [commands computeCommandEncoder];
-    Encode(encoder, pipeline, buffers, params, width, height);
+    const bool encoded = Encode(encoder, pipeline, buffers, params, width, height);
     [encoder endEncoding];
-    return Succeeded(commands);
+    return Succeeded(commands) && encoded;
 }
 
 void FillWeights(BlurAxisParams& p, float sigma)
@@ -229,15 +234,19 @@ id<MTLBuffer> FeedbackRenderer::acquireForBatch(StepBatch& batch, size_t bytes)
             return buffer;
         }
     }
-    return mCache->acquireScratch(bytes);
+    id<MTLBuffer> buffer = mCache->acquireScratch(bytes);
+    if (!buffer)
+        batch.failed = true;
+    return buffer;
 }
 
 bool FeedbackRenderer::flush(StepBatch& batch)
 {
-    bool ok = true;
+    bool ok = !batch.failed;
+    batch.failed = false;
     if (batch.commands)
     {
-        ok = Succeeded(batch.commands);
+        ok = Succeeded(batch.commands) && ok;
         batch.commands = nil;
     }
     for (id<MTLBuffer> buffer : batch.freeBuffers)
@@ -423,8 +432,9 @@ id<MTLBuffer> FeedbackRenderer::step(
     id<MTLBuffer> current = prev;
 
     if (!current)
-    {
         current = acquire();
+    if (current != prev && current)
+    {
         id<MTLBlitCommandEncoder> blit = [commands blitCommandEncoder];
         [blit fillBuffer:current range:NSMakeRange(0, canvas.bytes()) value:0];
         [blit endEncoding];

@@ -123,6 +123,18 @@
     comp("precomp_inner").layer("dot").source.mainSource.color = [0.1, 0.2, 1];
     queue(outer, 40, "inner_after");
 
+    // Moving a layer between frames, where only a sub-step sees it, changes the trail, though nothing at
+    // frame times moved.
+    var betweenComp = comp("subframe_motion");
+    queue(betweenComp, 20, "between_before", null, 21);
+    betweenComp.layer("dot").property("Position").setValueAtKey(3, [200, 60]);
+    queue(betweenComp, 20, "between_after");
+    // Changing a keyframe beneath an adjustment layer, at frames 10 to 15 only, changes frame 40's trail.
+    var keyBelow = comp("adjust_key_below");
+    queue(keyBelow, 40, "key_below_before", null, 41);
+    keyBelow.layer("flash").property("Opacity").setValueAtKey(3, 10);
+    queue(keyBelow, 40, "key_below_after");
+
     // Saved so that a fresh aerender can show what those last frames should be.
     app.project.save(new File(OUT + "/feedback_live_edited.aep"));
     app.endSuppressDialogs(false);

@@ -44,6 +44,8 @@ COMPS = ["trail", "behind", "screen_sub", "add_sub", "grade_blur", "self_disp", 
          "map_offset",
          *[f"comp_space_{v}{p}" for v in ("2d", "parented") for p in ("", "_plain")], "layer_3d", "layer_3d_plain",
          "edge_luminance", "edge_colour", "edge_unsmoothed", "edge_trail", "update_stamp", "update_off", "transform_scale_zero",
+         "adjust_single", "adjust_dup", "adjust_key_below", "nest_30", "nest_12", "nest_solid_sub", "nest_solid_sub_60",
+         "subframe_motion", "border_drift", "canvas_limit",
          "mask_none", "mask_alpha_none",
          *[f"mask_{g}_{v}" for g in ("alpha", "levels", "hsl", "transform", "displace", "edge") for v in ("full", "left")]]
 NEUTRAL = ["neutral_ref", "neutral_luma", "neutral_red", "neutral_alpha_transparent", "neutral_alpha_half"]
@@ -53,18 +55,19 @@ COLD = {"trail": 60, "behind": 60, "screen_sub": 60, "add_sub": 60, "grade_blur"
         "duplicate_fx": 40, "perf_long": 299, "limit_600": 699,
         "limit_800": 699, "limit_100": 299, "preroll_unlimited": 699, "flash_spread": 32, "blurmap_left": 60, "blurmap_trail": 60, "trim_48": 60, "trim_start": 60, "trim_stretch": 60,
         "blend_difference": 3, "blend_overlay_sub": 29, "comp_space_2d": 20, "layer_3d": 20, "transform_rotate": 12, "transform_sub": 60, "edge_trail": 60,
-        "update_stamp": 13}
+        "update_stamp": 13, "adjust_dup": 23, "nest_30": 53, "nest_solid_sub_60": 70}
 DEEP = 3999  # deep_alpha1's last frame
+SMALL_CANVAS = 300 * 300  # pixels
 
 
-def render(project, comp, folder, start=None, end=None):
+def render(project, comp, folder, start=None, end=None, extra_env=None):
     folder.mkdir(parents=True, exist_ok=True)
     cmd = [AERENDER, "-project", str(OUT / project), "-comp", comp, "-RStemplate", "Best Settings",
            "-OMtemplate", "TIFF Sequence with Alpha", "-output", str(folder / "f_[#####].tif")]
     if start is not None:
         cmd += ["-s", str(start), "-e", str(end)]
     # A logging build mixes this into its GUIDs, so AE's disk cache can't serve an earlier render's frames.
-    env = dict(os.environ, FEEDBACK_GUID_SALT=str(time.time_ns()))
+    env = dict(os.environ, FEEDBACK_GUID_SALT=str(time.time_ns()), **(extra_env or {}))
     began = time.time()
     done = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=env)
     took = time.time() - began
@@ -90,6 +93,9 @@ def cmd_render(label):
             timing[f"{comp}_{depth}"] = render(f"feedback_{depth}.aep", comp, base / f"{comp}_{depth}")
     for comp, frame in COLD.items():
         timing[f"{comp}_cold"] = render("feedback_16.aep", comp, base / f"{comp}_cold", frame, frame)
+    # A canvas held to what a machine with far less memory would allow.
+    timing["canvas_limit_small"] = render("feedback_16.aep", "canvas_limit", base / "canvas_limit_small",
+                                          extra_env={"FEEDBACK_CANVAS_PIXELS": str(SMALL_CANVAS)})
     timing["deep_alpha1"] = render("feedback_16.aep", "deep_alpha1", base / "deep_alpha1", DEEP, DEEP)
     (base / "timing.json").write_text(json.dumps(
         {"timing": timing, "log": [log_start, LOG.stat().st_size if LOG.exists() else 0]}, indent=1))
@@ -426,6 +432,55 @@ def cmd_check(label):
     left = max(int(load(label, "transform_scale_zero", f)[..., 3].max()) for f in (1, 3))
     report(first == 255 and left == 0,
            f"a dot on Centre, stamped once (alpha {first}), leaves nothing after it, Centre included: peak alpha {left}")
+
+    print("Two adjustment layers with the same settings, one over the other:")
+    # The upper one's trail is of the lower one's: its input in front of its own faded trail, premultiplied.
+    lower = [load(label, "adjust_single", f) / 255 for f in range(24)]
+    upper = None
+    for im in lower:
+        upper = im if upper is None else im + (1 - im[..., 3:4]) * 0.85 * upper
+    seen = load(label, "adjust_dup", 23) / 255
+    peak = int(round(np.abs(seen - upper).max() * 255))
+    report(peak <= 4, f"the upper layer builds on the lower one's trail: peak {peak}/255 from what that gives, "
+                      f"alpha in all {seen[..., 3].sum():.0f}, the lower one alone {lower[-1][..., 3].sum():.0f}")
+
+    print("Nested at another frame rate, the trail steps by its own comp's frames:")
+    for comp, fps, source, every in (("nest_30", 30, "trail", 5), ("nest_12", 12, "trail", 1),
+                                     ("nest_solid_sub_60", 60, "nest_solid_sub", 5)):
+        own = lambda f: load(label, source, f)
+        outer = sorted(int(p.stem[2:]) for p in (OUT / label / comp).glob("f_*.tif"))
+        native = [f for f in outer if f % every == 0 and f * 24 % fps == 0]
+        peak = max(difference(load(label, comp, f), own(f * 24 // fps))[0] for f in native)
+        report(peak <= 2, f"{comp}: on its own frames, the same as the comp itself: peak {peak}/255 over {len(native)}")
+        mass = lambda im: float(im[..., 3].sum())
+        worst = 0.0
+        for f in outer:
+            k = f * 24 / fps
+            lo = int(k)
+            if k == lo or lo < 4 or lo + 1 >= len(list((OUT / label / source).glob("f_*.tif"))):
+                continue
+            a, b, m = mass(own(lo)), mass(own(lo + 1)), mass(load(label, comp, f))
+            worst = max(worst, max(min(a, b) - m, m - max(a, b), 0.0) / max(a, b))
+        report(worst <= 0.03, f"{comp}: between its frames, as much trail as on either side, give or take: "
+                              f"at worst {worst:.1%} beyond")
+
+    print("Sub-pixel moves at the canvas's edge:")
+    im = load(label, "border_drift", 11)
+    edge, middle = int(im[180, :20, 3].max()), int(im[180, 320, 3])
+    report(edge <= 2 and abs(middle - 255 * 0.9 ** 11) <= 3,
+           f"a sheet filling the canvas, drifting right, brings in nothing at the canvas's edge: alpha {edge} "
+           f"in the comp's first 20 columns, "
+           f"{middle} in the middle, expected {255 * 0.9 ** 11:.0f}")
+
+    print(f"A canvas held to {SMALL_CANVAS} pixels:")
+    for f in (12, 23):
+        x, y = int(round(60 + 520 * f / 24)), int(round(120 + 120 * f / 24))
+        box = (slice(max(y - 60, 0), y + 60), slice(max(x - 60, 0), x + 60))
+        small, full = load(label, "canvas_limit_small", f), load(label, "canvas_limit", f)
+        peak = difference(small[box], full[box])[0]
+        report(peak <= 1 and small[y, x, 3] == 255,
+               f"frame {f}: around the layer, as the full canvas has it: peak {peak}/255, alpha {small[y, x, 3]} at the layer; "
+               f"in all, {small[..., 3].sum() / max(full[..., 3].sum(), 1):.0%} of the full canvas's trail")
 
     print("Edges: the dot's outline over its trail, in front of the dot:")
     for comp, least in (("edge_luminance", 40), ("edge_colour", 200)):

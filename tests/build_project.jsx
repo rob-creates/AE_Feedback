@@ -280,6 +280,81 @@
         var outer = newComp("precomp_outer", 48);
         feedback(outer.layers.add(inner), { "Alpha Max": 0.9 });
 
+        // Two adjustment layers with the same settings, one over the other: the upper one's trail is of
+        // the lower one's, never the lower one's own. Beside one alone, which run_tests.py builds on.
+        for (var stack = 1; stack <= 2; stack++) {
+            var adj = newComp(stack === 1 ? "adjust_single" : "adjust_dup", 24);
+            var adjDot = adj.layers.addSolid(RED, "dot", 30, 30, 1, adj.duration);
+            adjDot.property("Position").setValueAtTime(0, [60, 120]);
+            adjDot.property("Position").setValueAtTime(adj.duration, [580, 240]);
+            for (var a = 0; a < stack; a++) {
+                var al = adj.layers.addSolid(GREY, "adjust" + a, W, H, 1, adj.duration);
+                al.adjustmentLayer = true;
+                feedback(al, { "Alpha Max": 0.85 });
+            }
+        }
+        // A flash beneath an adjustment layer, faded by Opacity keyframes, for an edit to frames 10 to 15 only.
+        var flashKey = newComp("adjust_key_below", 48);
+        var flashSolid = flashKey.layers.addSolid(RED, "flash", 60, 60, 1, flashKey.duration);
+        flashSolid.inPoint = 5 / FPS;
+        flashSolid.outPoint = 16 / FPS;
+        var flashOpacity = flashSolid.property("Opacity");
+        flashOpacity.setValueAtTime(5 / FPS, 100);
+        flashOpacity.setValueAtTime(10 / FPS, 100);
+        flashOpacity.setValueAtTime(15 / FPS, 100);
+        var flashAdjust = flashKey.layers.addSolid(GREY, "adjust", W, H, 1, flashKey.duration);
+        flashAdjust.adjustmentLayer = true;
+        feedback(flashAdjust, { "Alpha Max": 0.97 });
+
+        // Nested at another frame rate, a comp's trail still steps by its own frames: at 30, every fifth
+        // frame is one of its own, and those in between are part of the way to the next. At 12, every
+        // frame is every other one of its own. Sub-steps and a comp-space trail at 60.
+        function nest(name, source, fps) {
+            var c = app.project.items.addComp(name, W, H, 1, source.duration, fps);
+            c.layers.add(source);
+            return c;
+        }
+        var nestTrail = comp("trail");
+        nest("nest_30", nestTrail, 30);
+        nest("nest_12", nestTrail, 12);
+        var nestSolid = newComp("nest_solid_sub", 48);
+        var nestDot = nestSolid.layers.addSolid(RED, "dot", 30, 30, 1, nestSolid.duration);
+        nestDot.property("Position").setValueAtTime(0, [60, 120]);
+        nestDot.property("Position").setValueAtTime(nestSolid.duration, [580, 240]);
+        feedback(nestDot, { "Alpha Max": 0.85, "Sub-steps": 3 });
+        nest("nest_solid_sub_60", nestSolid, 60);
+
+        // A solid held still at frame times but away between them, at 10.5 frames, with a sub-step there:
+        // editing where it is between frames must change the trail, though nothing at frame times moved.
+        var between = newComp("subframe_motion", 24);
+        var betweenDot = between.layers.addSolid(RED, "dot", 30, 30, 1, between.duration);
+        var betweenPos = betweenDot.property("Position");
+        betweenPos.setValueAtTime(0, [100, 180]);
+        betweenPos.setValueAtTime(10 / FPS, [200, 180]);
+        betweenPos.setValueAtTime(10.5 / FPS, [200, 300]);
+        betweenPos.setValueAtTime(11 / FPS, [220, 180]);
+        betweenPos.setValueAtTime(between.duration, [500, 180]);
+        for (var bk = 1; bk <= betweenPos.numKeys; bk++)
+            betweenPos.setInterpolationTypeAtKey(bk, KeyframeInterpolationType.HOLD, KeyframeInterpolationType.HOLD);
+        feedback(betweenDot, { "Alpha Max": 0.9, "Sub-steps": 1 });
+
+        // A sheet larger than the comp and its margin, so it fills the canvas, stamped once and drifting
+        // 8.5 pixels right a frame: what comes in at the canvas's left edge is empty, rather than the edge
+        // stretched across, and by frame 11 the empty part is about 30 pixels into the comp. (Not 3D:
+        // under aerender, a 3D solid with the effect draws only a pixel.)
+        var drift = newComp("border_drift", 12);
+        var sheet = drift.layers.addSolid(RED, "sheet", W + 400, H + 400, 1, drift.duration);
+        var sheetFx = feedback(sheet, { "Alpha Max": 0.9, "Position": [8.5, 0] });
+        for (var sf = 0; sf < 12; sf++) find(sheetFx, "Update").setValueAtTime(sf / FPS, sf === 0);
+
+        // A comp-space trail, rendered again by run_tests.py with the canvas held to a small machine's
+        // worth: it keeps the part around the layer, as the full canvas has it.
+        var limited = newComp("canvas_limit", 24);
+        var limitedDot = limited.layers.addSolid(RED, "dot", 30, 30, 1, limited.duration);
+        limitedDot.property("Position").setValueAtTime(0, [60, 120]);
+        limitedDot.property("Position").setValueAtTime(limited.duration, [580, 240]);
+        feedback(limitedDot, { "Alpha Max": 0.9 });
+
         // Blur Mask Layer scales the blur by its luminance: black blurs nothing, white the whole radius, and a
         // white map over the left half alone blurs only there. Beside the same dot unblurred and blurred.
         dotComp("blur_sharp", 72, { "Alpha Max": 0.9 });

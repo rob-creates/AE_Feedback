@@ -45,9 +45,11 @@ public:
     // read from AE once.
     bool layerToComp(A_long value, A_u_long scale, Projective* out);
 
-    // Changes whenever where the layer is at `time`, in the comp's time scale, changes. Zero if it
+    // Changes whenever where the layer is at `time`, in the effect's time scale, changes. Zero if it
     // can't be read.
-    uint64_t fingerprint(A_long time);
+    uint64_t fingerprint(A_long time) { return fingerprint(time, A_u_long(mInData->time_scale)); }
+    // The same at a moment in any time scale, such as a sub-step's.
+    uint64_t fingerprint(A_long value, A_u_long scale);
 
 private:
     PF_InData* mInData;

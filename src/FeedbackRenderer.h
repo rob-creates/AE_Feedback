@@ -132,6 +132,7 @@ struct StepBatch
     id<MTLCommandQueue> queue;
     id<MTLCommandBuffer> commands;
     std::vector<id<MTLBuffer>> freeBuffers;
+    bool failed = false; // a buffer couldn't be had, so what's queued is incomplete
 };
 
 class FeedbackRenderer

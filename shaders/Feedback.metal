@@ -162,11 +162,12 @@ inline float2 toSmaller(float2 pos, int factor)
     return (pos + 0.5f) / float(factor) - 0.5f;
 }
 
-// Transparent beyond the image, rather than repeating its edge.
+// Transparent beyond the image, rather than repeating its edge: a position part way past the border
+// blends the border pixel with transparency, so a sub-pixel move carries the border away.
 inline float4 sampleOrClear(device const float4* src, int pitch, int w, int h, float2 pos)
 {
     if (pos.x > -1.0f && pos.y > -1.0f && pos.x < float(w) && pos.y < float(h))
-        return bilinearClamped(src, pitch, w, h, pos);
+        return bilinearPremultiplied(src, pitch, w, h, pos, false);
     return float4(0.0);
 }
 // How much of a group a pixel gets: its mask's luminance, premultiplied so transparent parts of the

@@ -23,6 +23,9 @@ Feedback Effect for Adobe After Effects
   were empty, while the trail goes on moving, fading and changing as usual. Keyframe it on and off to
   stamp the layer into a smoothly moving trail, in time with music for instance.
 - Transform's Scale goes down to 0, which shrinks the whole trail away in a single frame.
+- The trail moves on once per frame of the comp its layer is in. Nested in a comp at another frame
+  rate, or stretched, it still looks as it does in its own comp at those frames, and between them it
+  goes part of the way to the next.
 - Jumping to a frame recalculates the whole trail before it, so the trail is always complete, though a
   long one that never fades takes a while. Turn on Limit Pre-Roll to recalculate only the last
   Pre-Roll Limit frames instead: quicker, but a long trail can look shorter after a jump. Playing

@@ -1,11 +1,22 @@
 #include "FeedbackCache.h"
 
 #include <algorithm>
+#include <cstdlib>
 
 namespace
 {
-// Holds about 30 frames at 4K or 120 at 1080p across all instances of the effect.
-const size_t kBudgetBytes = size_t(4) * 1024 * 1024 * 1024;
+// Holds about 30 frames at 4K or 120 at 1080p across all instances of the effect, given room.
+const size_t kMostBudgetBytes = size_t(4) * 1024 * 1024 * 1024;
+// Kept images take no more than this share of what the GPU can use, and a step's buffers no more
+// than kStepShare, at about kStepCanvases canvases' worth: the trail, its result and the scratch for
+// displacement, edges and the blur's smaller images. AE's own images take the rest.
+const size_t kBudgetShare = 4;
+const size_t kStepShare = 3;
+const size_t kStepCanvases = 12;
+// A canvas side never goes beyond this, however much memory there is.
+const size_t kMostCanvasPixels = size_t(8192) * 8192;
+// Nor below about 4K, which a machine that can run AE at all can hold.
+const size_t kLeastCanvasPixels = size_t(4096) * 2304;
 // A step with displacement and a downsampled blur has seven free at rest.
 const size_t kMaxScratchBuffers = 8;
 } // namespace
@@ -13,6 +24,15 @@ const size_t kMaxScratchBuffers = 8;
 FeedbackCache::FeedbackCache(id<MTLDevice> device)
     : mDevice(device)
 {
+    const size_t usable = size_t(device.recommendedMaxWorkingSetSize);
+    mBudgetBytes = std::min(kMostBudgetBytes, usable / kBudgetShare);
+    mCanvasPixelLimit =
+        std::clamp(usable / kStepShare / (kStepCanvases * 16), kLeastCanvasPixels, kMostCanvasPixels);
+#ifdef FEEDBACK_LOG
+    // Tests stand in for a machine with less memory.
+    if (const char* given = getenv("FEEDBACK_CANVAS_PIXELS"))
+        mCanvasPixelLimit = std::max<size_t>(strtoull(given, nullptr, 10), 1);
+#endif
 }
 
 std::vector<FeedbackCache::Candidate> FeedbackCache::candidates(const CanvasKey& key, A_long time)
@@ -46,7 +66,7 @@ void FeedbackCache::publish(
 void FeedbackCache::evictLocked()
 {
     // The newest entry always survives, however large it is.
-    while (mEntryBytes > kBudgetBytes && mEntries.size() > 1)
+    while (mEntryBytes > mBudgetBytes && mEntries.size() > 1)
     {
         auto oldest = std::min_element(
             mEntries.begin(), mEntries.end(), [](const Entry& a, const Entry& b) { return a.lastUsed < b.lastUsed; });

@@ -112,10 +112,10 @@ bool LayerMotion::layerToComp(A_long value, A_u_long scale, Projective* out)
     return true;
 }
 
-uint64_t LayerMotion::fingerprint(A_long time)
+uint64_t LayerMotion::fingerprint(A_long value, A_u_long scale)
 {
     Projective p;
-    if (!layerToComp(time, A_u_long(mInData->time_scale), &p))
+    if (!layerToComp(value, scale, &p))
         return 0;
     uint64_t hash = 1469598103934665603ull; // FNV-1a
     unsigned char bytes[sizeof(p.m)];
