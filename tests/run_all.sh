@@ -25,7 +25,8 @@ cd "$HERE"
 rm -rf out/live "out/$LABEL"
 mkdir -p out/live
 
-# Each script in a fresh After Effects, which is then quit.
+# Each script in a fresh After Effects, which is then quit without asking to save: the live session's
+# edits to the test project are only for that session, and aerender renders the project as built.
 open -a "$APP"
 # Scripting works once a script can write a file. After Effects's reply can't be relied on: it can come
 # back as 0 even when the script ran.
@@ -42,7 +43,7 @@ for script in build_project.jsx live_session.jsx; do
     reply=$(osascript -e "with timeout of 900 seconds" -e "tell application \"$APP\" to DoScriptFile \"$HERE/$script\"" -e "end timeout" 2>&1)
     echo "$script: exit $? ${reply:0:200}"
 done
-osascript -e "with timeout of 60 seconds" -e "tell application \"$APP\" to DoScript \"app.quit()\"" -e "end timeout" >/dev/null
+osascript -e "with timeout of 60 seconds" -e "tell application \"$APP\" to DoScript \"if (app.project) app.project.close(CloseOptions.DO_NOT_SAVE_CHANGES); app.quit();\"" -e "end timeout" >/dev/null
 for i in {1..24}; do pgrep -x "After Effects" >/dev/null || break; sleep 5; done
 # It can hang on the way out with no window left, once the projects are saved, so then it's stopped.
 if pgrep -x "After Effects" >/dev/null; then

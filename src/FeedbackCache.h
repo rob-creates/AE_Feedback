@@ -55,6 +55,14 @@ struct CanvasKey
     size_t bytes() const { return size_t(width) * size_t(height) * 16; }
 };
 
+// Pixel Sampling at Pixel moves the trail by whole pixels and owes what's left over: how far, in canvas
+// pixels, the image still has to move to be where the trail should be. Kept with each image, so a trail
+// resumed from it moves on exactly as one that never stopped. Always zero at Smooth.
+struct TrailCarry
+{
+    float x = 0.0f, y = 0.0f;
+};
+
 // A layer as one render fetched it from AE, kept so that other renders can use it rather than ask AE
 // for it again. AE renders several frames at once, and each reads layers at moments the others read too.
 struct FetchKey
@@ -108,6 +116,7 @@ public:
         AEGP_TimeStamp made; // the project's timestamp when the image's inputs were read
         A_long drawnFor;     // the frame whose canvas the image was drawn on, which may be later than its own
         id<MTLBuffer> buffer;
+        TrailCarry carry;
     };
 
     explicit FeedbackCache(id<MTLDevice> device);
@@ -138,7 +147,7 @@ public:
     // Takes ownership of the buffer. Evicted buffers are dropped rather than recycled, because
     // a render further up the stack may still be reading them.
     void publish(const CanvasKey& key, A_long time, const PF_State& history, uint64_t motion, const AEGP_TimeStamp& made,
-                 A_long drawnFor, id<MTLBuffer> buffer);
+                 A_long drawnFor, id<MTLBuffer> buffer, TrailCarry carry);
 
     id<MTLBuffer> acquireScratch(size_t bytes);
     void releaseScratch(id<MTLBuffer> buffer);
@@ -153,6 +162,7 @@ private:
         AEGP_TimeStamp made;
         A_long drawnFor;
         id<MTLBuffer> buffer;
+        TrailCarry carry;
         uint64_t lastUsed;
     };
 

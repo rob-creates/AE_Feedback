@@ -511,6 +511,7 @@ id<MTLBuffer> FeedbackRenderer::step(
         p.amountX = amountX;
         p.amountY = amountY;
         p.inverse[0] = p.inverse[3] = 1.0f;
+        p.nearest = f.nearest;
         if (MovesTrail(f))
             InvertTransform(f, canvas, &p);
         // No map: zero size, so nothing shifts.
@@ -559,15 +560,17 @@ id<MTLBuffer> FeedbackRenderer::step(
     const float sigmaY = BlurSigma(f.blurRadius) * scaleY;
     // Every blur of this image shares one pyramid of it.
     Pyramid pyramid{{SmallBlur{current, width, height, 1}}};
+    // Sub-steps and reduced resolution divide the blur into widths far under a pixel, which only add up
+    // over many steps, so any blur at all goes ahead. The spread leaves out its parts too narrow to matter.
     auto blurBy = [&](float share)
     {
-        if (std::max(sigmaX, sigmaY) * share < kMinSigma)
+        if (std::max(sigmaX, sigmaY) * share <= 0.0f)
             return current;
         return encodeSpread(encoder, pyramid, canvas, f.spreadWidest, sigmaX * share, sigmaY * share, batch, scratch);
     };
     // A layer with nothing there blurs nothing, as black would.
     const bool blurMapMissing = blurSource == MAP_LAYER && !blurMap.buffer;
-    if (std::max(sigmaX, sigmaY) >= kMinSigma && !blurMapMissing)
+    if (std::max(sigmaX, sigmaY) > 0.0f && !blurMapMissing)
     {
         if (blurSource == MAP_NONE)
             current = blurBy(1.0f);
@@ -607,6 +610,7 @@ id<MTLBuffer> FeedbackRenderer::step(
     grade.alphaSlope = f.alphaSlope;
     grade.alphaOffset = f.alphaOffset;
     last.composite = MakeCompositeParams(canvas, input, f.compositeMode);
+    last.composite.nearest = f.nearest;
     last.composite.splitsInput = f.splitsInput;
     last.composite.frameAlpha = f.frameAlpha;
     last.composite.stepAlpha = f.stepAlpha;
@@ -643,10 +647,12 @@ id<MTLBuffer> FeedbackRenderer::compositeInput(
     const CanvasKey& canvas,
     id<MTLBuffer> image,
     const PlacedImage& input,
-    int compositeMode)
+    int compositeMode,
+    bool nearest)
 {
     id<MTLBuffer> result = mCache->acquireScratch(canvas.bytes());
     CompositeParams p = MakeCompositeParams(canvas, input, compositeMode);
+    p.nearest = nearest;
     if (!RunOnce(queue, mComposite, {image, input.buffer ? input.buffer : mEmpty, result}, p, canvas.width, canvas.height))
     {
         mCache->releaseScratch(result);
@@ -660,9 +666,11 @@ bool FeedbackRenderer::copyOut(
     const CanvasKey& canvas,
     id<MTLBuffer> image,
     const PlacedImage& output,
-    const float* canvasFromOutput)
+    const float* canvasFromOutput,
+    bool nearest)
 {
     CopyOutParams p{};
+    p.nearest = nearest;
     p.srcPitch = canvas.width;
     p.dstPitch = output.pitch;
     p.offsetX = output.offsetX;

@@ -102,24 +102,25 @@ enum
     PARAM_EDGE_BLEND,
     PARAM_EDGE_MASK,
     PARAM_EDGE_END,
-    PARAM_INPUT_GROUP_START,
+    PARAM_SAMPLING_GROUP_START,
     PARAM_UPDATE,
     PARAM_SUBSTEPS,
     PARAM_PRECISION,
-    PARAM_STATIC_MAPS,
+    PARAM_SAMPLING,
     PARAM_LIMIT_PREROLL,
     PARAM_PREROLL_LIMIT,
-    PARAM_INPUT_GROUP_END,
+    PARAM_SAMPLING_GROUP_END,
     PARAM_COUNT
 };
 
 // Saved projects find each control by this ID, so a control keeps its ID wherever it moves. In the
 // order above. ID 17 belonged to a Source popup, 33 and 34 to Position X and Y sliders, and 44 to a
 // Position where the centre went rather than how far it moved, 48 to a comp-space checkbox, 50 to a
-// Blur Type popup, and 54 to Update Every (Frames), and they mustn't be reused.
+// Blur Type popup, 54 to Update Every (Frames), and 64 to a Static Maps checkbox, and they mustn't
+// be reused.
 const int kDiskIds[PARAM_COUNT] = {0, 1, 27, 2, 26, 55, 28, 29, 3, 51, 30, 4, 5, 6, 7, 8, 9, 56, 10, 11,
                                     12, 13, 14, 57, 15, 31, 32, 47, 45, 35, 46, 36, 58, 37, 16, 18, 19, 20, 21, 22,
-                                    59, 23, 38, 39, 41, 40, 61, 42, 60, 43, 52, 62, 24, 63, 64, 49, 25, 53};
+                                    59, 23, 38, 39, 41, 40, 61, 42, 60, 43, 52, 62, 24, 63, 65, 49, 25, 53};
 
 int DiskId(int param)
 {
@@ -152,6 +153,15 @@ enum
     PRECISION_8_BIT = 1,
     PRECISION_16_BIT,
     PRECISION_32_BIT_FLOAT,
+};
+
+// Pixel Sampling: how the trail is moved, and the input placed, between pixels. Smooth mixes the neighbours,
+// which softens a little with every move that isn't by whole pixels. Pixel moves by whole pixels and
+// carries the fraction left over on to the next move, so the trail stays exactly as sharp as it went in.
+enum
+{
+    SAMPLING_SMOOTH = 1,
+    SAMPLING_PIXEL,
 };
 
 double InvisibleContribution(int precision)
@@ -333,10 +343,7 @@ struct PreRenderData
     // canvas was before it followed the trail. In the layer, from the canvas, as before.
     float spreadWidest = 0.0f;
 
-    // With Static Maps, every step reads the maps checked out once, at staticMapTime.
-    bool staticMaps = false;
-    SubstepCheckout::Map staticMap[SLOT_COUNT]{};
-    SampleTime staticMapTime{};
+    bool pixelSampling = false; // Pixel Sampling at Pixel
 
     // AE only hands out the output after an input has been checked out, so this always is, even
     // when the layer is empty or the frame needs no computing.
@@ -352,6 +359,7 @@ struct PreRenderData
     // render. Nil means they start from blank.
     id<MTLBuffer> resumeImage;
     CanvasKey resumeCanvas;
+    TrailCarry resumeCarry;
 
     // With the trail in comp space (canvas.compSpace), the canvas is the comp, and the output is the
     // layer's view of it.
@@ -857,6 +865,62 @@ FrameParams DivideIntoSteps(FrameParams f, float share, bool frameEnd)
     return f;
 }
 
+// A step at Pixel Sampling's Pixel, as DivideIntoSteps divides it except for the trail's move, which takes
+// whole pixels only. Resampling by a fraction of a pixel mixes neighbours, and fed back step after step
+// that softens the trail. `resolutionX` and `resolutionY` are the canvas's, as its pixels are the ones
+// that count.
+//
+// The frame's move, x -> L (x - centre) + centre + move, is the same as moving by u = L^-1 move and then
+// applying L about the centre. Each step takes its share of u, rounded to whole pixels, and `carry` keeps
+// what rounding left over for the next, so the steps still add up to the frame's move. L, and
+// displacement, which move each pixel differently and can't be carried, apply once a frame, at the
+// frame's own moment, as with no sub-steps. The fraction still owed is turned with the trail.
+FrameParams PixelSteps(const FrameParams& whole, float share, bool frameEnd, float resolutionX, float resolutionY,
+                       TrailCarry* carry)
+{
+    FrameParams f = DivideIntoSteps(whole, share, frameEnd);
+    // In canvas pixels, as TrailTransform has it.
+    const double a = whole.linear[0], b = double(whole.linear[1]) * resolutionX / resolutionY,
+                 c = double(whole.linear[2]) * resolutionY / resolutionX, d = whole.linear[3];
+    const double det = a * d - b * c;
+    if (CollapsesTrail(whole) || std::abs(det) < 1e-12)
+    {
+        *carry = {};
+        return f;
+    }
+    const double moveX = double(whole.moveX) * resolutionX, moveY = double(whole.moveY) * resolutionY;
+    const double wantX = carry->x + share * (d * moveX - b * moveY) / det;
+    const double wantY = carry->y + share * (a * moveY - c * moveX) / det;
+    const double stepX = std::floor(wantX + 0.5), stepY = std::floor(wantY + 0.5);
+    double owedX = wantX - stepX, owedY = wantY - stepY;
+
+    const bool turns = frameEnd && !(a == 1.0 && b == 0.0 && c == 0.0 && d == 1.0);
+    if (turns)
+    {
+        // x -> L (x + step - centre) + centre: L's move is L times the step.
+        std::copy(std::begin(whole.linear), std::end(whole.linear), f.linear);
+        f.moveX = float((a * stepX + b * stepY) / resolutionX);
+        f.moveY = float((c * stepX + d * stepY) / resolutionY);
+        const double turnedX = a * owedX + b * owedY;
+        owedY = c * owedX + d * owedY;
+        owedX = turnedX;
+    }
+    else
+    {
+        f.linear[0] = f.linear[3] = 1.0f;
+        f.linear[1] = f.linear[2] = 0.0f;
+        f.moveX = float(stepX / resolutionX);
+        f.moveY = float(stepY / resolutionY);
+    }
+    carry->x = float(owedX);
+    carry->y = float(owedY);
+
+    f.amountX = frameEnd ? whole.amountX : 0.0f;
+    f.amountY = frameEnd ? whole.amountY : 0.0f;
+    f.nearest = 1;
+    return f;
+}
+
 PF_Err GlobalSetup(PF_OutData* out_data)
 {
     // Must match AE_Effect_Version in FeedbackPiPL.r (AE compares the encoded value, build included).
@@ -1013,28 +1077,30 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
     maskLayer("Edge Mask Layer", PARAM_EDGE_MASK);
     endTopic(PARAM_EDGE_END);
 
-    topic("Input", PARAM_INPUT_GROUP_START);
+    topic("Sampling", PARAM_SAMPLING_GROUP_START);
     // Off, the layer adds nothing to the trail, as if it were empty, while the trail goes on moving and
     // fading. Keyframed on and off, it stamps the layer into the trail at those moments.
     AEFX_CLR_STRUCT(def);
     PF_ADD_CHECKBOXX("Update", TRUE, 0, DiskId(PARAM_UPDATE));
     fixedInteger("Sub-steps", 0, kMaxSubsteps, kMaxSubsteps, 0, PARAM_SUBSTEPS);
-    // How faint older frames may get before a rebuild leaves them out: below what the depth can show.
+    // How faint older frames may get before a rebuild leaves them out, and how far the blur's faint
+    // tails are followed: below what the depth can show. The trail itself is always worked in float.
     AEFX_CLR_STRUCT(def);
     def.flags = PF_ParamFlag_CANNOT_TIME_VARY;
-    PF_ADD_POPUP("Precision", 3, PRECISION_8_BIT, "8 bit|16 bit|32 bit float", DiskId(PARAM_PRECISION));
-    // On, each map layer is read once, at the frame shown, and used for the whole trail: far quicker,
-    // and right for maps that don't change. An animated map then looks different depending on which
-    // frame the trail was rebuilt from.
+    PF_ADD_POPUP("Cut-off Precision", 3, PRECISION_8_BIT, "8 bit|16 bit|32 bit float", DiskId(PARAM_PRECISION));
+    // Smooth softens a trail moved by fractions of a pixel, a little more with every step; Pixel keeps
+    // it exactly as sharp, for pixel art and hard-edged graphics.
     AEFX_CLR_STRUCT(def);
-    PF_ADD_CHECKBOXX("Static Maps", FALSE, PF_ParamFlag_CANNOT_TIME_VARY, DiskId(PARAM_STATIC_MAPS));
+    def.flags = PF_ParamFlag_CANNOT_TIME_VARY;
+    PF_ADD_POPUP("Pixel Sampling", 2, SAMPLING_SMOOTH, "Smooth|Pixel", DiskId(PARAM_SAMPLING));
     // Off, jumping to a frame recalculates the whole trail before it, however long that takes. On, only
     // the last Pre-Roll Limit frames are, which is quicker but can show a shorter trail.
     AEFX_CLR_STRUCT(def);
     PF_ADD_CHECKBOXX("Limit Pre-Roll", FALSE, PF_ParamFlag_SUPERVISE | PF_ParamFlag_CANNOT_TIME_VARY,
                      DiskId(PARAM_LIMIT_PREROLL));
     fixedInteger("Pre-Roll Limit (Frames)", 1, kLongestPreRollLimit, 3000, kDefaultPreRollLimit, PARAM_PREROLL_LIMIT);
-    endTopic(PARAM_INPUT_GROUP_END);
+    endTopic(PARAM_SAMPLING_GROUP_END);
+
 
     out_data->num_params = PARAM_COUNT;
     return err;
@@ -1300,7 +1366,8 @@ id<MTLBuffer> FindCached(
     A_long time,
     A_long step,
     const StillCurrent& current,
-    CanvasKey* imageCanvas)
+    CanvasKey* imageCanvas,
+    TrailCarry* carry)
 {
     const auto candidates = cache.candidates(canvas, time);
     PF_State history;
@@ -1315,6 +1382,7 @@ id<MTLBuffer> FindCached(
         {
             cache.touch(candidate.buffer);
             *imageCanvas = candidate.key;
+            *carry = candidate.carry;
             return candidate.buffer;
         }
     }
@@ -1333,11 +1401,12 @@ int FindResume(
     int frames,
     const StillCurrent& current,
     __strong id<MTLBuffer>* image,
-    CanvasKey* imageCanvas)
+    CanvasKey* imageCanvas,
+    TrailCarry* carry)
 {
     for (int k = 0; k < frames; k++)
     {
-        *image = FindCached(in_data, utils, cache, canvas, now, now - k * step, step, current, imageCanvas);
+        *image = FindCached(in_data, utils, cache, canvas, now, now - k * step, step, current, imageCanvas, carry);
         if (*image)
             return k;
     }
@@ -2046,10 +2115,7 @@ PF_Err CheckOutFrames(
                 ERR(CheckoutOrShare(in_data, extra, request, fetch, PARAM_INPUT, sample.time, kWholeLayer, sub.inputId,
                                     &sub.inputRect, &sub.inputFetch));
             }
-            if (data->staticMaps)
-                std::copy(std::begin(data->staticMap), std::end(data->staticMap), sub.maps);
-            else
-                ERR(CheckOutMaps(in_data, extra, request, fetch, mapArea, sample, nextId, &sub));
+            ERR(CheckOutMaps(in_data, extra, request, fetch, mapArea, sample, nextId, &sub));
             frame.substeps.push_back(sub);
         }
         data->frames.push_back(std::move(frame));
@@ -2128,7 +2194,7 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             ParamReader r{in_data, FrameSample(in_data, now)};
             data->samplesPerStep = r.integer(PARAM_SUBSTEPS) + 1;
             invisible = InvisibleContribution(r.popup(PARAM_PRECISION));
-            data->staticMaps = r.checkbox(PARAM_STATIC_MAPS);
+            data->pixelSampling = r.popup(PARAM_SAMPLING) == SAMPLING_PIXEL;
             if (r.checkbox(PARAM_LIMIT_PREROLL))
                 preRollLimit = r.integer(PARAM_PREROLL_LIMIT);
             ERR(r.err);
@@ -2292,13 +2358,6 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             const SampleFacts& own = grid.between() ? betweenFacts.samples.back() : walk.window[0]->samples.back();
             data->updates = own.updates;
             ERR(CheckoutWholeLayer(in_data, extra, request, PARAM_INPUT, own.time, data->currentInputId, &data->currentInputRect));
-            if (data->staticMaps)
-            {
-                SubstepCheckout once{};
-                ERR(CheckOutMaps(in_data, extra, request, FetchContext{}, mapArea, own, &nextId, &once));
-                std::copy(std::begin(once.maps), std::end(once.maps), data->staticMap);
-                data->staticMapTime = own.time;
-            }
         }
 
         // With the trail in comp space, the output is the layer's view of the comp, around the layer.
@@ -2324,9 +2383,8 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             data->outputRect = extra->output->result_rect;
         }
 
-        // Layers other renders have fetched at the moments needed are used rather than fetched again.
-        // Static Maps fetches its maps once a render, at a moment no other frame needs. Not on an
-        // adjustment layer: its input is what's beneath it, which AE's state doesn't follow.
+        // Layers other renders have fetched at the moments needed are used rather than fetched again. Not
+        // on an adjustment layer: its input is what's beneath it, which AE's state doesn't follow.
         const FetchContext fetchContext{&utils, &metal->renderer->cache(),
                                         data->watchesComp ? 0 : EffectInstance(in_data, out_data)};
         if (!err)
@@ -2342,7 +2400,7 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             const StillCurrent current = MakeStillCurrent(motionAt, data->watchesComp ? &watch : nullptr, grid.step);
             resumeK = FindResume(
                 in_data, utils, metal->renderer->cache(), data->canvas, grid.last, grid.step, int(walk.window.size()),
-                current, &data->resumeImage, &data->resumeCanvas);
+                current, &data->resumeImage, &data->resumeCanvas, &data->resumeCarry);
             ERR(CheckOutFrames(in_data, extra, request, fetchContext, mapArea, walk, resumeK >= 0 ? resumeK : int(walk.window.size()),
                                &nextId, data.get()));
         }
@@ -2355,10 +2413,7 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             sub.inputId = data->currentInputId;
             if (sample.updates)
                 sub.inputRect = data->currentInputRect;
-            if (data->staticMaps)
-                std::copy(std::begin(data->staticMap), std::end(data->staticMap), sub.maps);
-            else
-                ERR(CheckOutMaps(in_data, extra, request, fetchContext, mapArea, sample, &nextId, &sub));
+            ERR(CheckOutMaps(in_data, extra, request, fetchContext, mapArea, sample, &nextId, &sub));
             data->between = sub;
         }
         // Where the layer is at each moment to be computed, and what each frame's image is kept with.
@@ -2370,9 +2425,8 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             {
                 SubstepCheckout::Map& map = sub.maps[slot];
                 map.toComp = sub.layerToComp;
-                const SampleTime& at = data->staticMaps ? data->staticMapTime : sub.time;
                 if (!err && mapMotions[slot] && !IsEmpty(map.rect) &&
-                    !mapMotions[slot]->layerToComp(at.value, at.scale, &map.toComp))
+                    !mapMotions[slot]->layerToComp(sub.time.value, sub.time.scale, &map.toComp))
                     err = PF_Err_INTERNAL_STRUCT_DAMAGED;
             }
         };
@@ -2435,7 +2489,6 @@ struct GpuRender
 
     StepBatch batch;
     std::vector<A_long> checkedOut; // what the queued steps read, which AE must keep until they've run
-    PF_EffectWorld* staticMaps[SLOT_COUNT] = {}; // with Static Maps, checked out once and in at the end
 
     // Fetched layers copied for other renders, kept once the batch that copies them has run.
     struct Kept
@@ -2561,7 +2614,8 @@ PF_Err FlushSteps(GpuRender& render)
 }
 
 // Queues one step of the loop. Sets `next` to the image it will produce.
-// `share` is how much of a frame's change it makes.
+// `share` is how much of a frame's change it makes. At Pixel Sampling's Pixel, `carry` is what the trail's
+// move still owes, which the step takes on and updates.
 PF_Err ComputeSample(
     GpuRender& render,
     const SubstepCheckout& sub,
@@ -2569,6 +2623,7 @@ PF_Err ComputeSample(
     bool frameEnd,
     bool isCurrent,
     id<MTLBuffer> image,
+    TrailCarry* carry,
     __strong id<MTLBuffer>* next)
 {
     PF_Err err = PF_Err_NONE;
@@ -2578,8 +2633,12 @@ PF_Err ComputeSample(
         ERR(PF_ABORT(in_data));
 
     FrameParams params{};
-    if (!err)
+    if (!err && render.data.pixelSampling)
+        params = PixelSteps(ReadFrameParams(in_data, sub.time, &err), share, frameEnd,
+                            ScaleValue(render.data.canvas.downsampleX), ScaleValue(render.data.canvas.downsampleY), carry);
+    else if (!err)
         params = DivideIntoSteps(ReadFrameParams(in_data, sub.time, &err), share, frameEnd);
+    params.nearest = render.data.pixelSampling;
     params.spreadWidest = render.data.spreadWidest;
     std::copy(render.data.sources.begin(), render.data.sources.end(), params.sources);
 
@@ -2601,15 +2660,8 @@ PF_Err ComputeSample(
     for (int slot = 0; !err && slot < SLOT_COUNT; slot++)
         if (!IsEmpty(sub.maps[slot].rect) && !mapShared[slot])
         {
-            if (render.data.staticMaps && render.staticMaps[slot])
-            {
-                mapWorlds[slot] = render.staticMaps[slot];
-                continue;
-            }
             ERR(extra->cb->checkout_layer_pixels(in_data->effect_ref, sub.maps[slot].id, &mapWorlds[slot]));
             render.mapsFetched++;
-            if (render.data.staticMaps)
-                render.staticMaps[slot] = mapWorlds[slot];
         }
     render.mapMs += MsSince(mapStart);
     render.fetchMs += MsSince(fetchStart);
@@ -2670,7 +2722,7 @@ PF_Err ComputeSample(
     if (!isCurrent && inputWorld)
         render.checkedOut.push_back(sub.inputId);
     for (int slot = 0; slot < SLOT_COUNT; slot++)
-        if (mapWorlds[slot] && !render.data.staticMaps)
+        if (mapWorlds[slot])
             render.checkedOut.push_back(sub.maps[slot].id);
     return err;
 }
@@ -2716,9 +2768,8 @@ PF_Err FetchAhead(GpuRender& render, int frames, bool startsBlank)
             };
             if (!isCurrent)
                 add(sub.inputFetch, sub.inputId, sub.inputRect, false);
-            if (!data.staticMaps)
-                for (int slot = 0; slot < SLOT_COUNT; slot++)
-                    add(sub.maps[slot].fetch, sub.maps[slot].id, sub.maps[slot].rect, true);
+            for (int slot = 0; slot < SLOT_COUNT; slot++)
+                add(sub.maps[slot].fetch, sub.maps[slot].id, sub.maps[slot].rect, true);
         }
     }
 
@@ -2827,7 +2878,7 @@ PF_Err ShowImage(GpuRender& render, id<MTLBuffer> image, PF_EffectWorld* output)
                 err = PF_Err_INTERNAL_STRUCT_DAMAGED;
             if (!err)
             {
-                shown = renderer.compositeInput(render.queue, canvas, image, input, mode);
+                shown = renderer.compositeInput(render.queue, canvas, image, input, mode, render.data.pixelSampling);
                 shownIsScratch = shown != nil;
                 if (!shown)
                     err = PF_Err_INTERNAL_STRUCT_DAMAGED;
@@ -2843,7 +2894,8 @@ PF_Err ShowImage(GpuRender& render, id<MTLBuffer> image, PF_EffectWorld* output)
         Between(AtResolution(render.data.layerToCompNow, render.in_data), render.data.outputRect.left,
                 render.data.outputRect.top, canvas.left, canvas.top)
             .toFloats(canvasFromOutput);
-    if (!err && !renderer.copyOut(render.queue, canvas, shown, placedOutput, render.data.canvas.compSpace ? canvasFromOutput : nullptr))
+    if (!err && !renderer.copyOut(render.queue, canvas, shown, placedOutput,
+                                  render.data.canvas.compSpace ? canvasFromOutput : nullptr, render.data.pixelSampling))
         err = PF_Err_INTERNAL_STRUCT_DAMAGED;
     if (shownIsScratch)
         renderer.cache().releaseScratch(shown);
@@ -2913,13 +2965,15 @@ PF_Err RenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* 
         if (data->watchesComp)
             watch.emplace(in_data, out_data);
         const StillCurrent current = MakeStillCurrent(motionAt, watch ? &*watch : nullptr, step);
+        TrailCarry carry{};
         int resumeK = err ? -1
                           : FindResume(in_data, utils, cache, canvas, data->grid.last, step, frameCount, current,
-                                       &image, &imageCanvas);
+                                       &image, &imageCanvas, &carry);
         if (resumeK < 0)
         {
             image = data->resumeImage;
             imageCanvas = data->resumeCanvas;
+            carry = data->resumeCarry;
             resumeK = frameCount;
         }
         framesComputed = resumeK;
@@ -2959,7 +3013,7 @@ PF_Err RenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* 
                 {
                     id<MTLBuffer> next = nil;
                     ERR(ComputeSample(render, sub, 1.0f / float(data->samplesPerStep), s == subCount - 1, isCurrent,
-                                      image, &next));
+                                      image, &carry, &next));
                     if (next)
                     {
                         if (imageIsScratch)
@@ -2988,7 +3042,7 @@ PF_Err RenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* 
                 ERR(FlushSteps(render));
                 if (!err)
                 {
-                    cache.publish(canvas, frame.time, history, frame.motion, data->made, data->grid.last, image);
+                    cache.publish(canvas, frame.time, history, frame.motion, data->made, data->grid.last, image, carry);
                     imageIsScratch = false;
                 }
             }
@@ -3001,7 +3055,9 @@ PF_Err RenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* 
             @autoreleasepool
             {
                 id<MTLBuffer> next = nil;
-                ERR(ComputeSample(render, *data->between, data->grid.share, false, true, image, &next));
+                // Only shown, so what it owes is left with the last frame's image.
+                TrailCarry shownCarry = carry;
+                ERR(ComputeSample(render, *data->between, data->grid.share, false, true, image, &shownCarry, &next));
                 if (next)
                 {
                     if (imageIsScratch)
@@ -3023,10 +3079,6 @@ PF_Err RenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* 
 
         if (imageIsScratch)
             cache.releaseScratch(image);
-        // Every step has run by now, so the maps they shared can go back.
-        for (int slot = 0; slot < SLOT_COUNT; slot++)
-            if (render.staticMaps[slot])
-                extra->cb->checkin_layer_pixels(in_data->effect_ref, data->staticMap[slot].id);
         extra->cb->checkin_layer_pixels(in_data->effect_ref, data->currentInputId);
     }
 

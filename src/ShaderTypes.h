@@ -86,6 +86,7 @@ struct DisplaceParams
     MapLookup map;
     Mask transformMask; // each pixel moves this much of the way Transform takes it
     Mask displaceMask; // and shifts this much of its displacement
+    int nearest; // Pixel Sampling at Pixel: each pixel copies the one nearest where it came from, unmixed
 };
 
 struct EdgeParams
@@ -189,6 +190,7 @@ struct CompositeParams
     // With the trail in comp space, the input is drawn through the layer's own move.
     int inputWarped;
     float inputFromCanvas[9]; // row-major 3x3, to input pixel coordinates
+    int nearest; // and drawn with each pixel copied from the nearest, at Pixel Sampling's Pixel
 };
 
 struct StepParams
@@ -217,4 +219,5 @@ struct CopyOutParams
     int warped;
     float canvasFromOutput[9]; // row-major 3x3, to canvas pixel coordinates
     int canvasHeight; // the canvas's width is srcPitch
+    int nearest; // each output pixel copies the nearest canvas pixel, at Pixel Sampling's Pixel
 };

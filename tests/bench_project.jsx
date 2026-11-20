@@ -149,7 +149,6 @@
     BENCHES.user_nosub = function (c, n) { userComp(c, n, { "Sub-steps": 0 }, "noise"); };
     BENCHES.user_flatmap = function (c, n) { userComp(c, n, { "Sub-steps": 1 }, "solid"); };
     BENCHES.user_nomap = function (c, n) { userComp(c, n, { "Sub-steps": 1 }, null); };
-    BENCHES.user_static = function (c, n) { userComp(c, n, { "Sub-steps": 1, "Static Maps": true }, "noise"); };
     // Footage from make_footage.sh: a keyed clip with a slow fade, so a rebuild reaches back about 300
     // frames, as it plays and slowed by stretching; and a clip as the map.
     function footageIn(c, n, stretch) {
@@ -162,7 +161,6 @@
     BENCHES.footage_in = function (c, n) { footageIn(c, n, 100); };
     BENCHES.footage_stretch = function (c, n) { footageIn(c, n, 400); };
     BENCHES.footage_map = function (c, n) { userComp(c, n, { "Sub-steps": 1 }, "footage"); };
-    BENCHES.footage_map_static = function (c, n) { userComp(c, n, { "Sub-steps": 1, "Static Maps": true }, "footage"); };
     var SIZES = { small: [3840, 2160] };
 
     app.beginSuppressDialogs();

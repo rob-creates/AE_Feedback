@@ -19,10 +19,18 @@ Feedback Effect for Adobe After Effects
   mask is read where it is in the comp, and the effect's own layer at Effects & Masks uses the
   trail. Left at None, the group applies everywhere. Where an Alpha mask is dark the trail doesn't
   fade, so jumping to a frame recalculates the trail from its start, or from Pre-Roll Limit.
-- Update, under Input, is on by default. Turned off, the layer stops adding to the trail, as if it
+- Update, under Sampling, is on by default. Turned off, the layer stops adding to the trail, as if it
   were empty, while the trail goes on moving, fading and changing as usual. Keyframe it on and off to
   stamp the layer into a smoothly moving trail, in time with music for instance.
 - Transform's Scale goes down to 0, which shrinks the whole trail away in a single frame.
+- Pixel Sampling, under Sampling, sets how the trail is moved between pixels. Smooth, the default, blends
+  neighbouring pixels: a trail moved by fractions of a pixel (by Transform, displacement or
+  Sub-steps, which divide each frame's move) softens a little with every move, like motion blur.
+  Pixel moves the trail by whole pixels and carries the fraction left over on to the next move, so it
+  stays exactly as sharp as it went in while moving just as far: for pixel art and hard-edged
+  graphics. At Pixel, Scale, Rotation and displacement apply once a frame, as with no sub-steps, and
+  near Centre a gentle Scale can leave pixels in place, as copying whole pixels does. At reduced
+  preview resolution a move is fewer pixels, so the trail steps more coarsely than in a full render.
 - The trail moves on once per frame of the comp its layer is in. Nested in a comp at another frame
   rate, or stretched, it still looks as it does in its own comp at those frames, and between them it
   goes part of the way to the next. A time-reversed layer leaves its trail through the comp's earlier
@@ -31,12 +39,10 @@ Feedback Effect for Adobe After Effects
   long one that never fades takes a while. Turn on Limit Pre-Roll to recalculate only the last
   Pre-Roll Limit frames instead (300 by default): quicker, but a long trail can look shorter after a
   jump. Playing forward keeps the full trail either way.
-- Precision, under Input, sets how faint the oldest frames may get before recalculating leaves them
-  out: below what 8 bit, 16 bit or 32 bit float can show. 8 bit is quickest, and right for most work;
-  a deeper setting recalculates further back, for a project at that depth.
-- Static Maps, under Input, reads each map and mask layer once, at the frame shown, for the whole
-  trail. That's far quicker, and right for maps that don't change. An animated map then looks
-  different depending on which frame the trail was recalculated from.
+- Cut-off Precision, under Sampling, sets how faint the oldest frames may get before recalculating
+  leaves them out, and how far the blur's faint tails are followed: below what 8 bit, 16 bit or 32 bit
+  float can show. The trail itself is always worked in float. 8 bit is quickest, and right for most
+  work; a deeper setting recalculates further back, for a project at that depth.
 - Work is kept to where the trail can be: a small layer's trail is worked on, and its maps read, only
   around it. Blur, large displacement and Transform can carry a trail anywhere, so with those it
   covers the whole comp, as before.

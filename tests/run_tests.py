@@ -30,7 +30,7 @@ COMPS = ["trail", "behind", "screen_sub", "add_sub", "grade_blur", "self_disp", 
          "alpha_min", "alpha_min_ref", "alpha_min_fade", "alpha_min_sub", "empties_midway",
          "shape_trail", "shape_sub", "shape_mapped", "shape_as_map",
          "two_layers", "duplicate_fx", "neutral_ref", "neutral_luma", "neutral_red", "neutral_alpha_transparent",
-         "neutral_alpha_half", "map_solid_opaque", "map_static", "map_source_default", "map_solid_masked", "map_effects",
+         "neutral_alpha_half", "map_solid_opaque", "map_source_default", "map_solid_masked", "map_effects",
          "empty_layer", "empty_mapped", "layer_own", "layer_none", "layer_own_effects",
          "perf_long", "precision_8", "precision_16", "precision_32", "limit_default", "limit_800", "limit_100", "preroll_unlimited",
          "flash_spread", "flash_spread_sub", "adjust_below", "precomp_outer",
@@ -40,7 +40,7 @@ COMPS = ["trail", "behind", "screen_sub", "add_sub", "grade_blur", "self_disp", 
          *[f"blend_{m}{v}" for m in ("multiply", "lighten", "darken", "overlay", "add_subtract", "difference")
            for v in ("", "_sub", "_fade")],
          "transform_position", "transform_scale", "transform_scale_xy", "transform_rotate", "transform_sub",
-         "transform_sub_scale", "transform_sub_skew", "edge_multiply", "square_path", "square_path_plain",
+         "transform_sub_scale", "transform_sub_skew", "sampling_smooth", "sampling_pixel", "edge_multiply", "square_path", "square_path_plain",
          "map_offset",
          *[f"comp_space_{v}{p}" for v in ("2d", "parented") for p in ("", "_plain")], "layer_3d", "layer_3d_plain",
          "edge_luminance", "edge_colour", "edge_unsmoothed", "edge_trail", "update_stamp", "update_off", "transform_scale_zero",
@@ -56,15 +56,15 @@ COLD = {"trail": 60, "behind": 60, "screen_sub": 60, "add_sub": 60, "grade_blur"
         "alpha_min": 60, "alpha_min_fade": 60, "alpha_min_sub": 60,
         "duplicate_fx": 40, "perf_long": 299, "limit_default": 699,
         "limit_800": 699, "limit_100": 299, "preroll_unlimited": 699, "flash_spread": 32, "blurmap_left": 60, "blurmap_trail": 60, "trim_48": 60, "trim_start": 60, "trim_stretch": 60,
-        "blend_difference": 3, "blend_overlay_sub": 29, "comp_space_2d": 20, "layer_3d": 20, "transform_rotate": 12, "transform_sub": 60, "edge_trail": 60,
+        "blend_difference": 3, "blend_overlay_sub": 29, "comp_space_2d": 20, "layer_3d": 20, "transform_rotate": 12, "transform_sub": 60, "sampling_pixel": 60, "edge_trail": 60,
         "update_stamp": 13, "adjust_dup": 23, "nest_30": 53, "nest_solid_sub_60": 70,
         "stretch_1000": 23, "stretch_25": 23,
-        "footage_trail": 60, "footage_stretch": 60, "footage_reverse": 60, "map_static": 71, "precision_8": 95, "precision_16": 95, "precision_32": 95}
+        "footage_trail": 60, "footage_stretch": 60, "footage_reverse": 60, "precision_8": 95, "precision_16": 95, "precision_32": 95}
 STRETCHES = ["stretch_1000", "stretch_25"]
 # Rendered again with the canvas and maps as they were before they followed the trail: the whole comp,
 # and the whole of each map. Each must look the same.
 WHOLE = ["trail", "self_disp", "grade_blur", "screen_sub", "shape_trail", "shape_mapped", "shape_as_map",
-         "map_solid_opaque", "map_static", "map_offset", "blurmap_left", "blurmap_trail", "edge_trail",
+         "map_solid_opaque", "map_offset", "blurmap_left", "blurmap_trail", "edge_trail",
          "mask_displace_left", "mask_transform_left", "transform_rotate", "transform_sub", "comp_space_2d",
          "comp_space_parented", "layer_3d", "nest_30", "nest_solid_sub", "subframe_motion", "border_drift",
          "canvas_limit", "stretch_25", "footage_trail", "footage_stretch", "footage_reverse", "flash_spread"]
@@ -251,10 +251,8 @@ def cmd_check(label):
         report(peak <= 1, f"{text}: peak {peak}/255 across {count} pixels")
     peak, count = difference(load(label, "map_source_default", 71), load(label, "map_solid_opaque", 71))
     report(peak <= 1, f"Source ignores the mask: peak {peak}/255 against an unmasked map")
-    worst = max(difference(load(label, "map_static", f), load(label, "map_solid_opaque", f))[0] for f in range(72))
-    report(worst <= 1, f"Static Maps, with a map that doesn't change, gives the same trail: peak {worst}/255")
 
-    print("Precision: a deeper cut-off rebuilds further back, and only changes what 8 bits can't show:")
+    print("Cut-off Precision: a deeper cut-off rebuilds further back, and only changes what 8 bits can't show:")
     for comp in ("precision_16", "precision_32"):
         peak, count = difference(load(label, comp, 95), load(label, "precision_8", 95))
         report(peak <= 1, f"{comp}@95 against 8 bit: peak {peak}/255 across {count} pixels")
@@ -437,6 +435,21 @@ def cmd_check(label):
             # Earlier moments of the frame trail behind each copy, so it's at least as solid as one.
             seen, want = alpha_at(comp, 11, int(round(x)), int(round(y))), 255 * 0.9 ** k
             report(seen >= want - 4, f"{text} with 3 sub-steps, {k} frames back at ({x:.0f}, {y:.0f}): alpha {seen}, at least {want - 4:.0f}")
+
+    print("Sampling, with the trail moved 2.5 pixels a frame in 6 steps:")
+    # A column the dot crossed about 40 frames before frame 60, so its copy there has been moved 240 times.
+    def edge_and_centre(comp):
+        column = load(label, comp, 60)[:, 347, 3].astype(float)
+        top = column.max()
+        soft = int(((column > 0.1 * top) & (column < 0.9 * top)).sum())
+        rows = np.arange(len(column))
+        return soft, float((column * rows).sum() / column.sum())
+    smooth_soft, smooth_centre = edge_and_centre("sampling_smooth")
+    pixel_soft, pixel_centre = edge_and_centre("sampling_pixel")
+    report(pixel_soft <= 4, f"Pixel keeps the trail's edges as sharp as the dot's: {pixel_soft} soft pixels across both")
+    report(smooth_soft >= pixel_soft + 6, f"Smooth softens them, as before: {smooth_soft} soft pixels")
+    report(abs(pixel_centre - smooth_centre) <= 1,
+           f"Pixel moves the trail as far as Smooth: centred at row {pixel_centre:.1f} against {smooth_centre:.1f}")
 
     print("Update on every 4th frame, with Position 20 a frame:")
     for frame, newest in ((12, 0), (13, 1)):

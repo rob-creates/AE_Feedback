@@ -52,6 +52,9 @@ struct FrameParams
     // canvas's longer side. It mustn't follow a canvas that follows the trail, or the blur would change
     // with it.
     float spreadWidest;
+    // Pixel Sampling at Pixel: the trail's move and the input's placement copy whole pixels rather than
+    // mixing neighbours, so nothing softens however often the trail is moved.
+    int nearest;
 };
 
 // x' = a x + b y + tx, y' = c x + d y + ty.
@@ -176,19 +179,22 @@ public:
         const CanvasKey& canvas,
         id<MTLBuffer> image,
         const PlacedImage& input,
-        int compositeMode);
+        int compositeMode,
+        bool nearest);
 
     // Queues a copy of a layer AE gave, `pitch` pixels a row, into a buffer of its own that outlives
     // AE's. Nil if there's no memory for it.
     id<MTLBuffer> copyPixels(StepBatch& batch, id<MTLBuffer> source, int pitch, int height);
 
-    // With canvasFromOutput, each output pixel is looked up through it rather than by offset.
+    // With canvasFromOutput, each output pixel is looked up through it rather than by offset: from the
+    // nearest canvas pixel with `nearest`, and otherwise between them.
     bool copyOut(
         id<MTLCommandQueue> queue,
         const CanvasKey& canvas,
         id<MTLBuffer> image,
         const PlacedImage& output,
-        const float* canvasFromOutput = nullptr);
+        const float* canvasFromOutput = nullptr,
+        bool nearest = false);
 
 private:
     FeedbackRenderer() = default;

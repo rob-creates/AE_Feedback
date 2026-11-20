@@ -45,7 +45,7 @@ std::vector<FeedbackCache::Candidate> FeedbackCache::candidates(const CanvasKey&
     std::vector<Candidate> out;
     for (const Entry& e : mEntries)
         if (e.time == time && e.key.compatible(key))
-            out.push_back({e.key, e.history, e.motion, e.made, e.drawnFor, e.buffer});
+            out.push_back({e.key, e.history, e.motion, e.made, e.drawnFor, e.buffer, e.carry});
     return out;
 }
 
@@ -59,10 +59,10 @@ void FeedbackCache::touch(id<MTLBuffer> buffer)
 
 void FeedbackCache::publish(
     const CanvasKey& key, A_long time, const PF_State& history, uint64_t motion, const AEGP_TimeStamp& made,
-    A_long drawnFor, id<MTLBuffer> buffer)
+    A_long drawnFor, id<MTLBuffer> buffer, TrailCarry carry)
 {
     std::lock_guard<std::mutex> lock(mMutex);
-    mEntries.push_back({key, time, history, motion, made, drawnFor, buffer, ++mClock});
+    mEntries.push_back({key, time, history, motion, made, drawnFor, buffer, carry, ++mClock});
     mEntryBytes += buffer.length;
     evictLocked();
 }
