@@ -30,9 +30,9 @@ COMPS = ["trail", "behind", "screen_sub", "add_sub", "grade_blur", "self_disp", 
          "alpha_min", "alpha_min_ref", "alpha_min_fade", "alpha_min_sub", "empties_midway",
          "shape_trail", "shape_sub", "shape_mapped", "shape_as_map",
          "two_layers", "duplicate_fx", "neutral_ref", "neutral_luma", "neutral_red", "neutral_alpha_transparent",
-         "neutral_alpha_half", "map_solid_opaque", "map_source_default", "map_solid_masked", "map_effects",
+         "neutral_alpha_half", "map_solid_opaque", "map_static", "map_source_default", "map_solid_masked", "map_effects",
          "empty_layer", "empty_mapped", "layer_own", "layer_none", "layer_own_effects",
-         "perf_long", "limit_600", "limit_800", "limit_100", "preroll_unlimited",
+         "perf_long", "precision_8", "precision_16", "precision_32", "limit_default", "limit_800", "limit_100", "preroll_unlimited",
          "flash_spread", "flash_spread_sub", "adjust_below", "precomp_outer",
          "blur_sharp", "blur_whole", "blurmap_black", "blurmap_white", "blurmap_left", "blurmap_trail",
          "trim_48", "trim_48_plain", "trim_24", "trim_24_plain", "trim_start", "trim_start_plain",
@@ -45,17 +45,29 @@ COMPS = ["trail", "behind", "screen_sub", "add_sub", "grade_blur", "self_disp", 
          *[f"comp_space_{v}{p}" for v in ("2d", "parented") for p in ("", "_plain")], "layer_3d", "layer_3d_plain",
          "edge_luminance", "edge_colour", "edge_unsmoothed", "edge_trail", "update_stamp", "update_off", "transform_scale_zero",
          "adjust_single", "adjust_dup", "adjust_key_below", "nest_30", "nest_12", "nest_solid_sub", "nest_solid_sub_60",
-         "subframe_motion", "border_drift", "canvas_limit",
+         "subframe_motion", "border_drift", "canvas_limit", "stretch_1000", "stretch_25",
+         "footage_trail", "footage_stretch", "footage_reverse", "footage_reverse_plain",
+         *[f"footage_reverse_ref_{o}" for o in ("m1", "z0", "p1", "plain")],
          "mask_none", "mask_alpha_none",
          *[f"mask_{g}_{v}" for g in ("alpha", "levels", "hsl", "transform", "displace", "edge") for v in ("full", "left")]]
 NEUTRAL = ["neutral_ref", "neutral_luma", "neutral_red", "neutral_alpha_transparent", "neutral_alpha_half"]
 # Rendered again alone in a new process: a full rebuild, with nothing cached.
 COLD = {"trail": 60, "behind": 60, "screen_sub": 60, "add_sub": 60, "grade_blur": 60, "self_disp": 60, "keyed": 70,
         "alpha_min": 60, "alpha_min_fade": 60, "alpha_min_sub": 60,
-        "duplicate_fx": 40, "perf_long": 299, "limit_600": 699,
+        "duplicate_fx": 40, "perf_long": 299, "limit_default": 699,
         "limit_800": 699, "limit_100": 299, "preroll_unlimited": 699, "flash_spread": 32, "blurmap_left": 60, "blurmap_trail": 60, "trim_48": 60, "trim_start": 60, "trim_stretch": 60,
         "blend_difference": 3, "blend_overlay_sub": 29, "comp_space_2d": 20, "layer_3d": 20, "transform_rotate": 12, "transform_sub": 60, "edge_trail": 60,
-        "update_stamp": 13, "adjust_dup": 23, "nest_30": 53, "nest_solid_sub_60": 70}
+        "update_stamp": 13, "adjust_dup": 23, "nest_30": 53, "nest_solid_sub_60": 70,
+        "stretch_1000": 23, "stretch_25": 23,
+        "footage_trail": 60, "footage_stretch": 60, "footage_reverse": 60, "map_static": 71, "precision_8": 95, "precision_16": 95, "precision_32": 95}
+STRETCHES = ["stretch_1000", "stretch_25"]
+# Rendered again with the canvas and maps as they were before they followed the trail: the whole comp,
+# and the whole of each map. Each must look the same.
+WHOLE = ["trail", "self_disp", "grade_blur", "screen_sub", "shape_trail", "shape_mapped", "shape_as_map",
+         "map_solid_opaque", "map_static", "map_offset", "blurmap_left", "blurmap_trail", "edge_trail",
+         "mask_displace_left", "mask_transform_left", "transform_rotate", "transform_sub", "comp_space_2d",
+         "comp_space_parented", "layer_3d", "nest_30", "nest_solid_sub", "subframe_motion", "border_drift",
+         "canvas_limit", "stretch_25", "footage_trail", "footage_stretch", "footage_reverse", "flash_spread"]
 DEEP = 3999  # deep_alpha1's last frame
 SMALL_CANVAS = 300 * 300  # pixels
 
@@ -94,8 +106,12 @@ def cmd_render(label):
     for comp, frame in COLD.items():
         timing[f"{comp}_cold"] = render("feedback_16.aep", comp, base / f"{comp}_cold", frame, frame)
     # A canvas held to what a machine with far less memory would allow.
-    timing["canvas_limit_small"] = render("feedback_16.aep", "canvas_limit", base / "canvas_limit_small",
-                                          extra_env={"FEEDBACK_CANVAS_PIXELS": str(SMALL_CANVAS)})
+    for comp in WHOLE:
+        timing[f"{comp}_whole"] = render("feedback_16.aep", comp, base / f"{comp}_whole",
+                                         extra_env={"FEEDBACK_WHOLE_CANVAS": "1"})
+    for comp in ["canvas_limit", *STRETCHES]:
+        timing[f"{comp}_small"] = render("feedback_16.aep", comp, base / f"{comp}_small",
+                                         extra_env={"FEEDBACK_CANVAS_PIXELS": str(SMALL_CANVAS)})
     timing["deep_alpha1"] = render("feedback_16.aep", "deep_alpha1", base / "deep_alpha1", DEEP, DEEP)
     (base / "timing.json").write_text(json.dumps(
         {"timing": timing, "log": [log_start, LOG.stat().st_size if LOG.exists() else 0]}, indent=1))
@@ -156,7 +172,7 @@ def cmd_check(label):
             report(False, f"{comp}: missing {e.filename}")
             continue
         text = f"{comp}@{frame}: peak {peak}/255 across {count} pixels"
-        if comp in ("limit_600", "limit_100"):
+        if comp in ("limit_default", "limit_100"):
             report(None, text + " (Alpha Max 1.0, beyond Pre-Roll Limit)")
         elif comp == "duplicate_fx":
             # A rebuild stops once the effect's own Alpha has faded older frames to nothing, but the
@@ -173,7 +189,7 @@ def cmd_check(label):
     report(min(after) > 0, f"frames 50-95 all differ (smallest peak {min(after)})")
 
     print("Pre-Roll Limit sets how far a rebuild reaches, with Limit Pre-Roll on:")
-    for comp, frame, limit in (("limit_600", 699, 600), ("limit_800", 699, 800), ("limit_100", 299, 100)):
+    for comp, frame, limit in (("limit_default", 699, 300), ("limit_800", 699, 800), ("limit_100", 299, 100)):
         played = visible(load(label, comp, frame))
         alone = visible(load(label, comp + "_cold", frame))
         report(None, f"{comp}@{frame}, limit {limit}: {played} visible pixels played through, {alone} rendered alone")
@@ -235,6 +251,13 @@ def cmd_check(label):
         report(peak <= 1, f"{text}: peak {peak}/255 across {count} pixels")
     peak, count = difference(load(label, "map_source_default", 71), load(label, "map_solid_opaque", 71))
     report(peak <= 1, f"Source ignores the mask: peak {peak}/255 against an unmasked map")
+    worst = max(difference(load(label, "map_static", f), load(label, "map_solid_opaque", f))[0] for f in range(72))
+    report(worst <= 1, f"Static Maps, with a map that doesn't change, gives the same trail: peak {worst}/255")
+
+    print("Precision: a deeper cut-off rebuilds further back, and only changes what 8 bits can't show:")
+    for comp in ("precision_16", "precision_32"):
+        peak, count = difference(load(label, comp, 95), load(label, "precision_8", 95))
+        report(peak <= 1, f"{comp}@95 against 8 bit: peak {peak}/255 across {count} pixels")
 
     print("Map Layer:")
     # A trail displaced by its own alpha differs from one displaced by the layer's image.
@@ -482,6 +505,36 @@ def cmd_check(label):
                f"frame {f}: around the layer, as the full canvas has it: peak {peak}/255, alpha {small[y, x, 3]} at the layer; "
                f"in all, {small[..., 3].sum() / max(full[..., 3].sum(), 1):.0%} of the full canvas's trail")
 
+    print("A canvas that follows the trail, and maps read only over it, change nothing:")
+    for comp in WHOLE:
+        frames = sorted(int(p.stem[2:]) for p in (OUT / label / comp).glob("f_*.tif"))
+        worst = max((difference(load(label, comp, f), load(label, comp + "_whole", f))[0], f) for f in frames)
+        report(worst[0] <= 1, f"{comp}: against the whole comp, peak {worst[0]}/255 (frame {worst[1]}, of {len(frames)})")
+
+    print("A time-stretched layer moving as canvas_limit does, in comp time, has the same trail:")
+    for comp in STRETCHES:
+        worst = max((difference(load(label, comp, f), load(label, "canvas_limit", f))[0], f) for f in range(24))
+        report(worst[0] <= 1, f"{comp}: as the unstretched trail, peak {worst[0]}/255 (frame {worst[1]})")
+        # Every frame, since a frame reused from a render of a later one went wrong only on some.
+        worst = max((difference(load(label, comp + "_small", f), load(label, "canvas_limit_small", f))[0], f)
+                    for f in range(24))
+        report(worst[0] <= 1, f"{comp} on a small canvas: as the unstretched one, peak {worst[0]}/255 (frame {worst[1]})")
+    for comp in ("footage_trail", "footage_stretch"):
+        trail, layer = visible(load(label, comp, 60)), visible(load(label, "footage_reverse_plain", 60))
+        report(trail > layer, f"{comp}@60 has a trail: {trail} visible pixels against {layer} for a frame of the clip")
+    # A reversed layer's time runs backwards, and its trail goes back through the comp's earlier frames.
+    reversed_, plain = visible(load(label, "footage_reverse", 60)), visible(load(label, "footage_reverse_plain", 60))
+    report(reversed_ > plain * 1.05, f"footage_reverse@60 has a trail: {reversed_} visible pixels against {plain} bare")
+    fits = {o: max(difference(load(label, "footage_reverse", f), load(label, f"footage_reverse_ref_{o}", f))[0]
+                   for f in range(72)) for o in ("m1", "z0", "p1")}
+    best = min(fits, key=fits.get)
+    # Reversing the clip beforehand re-encodes it, which moves its pixels a little by itself, and Screen
+    # adds up those differences over the frames the trail holds. A frame out of step would be far more.
+    source = max(difference(load(label, "footage_reverse_plain", f), load(label, "footage_reverse_ref_plain", f))[0]
+                 for f in range(72))
+    report(fits[best] <= max(3 * source, 2), f"footage_reverse: as the clip reversed beforehand, peak {fits[best]}/255, "
+                                     f"against {source}/255 between the clips themselves (lined up {best}; {fits})")
+
     print("Edges: the dot's outline over its trail, in front of the dot:")
     for comp, least in (("edge_luminance", 40), ("edge_colour", 200)):
         im = load(label, comp, 1)
@@ -542,7 +595,7 @@ def cmd_perf(label):
             print(f"  window {lo}-{hi}: {len(q)} calls, median {statistics.median(p[1] for p in q):.2f} ms, "
                   f"median {statistics.median(p[2] for p in q)} checkouts")
     t = info["timing"]
-    print("  wall clock: " + ", ".join(f"{k} {t[k]:.1f}s" for k in ("trail", "perf_long", "limit_600", "perf_long_cold")))
+    print("  wall clock: " + ", ".join(f"{k} {t[k]:.1f}s" for k in ("trail", "perf_long", "limit_default", "perf_long_cold")))
 
 
 def summarize():

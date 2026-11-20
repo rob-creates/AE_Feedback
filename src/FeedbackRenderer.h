@@ -48,6 +48,10 @@ struct FrameParams
     int splitsInput; // all but In Front and Behind with sub-steps: each adds only its share of the input
     float frameAlpha; // the fades that share is worked out from, per frame and per sub-step
     float stepAlpha;
+    // How wide the blur's widest part may be, in pixels at the current resolution; 0 for half the
+    // canvas's longer side. It mustn't follow a canvas that follows the trail, or the blur would change
+    // with it.
+    float spreadWidest;
 };
 
 // x' = a x + b y + tx, y' = c x + d y + ty.
@@ -87,6 +91,10 @@ inline bool MovesTrail(const FrameParams& f)
     return f.moveX != 0.0f || f.moveY != 0.0f || f.linear[0] != 1.0f || f.linear[1] != 0.0f || f.linear[2] != 0.0f ||
            f.linear[3] != 1.0f;
 }
+
+// How far from what it blurs Spread of `width` (its sigma, in pixels), with its widest part at most
+// `widest`, still carries `invisible` of it: past that, even a whole frame of light adds less.
+float SpreadReach(float width, float widest, double invisible);
 
 // A radius covers about two sigma, the way most blur tools work. The canvas has to allow for what this
 // produces, so PreRender and the renderer share it.
@@ -170,6 +178,10 @@ public:
         const PlacedImage& input,
         int compositeMode);
 
+    // Queues a copy of a layer AE gave, `pitch` pixels a row, into a buffer of its own that outlives
+    // AE's. Nil if there's no memory for it.
+    id<MTLBuffer> copyPixels(StepBatch& batch, id<MTLBuffer> source, int pitch, int height);
+
     // With canvasFromOutput, each output pixel is looked up through it rather than by offset.
     bool copyOut(
         id<MTLCommandQueue> queue,
@@ -220,6 +232,7 @@ private:
         id<MTLComputeCommandEncoder> encoder,
         Pyramid& pyramid,
         const CanvasKey& canvas,
+        float widest,
         float widthX,
         float widthY,
         StepBatch& batch,

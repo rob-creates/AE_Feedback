@@ -47,7 +47,52 @@ struct CanvasKey
         return left == o.left && top == o.top && width == o.width && height == o.height && compatible(o);
     }
 
+    bool contains(const CanvasKey& o) const
+    {
+        return left <= o.left && top <= o.top && left + width >= o.left + o.width && top + height >= o.top + o.height;
+    }
+
     size_t bytes() const { return size_t(width) * size_t(height) * 16; }
+};
+
+// A layer as one render fetched it from AE, kept so that other renders can use it rather than ask AE
+// for it again. AE renders several frames at once, and each reads layers at moments the others read too.
+struct FetchKey
+{
+    uint64_t instance; // the effect, as EffectInstance tells them apart
+    int param;         // which of its layer controls
+    A_long value, step;
+    A_u_long scale; // the moment, exactly, and how long it lasts
+    PF_RationalScale downsampleX, downsampleY;
+    int quality, field, preserveRgb;
+    PF_LRect area; // what was asked for, in the layer's pixels
+
+    // The same layer at the same moment, however much of it.
+    bool sameSource(const FetchKey& o) const
+    {
+        // Moments are fractions, and the same one can come with different scales.
+        const auto same = [](A_long a, A_u_long as, A_long b, A_u_long bs)
+        { return __int128(a) * __int128(bs) == __int128(b) * __int128(as); };
+        return instance == o.instance && param == o.param && same(value, scale, o.value, o.scale) &&
+               same(step, scale, o.step, o.scale) && SameScale(downsampleX, o.downsampleX) &&
+               SameScale(downsampleY, o.downsampleY) && quality == o.quality && field == o.field &&
+               preserveRgb == o.preserveRgb;
+    }
+
+    // What was fetched for `o` would do for this: all of what this asks for is in it.
+    bool coveredBy(const FetchKey& o) const
+    {
+        return sameSource(o) && o.area.left <= area.left && o.area.top <= area.top && o.area.right >= area.right &&
+               o.area.bottom >= area.bottom;
+    }
+};
+
+// A copy of what AE gave: `rect` is where it sits, in the layer, and `pitch` is in pixels.
+struct FetchedPixels
+{
+    id<MTLBuffer> buffer;
+    PF_LRect rect;
+    int pitch, width, height;
 };
 
 class FeedbackCache
@@ -61,6 +106,7 @@ public:
         PF_State history;
         uint64_t motion;
         AEGP_TimeStamp made; // the project's timestamp when the image's inputs were read
+        A_long drawnFor;     // the frame whose canvas the image was drawn on, which may be later than its own
         id<MTLBuffer> buffer;
     };
 
@@ -73,12 +119,26 @@ public:
 
     // All images for this frame; the caller decides which, if any, matches the current history.
     std::vector<Candidate> candidates(const CanvasKey& key, A_long time);
+
+    // Fetched layers: all kept for this key, with the state of the project they were fetched in, for
+    // the caller to match against its own. Kept to a budget of their own, oldest-used dropped first.
+    struct FetchCandidate
+    {
+        PF_State state;
+        FetchedPixels pixels;
+    };
+    std::vector<FetchCandidate> fetchCandidates(const FetchKey& key);
+    void publishFetch(const FetchKey& key, const PF_State& state, const FetchedPixels& pixels);
+    // Says a render is fetching what `key` names, so others can fetch something else meanwhile rather
+    // than the same. False if another already is. Each true is followed by endFetch, kept or not.
+    bool beginFetch(const FetchKey& key);
+    void endFetch(const FetchKey& key);
     void touch(id<MTLBuffer> buffer);
 
     // Takes ownership of the buffer. Evicted buffers are dropped rather than recycled, because
     // a render further up the stack may still be reading them.
     void publish(const CanvasKey& key, A_long time, const PF_State& history, uint64_t motion, const AEGP_TimeStamp& made,
-                 id<MTLBuffer> buffer);
+                 A_long drawnFor, id<MTLBuffer> buffer);
 
     id<MTLBuffer> acquireScratch(size_t bytes);
     void releaseScratch(id<MTLBuffer> buffer);
@@ -91,6 +151,7 @@ private:
         PF_State history;
         uint64_t motion;
         AEGP_TimeStamp made;
+        A_long drawnFor;
         id<MTLBuffer> buffer;
         uint64_t lastUsed;
     };
@@ -105,4 +166,16 @@ private:
     std::vector<id<MTLBuffer>> mScratch;
     uint64_t mClock = 0;
     size_t mEntryBytes = 0;
+
+    struct FetchEntry
+    {
+        FetchKey key;
+        PF_State state;
+        FetchedPixels pixels;
+        uint64_t lastUsed;
+    };
+    std::vector<FetchEntry> mFetches; // guarded by mMutex
+    std::vector<FetchKey> mInFlight;  // guarded by mMutex
+    size_t mFetchBytes = 0;
+    size_t mFetchBudgetBytes;
 };

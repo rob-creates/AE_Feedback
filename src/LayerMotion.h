@@ -37,6 +37,9 @@ public:
     LayerMotion(PF_InData* in_data, PF_OutData* out_data, AEGP_LayerIDVal other = AEGP_LayerIDVal_NONE);
 
     bool usable() const { return mUsable; }
+    // Shape and text layers, and collapsed precomps. At reduced resolution AE sometimes gives their
+    // bounds at full scale.
+    bool drawnInComp() const { return mDrawnInComp; }
     A_long compWidth() const { return mCompWidth; }
     A_long compHeight() const { return mCompHeight; }
 

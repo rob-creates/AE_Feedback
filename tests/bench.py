@@ -13,7 +13,8 @@ import numpy as np
 
 from run_tests import LOG, OUT, read_tiff, render
 
-BENCHES = ["simple", "blur", "grade", "map", "trailmap", "sub", "add", "late", "full", "wander", "expr", "small"]
+BENCHES = ["simple", "blur", "grade", "map", "trailmap", "sub", "add", "late", "full", "wander", "expr", "small", "shape", "shape_sub", "user", "user_nosub", "user_flatmap", "user_nomap",
+           "user_static", "footage_in", "footage_stretch", "footage_map", "footage_map_static"]
 COPIES = 3
 LAST = 299
 
@@ -33,10 +34,10 @@ def prerender_ms(lines):
     return sum(float(m[1]) for m in map(lambda l: re.search(r"^prerender .*ms=([\d.]+)", l), lines) if m)
 
 
-def cmd_run(label):
+def cmd_run(label, *only):
     base = OUT / f"bench_{label}"
     results = {}
-    for name in BENCHES:
+    for name in (only or BENCHES):
         cold = []
         for copy in range(COPIES):
             start = LOG.stat().st_size

@@ -222,6 +222,9 @@
             find(comp(name).layer("dot").property("Effects").property(1), MAP_LAYER).setLayerInputStage(stage);
         }
         mapped("map_solid_opaque", redSolid, 4);
+        // The same, with Static Maps: a map that doesn't change reads once and gives the same trail.
+        mapped("map_static", redSolid, 4);
+        find(comp("map_static").layer("dot").property("Effects").property(1), "Static Maps").setValue(true);
         mapped("map_source_default", maskedSolid, 4); // left at Source, which ignores the mask
         mapped("map_solid_masked", maskedSolid, 4);
         setStage("map_solid_masked", -1);
@@ -232,11 +235,15 @@
         }, 1);
         setStage("map_effects", -1);
 
-        // Long trails, for PreRender cost and Pre-Roll Limit, at its default of 600 and set.
+        // Long trails, for PreRender cost and Pre-Roll Limit, at its default of 300 and set.
         var perf = newComp("perf_long", 300, 1920, 1080);
         var perfLayer = movingDot(perf, "dot", RED, 1920, 1080, [100, 100], [1800, 980], 60);
         feedback(perfLayer, { "Alpha Max": 0.98, "Sub-steps": 2 });
-        dotComp("limit_600", 700, { "Alpha Max": 1, "Limit Pre-Roll": true });
+        // Precision only sets how faint a rebuild lets the oldest frames get, below what each depth shows.
+        dotComp("precision_8", 96, { "Alpha Max": 0.9 });
+        dotComp("precision_16", 96, { "Alpha Max": 0.9, "Precision": 2 });
+        dotComp("precision_32", 96, { "Alpha Max": 0.9, "Precision": 3 });
+        dotComp("limit_default", 700, { "Alpha Max": 1, "Limit Pre-Roll": true });
         dotComp("limit_800", 700, { "Alpha Max": 1, "Limit Pre-Roll": true, "Pre-Roll Limit (Frames)": 800 });
         dotComp("limit_100", 300, { "Alpha Max": 1, "Limit Pre-Roll": true, "Pre-Roll Limit (Frames)": 100 });
         // With Limit Pre-Roll off, as it is by default, jumping to a frame rebuilds the whole trail.
@@ -354,6 +361,60 @@
         limitedDot.property("Position").setValueAtTime(0, [60, 120]);
         limitedDot.property("Position").setValueAtTime(limited.duration, [580, 240]);
         feedback(limitedDot, { "Alpha Max": 0.9 });
+
+        // The same path, with the layer's time stretched: slowed ten times and sped up four times.
+        // Keyframes are set after the stretch, in comp time, so the dot moves as it does above.
+        // run_tests.py renders these with the canvas held small too. (Reversed is tried on footage
+        // below: a reversed solid shows nothing in AE, with or without the effect.)
+        var stretches = { stretch_1000: 1000, stretch_25: 25 };
+        for (var sname in stretches) {
+            var sc = newComp(sname, 24);
+            var sdot = sc.layers.addSolid(RED, "dot", 30, 30, 1, sc.duration * 20);
+            sdot.stretch = stretches[sname];
+            sdot.inPoint = 0;
+            sdot.outPoint = sc.duration;
+            sdot.property("Position").setValueAtTime(0, [60, 120]);
+            sdot.property("Position").setValueAtTime(sc.duration, [580, 240]);
+            feedback(sdot, { "Alpha Max": 0.9 });
+        }
+
+        // Keyed footage, from make_footage.sh, as it plays and slowed four times by stretching.
+        var clip = app.project.importFile(new ImportOptions(new File(OUT + "/clips/small.mov")));
+        var footageStretch = { footage_trail: 100, footage_stretch: 400 };
+        for (var fname in footageStretch) {
+            var fc = newComp(fname, 72);
+            var fl = fc.layers.add(clip);
+            fl.stretch = footageStretch[fname];
+            fl.inPoint = 0;
+            fl.outPoint = fc.duration;
+            feedback(fl, { "Alpha Max": 0.9, "Composite": 4 });
+        }
+        // Reversed, and beside it bare: a reversed layer plays back from its start time, which is at the
+        // clip's end, and its in point comes after its out point.
+        for (var bare = 0; bare < 2; bare++) {
+            var rc = newComp("footage_reverse" + (bare ? "_plain" : ""), 72);
+            var rl = rc.layers.add(clip);
+            rl.stretch = -100;
+            rl.startTime = clip.duration;
+            if (!bare) feedback(rl, { "Alpha Max": 0.9, "Composite": 4 });
+        }
+        // What it should look like: the clip reversed beforehand, played forward, with its trail. AE can
+        // round a reversed layer's frames either way, so a frame early and a frame late too.
+        var reversedClip = app.project.importFile(new ImportOptions(new File(OUT + "/clips/small_reversed.mov")));
+        var offsets = { m1: -1, z0: 0, p1: 1 };
+        for (var oname in offsets) {
+            var oc = newComp("footage_reverse_ref_" + oname, 72);
+            var ol = oc.layers.add(reversedClip);
+            ol.startTime = offsets[oname] / FPS;
+            ol.inPoint = 0;
+            ol.outPoint = oc.duration;
+            feedback(ol, { "Alpha Max": 0.9, "Composite": 4 });
+        }
+        // And bare, to measure how far reversing the clip beforehand changed its pixels.
+        var bareRef = newComp("footage_reverse_ref_plain", 72);
+        var bl = bareRef.layers.add(reversedClip);
+        bl.inPoint = 0;
+        bl.outPoint = bareRef.duration;
 
         // Blur Mask Layer scales the blur by its luminance: black blurs nothing, white the whole radius, and a
         // white map over the left half alone blurs only there. Beside the same dot unblurred and blurred.

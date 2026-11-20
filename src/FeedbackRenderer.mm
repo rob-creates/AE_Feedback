@@ -115,6 +115,33 @@ std::vector<SpreadPart> SpreadParts(float width, float widest)
     return parts;
 }
 
+float SpreadReachIn(float width, float widest, double invisible)
+{
+    if (width <= 0.0f)
+        return 0.0f;
+    const std::vector<SpreadPart> parts = SpreadParts(width, widest);
+    // What lies further than r from the centre, of each Gaussian in the plane, weighed.
+    const auto beyond = [&](double r)
+    {
+        double t = 0.0;
+        for (const SpreadPart& part : parts)
+        {
+            const double s = double(part.sigma) * double(width);
+            t += double(part.weight) * std::exp(-r * r / (2.0 * s * s));
+        }
+        return t;
+    };
+    double lo = 0.0, hi = std::max(double(width), 1.0);
+    while (beyond(hi) > invisible && hi < 1e7)
+        hi *= 2.0;
+    for (int i = 0; i < 40; i++)
+    {
+        const double mid = 0.5 * (lo + hi);
+        (beyond(mid) > invisible ? lo : hi) = mid;
+    }
+    return float(hi);
+}
+
 // Describes a map for a kernel: a placed layer, or else the trail itself, and returns its buffer.
 id<MTLBuffer> FillMap(MapLookup& m, const PlacedImage& image, int source, id<MTLBuffer> trail, int width, int height)
 {
@@ -194,6 +221,12 @@ CompositeParams MakeCompositeParams(const CanvasKey& canvas, const PlacedImage& 
 }
 } // namespace
 
+float SpreadReach(float width, float widest, double invisible)
+{
+    return SpreadReachIn(width, widest, invisible);
+}
+
+
 std::unique_ptr<FeedbackRenderer> FeedbackRenderer::create(id<MTLDevice> device, id<MTLLibrary> library)
 {
     std::unique_ptr<FeedbackRenderer> r(new FeedbackRenderer());
@@ -238,6 +271,22 @@ id<MTLBuffer> FeedbackRenderer::acquireForBatch(StepBatch& batch, size_t bytes)
     if (!buffer)
         batch.failed = true;
     return buffer;
+}
+
+id<MTLBuffer> FeedbackRenderer::copyPixels(StepBatch& batch, id<MTLBuffer> source, int pitch, int height)
+{
+    const size_t bytes = size_t(pitch) * size_t(height) * 16;
+    if (!source || bytes == 0 || source.length < bytes)
+        return nil;
+    id<MTLBuffer> copy = [source.device newBufferWithLength:bytes options:MTLResourceStorageModePrivate];
+    if (!copy)
+        return nil;
+    if (!batch.commands)
+        batch.commands = [batch.queue commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [batch.commands blitCommandEncoder];
+    [blit copyFromBuffer:source sourceOffset:0 toBuffer:copy destinationOffset:0 size:bytes];
+    [blit endEncoding];
+    return copy;
 }
 
 bool FeedbackRenderer::flush(StepBatch& batch)
@@ -334,14 +383,16 @@ id<MTLBuffer> FeedbackRenderer::encodeSpread(
     id<MTLComputeCommandEncoder> encoder,
     Pyramid& pyramid,
     const CanvasKey& canvas,
+    float widestGiven,
     float widthX,
     float widthY,
     StepBatch& batch,
     std::vector<id<MTLBuffer>>& scratch)
 {
     const float width = std::max(widthX, widthY);
-    // Nothing is worth spreading further than across the canvas.
-    const float widest = std::max(float(std::max(canvas.width, canvas.height)) * 0.5f, 4.0f * width);
+    // Nothing is worth spreading further than across the canvas, or the comp the canvas lies in.
+    const float across = widestGiven > 0.0f ? widestGiven : float(std::max(canvas.width, canvas.height)) * 0.5f;
+    const float widest = std::max(across, 4.0f * width);
 
     // Each part blurred at its own size, gathered by size from the smallest.
     std::map<int, std::vector<std::pair<SmallBlur, float>>, std::greater<int>> bySize;
@@ -512,7 +563,7 @@ id<MTLBuffer> FeedbackRenderer::step(
     {
         if (std::max(sigmaX, sigmaY) * share < kMinSigma)
             return current;
-        return encodeSpread(encoder, pyramid, canvas, sigmaX * share, sigmaY * share, batch, scratch);
+        return encodeSpread(encoder, pyramid, canvas, f.spreadWidest, sigmaX * share, sigmaY * share, batch, scratch);
     };
     // A layer with nothing there blurs nothing, as black would.
     const bool blurMapMissing = blurSource == MAP_LAYER && !blurMap.buffer;

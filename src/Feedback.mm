@@ -105,6 +105,8 @@ enum
     PARAM_INPUT_GROUP_START,
     PARAM_UPDATE,
     PARAM_SUBSTEPS,
+    PARAM_PRECISION,
+    PARAM_STATIC_MAPS,
     PARAM_LIMIT_PREROLL,
     PARAM_PREROLL_LIMIT,
     PARAM_INPUT_GROUP_END,
@@ -117,7 +119,7 @@ enum
 // Blur Type popup, and 54 to Update Every (Frames), and they mustn't be reused.
 const int kDiskIds[PARAM_COUNT] = {0, 1, 27, 2, 26, 55, 28, 29, 3, 51, 30, 4, 5, 6, 7, 8, 9, 56, 10, 11,
                                     12, 13, 14, 57, 15, 31, 32, 47, 45, 35, 46, 36, 58, 37, 16, 18, 19, 20, 21, 22,
-                                    59, 23, 38, 39, 41, 40, 61, 42, 60, 43, 52, 62, 24, 49, 25, 53};
+                                    59, 23, 38, 39, 41, 40, 61, 42, 60, 43, 52, 62, 24, 63, 64, 49, 25, 53};
 
 int DiskId(int param)
 {
@@ -126,10 +128,10 @@ int DiskId(int param)
 
 const int kMaxSubsteps = 15;
 
-// Jumping to a frame replays no more than this many frames, so older trail is missing until playback
-// passes through it. Playing forward carries the whole trail along in one image, so this doesn't
-// shorten it. By default, Alpha Max 0.99 has all but faded out by the limit.
-const int kDefaultPreRollLimit = 600;
+// With Limit Pre-Roll on, jumping to a frame replays no more than this many frames, so older trail is
+// missing until playback passes through it. Playing forward carries the whole trail along in one
+// image, so this doesn't shorten it. By default, Alpha Max 0.98 has all but faded out by the limit.
+const int kDefaultPreRollLimit = 300;
 const int kLongestPreRollLimit = 100000;
 
 // Limits on the canvas, at full resolution for the spread and as actual pixels for the side. These
@@ -143,8 +145,27 @@ const A_long kMaxCanvasSide = 8192;
 const double kCompMargin = 64.0;
 const int kCanvasSnapBits = 6;
 
-// A rebuild starts where earlier frames have faded below this, about half an 8-bit level.
-const double kInvisibleContribution = 0.002;
+// Precision: a rebuild starts where earlier frames have faded below half a level at that depth, so
+// they can't change what's seen. 32-bit float has no levels; there it's float's own precision.
+enum
+{
+    PRECISION_8_BIT = 1,
+    PRECISION_16_BIT,
+    PRECISION_32_BIT_FLOAT,
+};
+
+double InvisibleContribution(int precision)
+{
+    switch (precision)
+    {
+    case PRECISION_16_BIT:
+        return 0.5 / 32768.0;
+    case PRECISION_32_BIT_FLOAT:
+        return 1.0 / 16777216.0;
+    default:
+        return 0.002; // as before the control, a shade over half an 8-bit level
+    }
+}
 
 // A rebuild keeps its last few frames, so scrubbing or caching backwards can resume from them
 // instead of rebuilding again.
@@ -249,18 +270,31 @@ public:
 
 const size_t kMaxFactRuns = 8;
 
+// A layer's pixels at a moment either come from another render that fetched them (`shared`), or are
+// checked out from AE and, if `keep`, copied and kept for other renders under `key` and `state`.
+struct FetchTag
+{
+    FetchKey key{};
+    PF_State state{};
+    FetchedPixels shared{};
+    bool keep = false;
+    bool tagged = false; // key and state are known, so it can be looked for and kept
+};
+
 struct SubstepCheckout
 {
     SampleTime time;
     bool updates; // whether the layer goes into the trail at this moment
     A_long inputId;
     PF_LRect inputRect; // empty if there's no input to use
+    FetchTag inputFetch;
     Projective layerToComp; // with the trail in comp space: where the layer is at this moment
     struct Map
     {
         A_long id;
         PF_LRect rect; // empty if there's no map to fetch
         Projective toComp; // and where its layer is
+        FetchTag fetch;
     } maps[SLOT_COUNT];
 };
 
@@ -295,10 +329,20 @@ struct PreRenderData
     int samplesPerStep; // the frame's own moment plus any sub-steps
     bool updates = true; // whether the layer goes into the trail at the moment shown
 
+    // FrameParams::spreadWidest: in comp space, half the longer side of the comp and its margin, as the
+    // canvas was before it followed the trail. In the layer, from the canvas, as before.
+    float spreadWidest = 0.0f;
+
+    // With Static Maps, every step reads the maps checked out once, at staticMapTime.
+    bool staticMaps = false;
+    SubstepCheckout::Map staticMap[SLOT_COUNT]{};
+    SampleTime staticMapTime{};
+
     // AE only hands out the output after an input has been checked out, so this always is, even
     // when the layer is empty or the frame needs no computing.
     A_long currentInputId;
     PF_LRect currentInputRect;
+    FetchTag currentInputFetch; // AE always gives it, but other renders' rebuilds can use it
 
     std::vector<FrameCheckout> frames; // the frames to compute: [k] is k frames before grid.last
     // Between frames, the part of a step from grid.last to the moment asked for, with the current input.
@@ -353,6 +397,12 @@ bool MakeSampleTime(PF_InData* in_data, A_long frameTime, A_long step, int subst
 // Fingerprints of where the layer went, for comp-space trails: for a frame, the frames that can still
 // be seen in it, from `window` frames back. Each frame's reading and each sum is kept, and a frame next
 // to one already summed only adds and takes away the ends, so asking for a run of frames is cheap.
+// Whether `a` comes before `b` in the comp, for a layer whose time moves `step` a frame.
+inline bool Before(A_long a, A_long b, A_long step)
+{
+    return step > 0 ? a < b : a > b;
+}
+
 class MotionPrints
 {
 public:
@@ -377,18 +427,18 @@ public:
         if (aligned(time) && later != mSums.end() && aligned(time + mStep))
         {
             sum = later->second - frame(time + mStep);
-            if (oldest(time) < oldest(time + mStep))
+            if (Before(oldest(time), oldest(time + mStep), mStep))
                 sum += frame(oldest(time));
         }
         else if (aligned(time) && earlier != mSums.end() && aligned(time - mStep))
         {
             sum = earlier->second + frame(time);
-            if (oldest(time) > oldest(time - mStep))
+            if (Before(oldest(time - mStep), oldest(time), mStep))
                 sum -= frame(oldest(time - mStep));
         }
         else
         {
-            for (A_long t = oldest(time); t <= time; t += mStep)
+            for (A_long t = oldest(time); !Before(time, t, mStep); t += mStep)
                 sum += frame(t);
         }
         mSums.emplace(time, sum);
@@ -396,9 +446,13 @@ public:
     }
 
 private:
-    A_long oldest(A_long time) const { return std::max(mFirst, time - mWindow * mStep); }
+    A_long oldest(A_long time) const
+    {
+        const A_long back = time - mWindow * mStep;
+        return Before(back, mFirst, mStep) ? mFirst : back;
+    }
     // Whether the frames summed for `time` fall on its own steps, so a neighbour's differ only at the ends.
-    bool aligned(A_long time) const { return mStep > 0 && (time - oldest(time)) % mStep == 0; }
+    bool aligned(A_long time) const { return mStep != 0 && (time - oldest(time)) % mStep == 0; }
 
     uint64_t frame(A_long t)
     {
@@ -473,7 +527,9 @@ bool MakeSampleTime(PF_InData* in_data, A_long frameTime, A_long step, int subst
     const long long subStep = step * multiple / substeps;
     const long long value = frameTime * multiple - substepsBefore * subStep;
     const long long scale = (long long)in_data->time_scale * multiple;
-    const long long duration = std::min<long long>(subStep, (long long)in_data->time_step * multiple);
+    // As short as either, in whichever direction the layer's time runs.
+    const long long frameStep = (long long)in_data->time_step * multiple;
+    const long long duration = std::llabs(subStep) < std::llabs(frameStep) ? subStep : frameStep;
     if (value > INT_MAX || value < INT_MIN || scale > INT_MAX || duration > INT_MAX)
         return false;
     *out = SampleTime{A_long(value), A_long(duration), A_u_long(scale)};
@@ -491,6 +547,15 @@ bool ReadHistory(PF_InData* in_data, const PF_ParamUtilsSuite3& utils, A_long en
     A_Time duration = {endExclusive, static_cast<A_u_long>(in_data->time_scale)};
     return utils.PF_GetCurrentState(in_data->effect_ref, PF_ParamIndex_CHECK_ALL, &start, &duration, state) ==
            PF_Err_NONE;
+}
+
+// Where the history a frame at `time` depends on ends. A trail runs back through the comp's earlier
+// frames, which in a time-reversed layer (a negative step) are later in its own time, up to where the
+// trail starts. There the history read runs from 0 to just past the start, whatever the frame: more
+// than it needs, but it can't miss anything.
+A_long HistoryEnd(A_long time, A_long step, A_long firstTime)
+{
+    return step > 0 ? time + step : firstTime - step;
 }
 
 struct ParamReader
@@ -954,6 +1019,15 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
     AEFX_CLR_STRUCT(def);
     PF_ADD_CHECKBOXX("Update", TRUE, 0, DiskId(PARAM_UPDATE));
     fixedInteger("Sub-steps", 0, kMaxSubsteps, kMaxSubsteps, 0, PARAM_SUBSTEPS);
+    // How faint older frames may get before a rebuild leaves them out: below what the depth can show.
+    AEFX_CLR_STRUCT(def);
+    def.flags = PF_ParamFlag_CANNOT_TIME_VARY;
+    PF_ADD_POPUP("Precision", 3, PRECISION_8_BIT, "8 bit|16 bit|32 bit float", DiskId(PARAM_PRECISION));
+    // On, each map layer is read once, at the frame shown, and used for the whole trail: far quicker,
+    // and right for maps that don't change. An animated map then looks different depending on which
+    // frame the trail was rebuilt from.
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_CHECKBOXX("Static Maps", FALSE, PF_ParamFlag_CANNOT_TIME_VARY, DiskId(PARAM_STATIC_MAPS));
     // Off, jumping to a frame recalculates the whole trail before it, however long that takes. On, only
     // the last Pre-Roll Limit frames are, which is quicker but can show a shorter trail.
     AEFX_CLR_STRUCT(def);
@@ -1010,6 +1084,43 @@ PF_Err GPUDeviceSetdown(PF_GPUDeviceSetdownExtra* extra)
     }
     return PF_Err_NONE;
 }
+
+// Where a rectangle goes under a move: the box around its corners. False if a corner has no place.
+bool MovedBounds(const Projective& move, const PF_LRect& r, PF_LRect* out)
+{
+    double lo[2] = {1e18, 1e18}, hi[2] = {-1e18, -1e18};
+    for (A_long x : {r.left, r.right})
+        for (A_long y : {r.top, r.bottom})
+        {
+            double p[2];
+            if (!move.apply(double(x), double(y), &p[0], &p[1]))
+                return false;
+            for (int i = 0; i < 2; i++)
+            {
+                lo[i] = std::min(lo[i], p[i]);
+                hi[i] = std::max(hi[i], p[i]);
+            }
+        }
+    const auto clampLong = [](double v) { return A_long(std::clamp(v, -1e8, 1e8)); };
+    *out = PF_LRect{clampLong(std::floor(lo[0])), clampLong(std::floor(lo[1])), clampLong(std::ceil(hi[0])),
+                    clampLong(std::ceil(hi[1]))};
+    return true;
+}
+
+#ifdef FEEDBACK_LOG
+// Tests turn this on to render as before the canvas followed a comp-space trail and maps were read only
+// over the canvas, to check that doing so changes nothing.
+bool WholeCanvas()
+{
+    static const bool whole = getenv("FEEDBACK_WHOLE_CANVAS") != nullptr;
+    return whole;
+}
+#else
+bool WholeCanvas()
+{
+    return false;
+}
+#endif
 
 inline PF_LRect Union(const PF_LRect& a, const PF_LRect& b)
 {
@@ -1083,6 +1194,80 @@ PF_Err CheckoutWholeLayer(
     return err;
 }
 
+// What PreRender needs to find layers other renders have fetched. Inactive, everything is checked out.
+struct FetchContext
+{
+    const PF_ParamUtilsSuite3* utils = nullptr;
+    FeedbackCache* cache = nullptr;
+    uint64_t instance = 0;
+
+    bool active() const { return utils && cache && instance; }
+};
+
+// What a layer fetched at a moment is kept under. False if AE can't say what state it's in.
+bool MakeFetchTag(PF_InData* in_data, const PF_RenderRequest& request, const FetchContext& fetch, int param,
+                  const SampleTime& time, const PF_LRect& area, FetchTag* tag)
+{
+    *tag = FetchTag{};
+    if (!fetch.active())
+        return false;
+    tag->key = FetchKey{fetch.instance,
+                        param,
+                        time.value,
+                        time.step,
+                        time.scale,
+                        in_data->downsample_x,
+                        in_data->downsample_y,
+                        int(in_data->quality),
+                        int(request.field),
+                        int(request.preserve_rgb_of_zero_alpha),
+                        area};
+    // Everything the effect reads over that moment, as AE sees it, layers included.
+    A_Time start{time.value, time.scale}, duration{std::max<A_long>(std::abs(time.step), 1), time.scale};
+    tag->keep = fetch.utils->PF_GetCurrentState(in_data->effect_ref, PF_ParamIndex_CHECK_ALL, &start, &duration,
+                                                &tag->state) == PF_Err_NONE;
+    tag->tagged = tag->keep;
+    return tag->keep;
+}
+
+// Far bigger than any layer, so this asks for the whole layer whatever its bounds are in this call.
+const A_long kAnyLayer = 1000000;
+const PF_LRect kWholeLayer{-kAnyLayer, -kAnyLayer, kAnyLayer, kAnyLayer};
+
+// Checks out `area` of a layer at a moment, unless another render has fetched it, unchanged since.
+PF_Err CheckoutOrShare(
+    PF_InData* in_data,
+    PF_PreRenderExtra* extra,
+    const PF_RenderRequest& request,
+    const FetchContext& fetch,
+    int param,
+    const SampleTime& time,
+    const PF_LRect& area,
+    A_long id,
+    PF_LRect* rect,
+    FetchTag* tag)
+{
+    if (MakeFetchTag(in_data, request, fetch, param, time, area, tag))
+    {
+        for (const auto& candidate : fetch.cache->fetchCandidates(tag->key))
+        {
+            A_Boolean same = 0;
+            fetch.utils->PF_AreStatesIdentical(in_data->effect_ref, &candidate.state, &tag->state, &same);
+            if (same)
+            {
+                tag->shared = candidate.pixels;
+                tag->keep = false;
+                *rect = candidate.pixels.rect;
+                return PF_Err_NONE;
+            }
+        }
+    }
+    PF_CheckoutResult result;
+    const PF_Err err = CheckoutLayer(in_data, extra, request, area, param, time, id, &result);
+    *rect = result.result_rect;
+    return err;
+}
+
 // Where a comp-space trail's layer went up to a frame; null for trails kept in the layer.
 using MotionAt = std::function<uint64_t(A_long)>;
 
@@ -1100,12 +1285,18 @@ StillCurrent MakeStillCurrent(MotionAt motion, const CompWatch* watch, A_long st
     };
 }
 
-// Finds the image for `time`, if one exists whose history is still current.
+// Finds the image for `time`, if one exists whose history is still current, for a render of `now`.
+// An image drawn for a later frame sits on that frame's canvas, which follows the trail further on: a
+// canvas held below the trail's size leaves out the older end that this frame's canvas still has, so
+// such an image is used only if its canvas covers this one. An earlier frame's canvas is behind, where
+// the trail is, and is used as before. Later means further along `step`, which runs backwards in a
+// time-reversed layer.
 id<MTLBuffer> FindCached(
     PF_InData* in_data,
     const PF_ParamUtilsSuite3& utils,
     FeedbackCache& cache,
     const CanvasKey& canvas,
+    A_long now,
     A_long time,
     A_long step,
     const StillCurrent& current,
@@ -1113,13 +1304,14 @@ id<MTLBuffer> FindCached(
 {
     const auto candidates = cache.candidates(canvas, time);
     PF_State history;
-    if (candidates.empty() || !ReadHistory(in_data, utils, time + step, &history))
+    if (candidates.empty() || !ReadHistory(in_data, utils, HistoryEnd(time, step, canvas.firstTime), &history))
         return nil;
     for (const auto& candidate : candidates)
     {
         A_Boolean same = 0;
         utils.PF_AreStatesIdentical(in_data->effect_ref, &candidate.history, &history, &same);
-        if (same && current(candidate, time))
+        const bool drawnLater = (step > 0 && candidate.drawnFor > now) || (step < 0 && candidate.drawnFor < now);
+        if (same && current(candidate, time) && (!drawnLater || candidate.key.contains(canvas)))
         {
             cache.touch(candidate.buffer);
             *imageCanvas = candidate.key;
@@ -1145,7 +1337,7 @@ int FindResume(
 {
     for (int k = 0; k < frames; k++)
     {
-        *image = FindCached(in_data, utils, cache, canvas, now - k * step, step, current, imageCanvas);
+        *image = FindCached(in_data, utils, cache, canvas, now, now - k * step, step, current, imageCanvas);
         if (*image)
             return k;
     }
@@ -1433,6 +1625,20 @@ A_long TrailStart(PF_InData* in_data, PF_OutData* out_data)
         if (face->AEGP_GetEffectLayer(in_data->effect_ref, &layer) || !layer ||
             layers->AEGP_GetLayerInPoint(layer, AEGP_LTimeMode_LayerTime, &inPoint) || !inPoint.scale)
             return 0;
+        // Reversed, AE's in point is the layer's later end in the comp, where its own time is 0. Its trail
+        // starts at the other end, the in point plus its duration, which is negative.
+        A_Ratio stretch{};
+        A_Time compIn{}, length{}, compStart{}, atStart{};
+        if (!layers->AEGP_GetLayerStretch(layer, &stretch) && stretch.num < 0 && stretch.den != 0 &&
+            !layers->AEGP_GetLayerInPoint(layer, AEGP_LTimeMode_CompTime, &compIn) && compIn.scale &&
+            !layers->AEGP_GetLayerDuration(layer, AEGP_LTimeMode_CompTime, &length) && length.scale)
+        {
+            const double start = std::min(double(compIn.value) / compIn.scale,
+                                          double(compIn.value) / compIn.scale + double(length.value) / length.scale);
+            compStart = A_Time{A_long(std::lround(start * compIn.scale)), compIn.scale};
+            if (!layers->AEGP_ConvertCompToLayerTime(layer, &compStart, &atStart) && atStart.scale)
+                return A_long(std::lround(double(atStart.value) * in_data->time_scale / atStart.scale));
+        }
         const double time = double(inPoint.value) * in_data->time_scale / inPoint.scale;
         return std::max<A_long>(A_long(std::lround(time)), 0);
     }
@@ -1467,19 +1673,20 @@ TrailGrid FindGrid(PF_InData* in_data, PF_OutData* out_data)
         const double seconds = double(at.value) / at.scale;
         const double compPerEffect = double(later.value) / later.scale - seconds;
         const double frameSeconds = double(frame.value) / frame.scale;
-        if (compPerEffect <= 1e-9)
+        // Negative where the layer's time runs backwards, and its steps are then negative too.
+        if (std::abs(compPerEffect) <= 1e-9)
             return grid;
         const double exact = frameSeconds / compPerEffect * scale;
         const A_long step = A_long(std::lround(exact));
-        if (step <= 0 || std::abs(exact - double(step)) > 0.01)
+        if (step == 0 || std::abs(exact - double(step)) > 0.01)
             return grid;
         // AE rounds the moments it asks for, so one within a unit or so of a frame is that frame.
         const double frames = seconds / frameSeconds;
-        const double whole = std::floor(frames + 1.5 / exact);
+        const double whole = std::floor(frames + 1.5 / std::abs(exact));
         const A_long back = A_long(std::lround((frames - whole) * exact));
         grid.step = step;
         grid.last = now - back;
-        grid.share = back > 1 ? float(double(back) / double(step)) : 0.0f;
+        grid.share = std::abs(back) > 1 ? float(double(back) / double(step)) : 0.0f;
         return grid;
     }
     catch (...)
@@ -1513,10 +1720,11 @@ void KeepFacts(
     FrameFactsMemo& memo,
     const RunView& view,
     const TrailGrid& grid,
+    A_long firstTime,
     TrailWalk& walk)
 {
     FrameFactsMemo::Run& run = *view.run;
-    A_long endExclusive = grid.last + grid.step;
+    A_long endExclusive = HistoryEnd(grid.last, grid.step, firstTime);
     {
         std::lock_guard<std::mutex> guard(memo.lock);
         if (walk.read.empty() && endExclusive <= run.endExclusive)
@@ -1524,7 +1732,7 @@ void KeepFacts(
         endExclusive = std::max(endExclusive, run.endExclusive);
     }
     for (const auto& [time, facts] : walk.read)
-        endExclusive = std::max(endExclusive, time + grid.step);
+        endExclusive = std::max(endExclusive, HistoryEnd(time, grid.step, firstTime));
 
     PF_State history;
     const bool readable = ReadHistory(in_data, utils, endExclusive, &history);
@@ -1569,8 +1777,12 @@ PF_Err WalkTrail(
     const TrailGrid& grid,
     int samplesPerStep,
     int preRollLimit,
+    double invisible,
     const MapSources& sources,
     A_long firstTime,
+    const std::function<PF_LRect(const SampleFacts&)>& toCanvas,
+    bool capSpread,
+    float spreadWidest,
     A_long* nextId,
     TrailWalk* walk)
 {
@@ -1579,10 +1791,14 @@ PF_Err WalkTrail(
     const A_long step = grid.step;
     const float scaleX = ScaleValue(in_data->downsample_x);
     const float scaleY = ScaleValue(in_data->downsample_y);
-    const A_long framesBefore = step > 0 ? std::max<A_long>((now - firstTime) / step, 0) : 0;
+    const A_long framesBefore = step != 0 ? std::max<A_long>((now - firstTime) / step, 0) : 0;
 
     double remaining = 1.0;
     float shiftX = 0.0f, shiftY = 0.0f;
+    // With spreadWidest, the blur's reach is worked out from its widths, which add frame by frame, to
+    // where what it carries is below `invisible`. Its widest part, applied frame after frame, widens
+    // as the square root of their number.
+    float spreadX = 0.0f, spreadY = 0.0f, blurReachX = 0.0f, blurReachY = 0.0f;
     bool oldest = false;
     // Transform can carry the trail anywhere, and working out where exactly is fragile. So while it moves,
     // the canvas is the layer's own rectangle, plus wherever its input reaches beyond that, and the
@@ -1618,18 +1834,20 @@ PF_Err WalkTrail(
         // does one where an Alpha mask is dark.
         if (facts.edgeSize <= 0.0f && sources[SLOT_ALPHA_MASK] == MAP_NONE)
             remaining *= facts.alpha;
-        oldest = remaining < kInvisibleContribution || k >= framesBefore;
+        oldest = remaining < invisible || k >= framesBefore;
 
         // The oldest frame in the window starts from blank, so only its final moment is used.
         const size_t firstSample = oldest ? facts.samples.size() - 1 : 0;
         bool hasFrameArea = false, hasMap = false;
-        PF_LRect frameArea{};
+        PF_LRect frameArea{}, frameInLayer{};
         for (size_t i = firstSample; i < facts.samples.size(); i++)
         {
             const SampleFacts& sample = facts.samples[i];
             if (!IsEmpty(sample.inputRect))
             {
-                frameArea = hasFrameArea ? Union(frameArea, sample.inputRect) : sample.inputRect;
+                const PF_LRect placed = toCanvas(sample);
+                frameArea = hasFrameArea ? Union(frameArea, placed) : placed;
+                frameInLayer = hasFrameArea ? Union(frameInLayer, sample.inputRect) : sample.inputRect;
                 hasFrameArea = true;
                 if (!walk->hasProbe)
                 {
@@ -1642,9 +1860,20 @@ PF_Err WalkTrail(
 
         const float sigmaX = BlurSigma(facts.blurRadius) * scaleX;
         const float sigmaY = BlurSigma(facts.blurRadius) * scaleY;
-        // The blur's reach adds up frame by frame. What its tails carry further is too faint to keep.
-        shiftX += kSpreadReach * sigmaX;
-        shiftY += kSpreadReach * sigmaY;
+        if (spreadWidest > 0.0f)
+        {
+            spreadX += sigmaX;
+            spreadY += sigmaY;
+            const float widest = spreadWidest * std::sqrt(float(k + 1));
+            blurReachX = SpreadReach(spreadX, widest, invisible);
+            blurReachY = SpreadReach(spreadY, widest, invisible);
+        }
+        else
+        {
+            // The blur's reach adds up frame by frame. What its tails carry further is too faint to keep.
+            blurReachX += kSpreadReach * sigmaX;
+            blurReachY += kSpreadReach * sigmaY;
+        }
         if (sources[SLOT_DISPLACE] == MAP_TRAIL || hasMap)
         {
             shiftX += std::abs(facts.amountX) * scaleX;
@@ -1656,12 +1885,12 @@ PF_Err WalkTrail(
 
         if (hasFrameArea)
         {
-            layerArea = Union(layerArea, frameArea);
+            layerArea = Union(layerArea, frameInLayer);
 
             // How far the blur, displacement and edges reach, plus a pixel for displacement's filtering.
-            const float limitX = kMaxSpread * scaleX, limitY = kMaxSpread * scaleY;
-            const A_long padX = A_long(std::ceil(std::min(shiftX, limitX))) + 1;
-            const A_long padY = A_long(std::ceil(std::min(shiftY, limitY))) + 1;
+            const float limitX = capSpread ? kMaxSpread * scaleX : 1e8f, limitY = capSpread ? kMaxSpread * scaleY : 1e8f;
+            const A_long padX = A_long(std::ceil(std::min(shiftX + blurReachX, limitX))) + 1;
+            const A_long padY = A_long(std::ceil(std::min(shiftY + blurReachY, limitY))) + 1;
             frameArea.left -= padX;
             frameArea.top -= padY;
             frameArea.right += padX;
@@ -1751,10 +1980,15 @@ void SnapCanvas(const TrailWalk& walk, PF_LRect* area)
 }
 
 // Requests the map layers' pixels at a sample's moment.
+// What of each map layer a step reads, in its own pixels: the part over the canvas.
+using MapArea = std::function<PF_LRect(int slot, const SampleTime& time)>;
+
 PF_Err CheckOutMaps(
     PF_InData* in_data,
     PF_PreRenderExtra* extra,
     const PF_RenderRequest& request,
+    const FetchContext& fetch,
+    const MapArea& mapArea,
     const SampleFacts& sample,
     A_long* nextId,
     SubstepCheckout* sub)
@@ -1765,7 +1999,8 @@ PF_Err CheckOutMaps(
         {
             SubstepCheckout::Map& map = sub->maps[slot];
             map.id = (*nextId)++;
-            ERR(CheckoutWholeLayer(in_data, extra, request, kMapParams[slot], sample.time, map.id, &map.rect));
+            ERR(CheckoutOrShare(in_data, extra, request, fetch, kMapParams[slot], sample.time, mapArea(slot, sample.time),
+                                map.id, &map.rect, &map.fetch));
         }
     return err;
 }
@@ -1775,6 +2010,8 @@ PF_Err CheckOutFrames(
     PF_InData* in_data,
     PF_PreRenderExtra* extra,
     const PF_RenderRequest& request,
+    const FetchContext& fetch,
+    const MapArea& mapArea,
     const TrailWalk& walk,
     int frames,
     A_long* nextId,
@@ -1806,9 +2043,13 @@ PF_Err CheckOutFrames(
             else if (!IsEmpty(sample.inputRect))
             {
                 sub.inputId = (*nextId)++;
-                ERR(CheckoutWholeLayer(in_data, extra, request, PARAM_INPUT, sample.time, sub.inputId, &sub.inputRect));
+                ERR(CheckoutOrShare(in_data, extra, request, fetch, PARAM_INPUT, sample.time, kWholeLayer, sub.inputId,
+                                    &sub.inputRect, &sub.inputFetch));
             }
-            ERR(CheckOutMaps(in_data, extra, request, sample, nextId, &sub));
+            if (data->staticMaps)
+                std::copy(std::begin(data->staticMap), std::end(data->staticMap), sub.maps);
+            else
+                ERR(CheckOutMaps(in_data, extra, request, fetch, mapArea, sample, nextId, &sub));
             frame.substeps.push_back(sub);
         }
         data->frames.push_back(std::move(frame));
@@ -1834,7 +2075,7 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
     {
         PF_State history;
         // AE requires this call on every PreRender. With no earlier frames, the zeroed state goes in.
-        ReadHistory(in_data, utils, now, &history);
+        ReadHistory(in_data, utils, step > 0 ? now : HistoryEnd(now, step, firstTime), &history);
         ERR(extra->cb->GuidMixInPtr(in_data->effect_ref, sizeof(history), &history));
 
         // Trimming changes the trail, which the history doesn't show.
@@ -1882,9 +2123,12 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
     else
     {
         int preRollLimit = INT_MAX; // unlimited, as Limit Pre-Roll is by default
+        double invisible = InvisibleContribution(PRECISION_8_BIT);
         {
             ParamReader r{in_data, FrameSample(in_data, now)};
             data->samplesPerStep = r.integer(PARAM_SUBSTEPS) + 1;
+            invisible = InvisibleContribution(r.popup(PARAM_PRECISION));
+            data->staticMaps = r.checkbox(PARAM_STATIC_MAPS);
             if (r.checkbox(PARAM_LIMIT_PREROLL))
                 preRollLimit = r.integer(PARAM_PREROLL_LIMIT);
             ERR(r.err);
@@ -1933,22 +2177,53 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
         if (!err)
             view = FindFacts(in_data, extra, request, utils, metal->memo, factsKey, &nextId, &err);
 
+        // Where each moment's input lands on the canvas: in the layer, where it is; in comp space, where
+        // the layer was in the comp then. A layer AE draws in comp space can come with its bounds at full
+        // scale at reduced resolution, so both readings are covered.
+        const double resolutionX = ScaleValue(in_data->downsample_x), resolutionY = ScaleValue(in_data->downsample_y);
+        const PF_LRect compBox{A_long(std::floor(-kCompMargin * resolutionX)), A_long(std::floor(-kCompMargin * resolutionY)),
+                               A_long(std::ceil((motion.compWidth() + kCompMargin) * resolutionX)),
+                               A_long(std::ceil((motion.compHeight() + kCompMargin) * resolutionY))};
+        const auto toCanvas = [&](const SampleFacts& sample) -> PF_LRect
+        {
+            if (!data->canvas.compSpace || IsEmpty(sample.inputRect))
+                return sample.inputRect;
+            Projective toComp;
+            PF_LRect placed;
+            if (!motion.layerToComp(sample.time.value, sample.time.scale, &toComp) ||
+                !MovedBounds(AtResolution(toComp, in_data), sample.inputRect, &placed))
+                return compBox;
+            if (motion.drawnInComp() && (resolutionX != 1.0 || resolutionY != 1.0))
+            {
+                const PF_LRect& r = sample.inputRect;
+                const PF_LRect reduced{A_long(std::floor(r.left * resolutionX)), A_long(std::floor(r.top * resolutionY)),
+                                       A_long(std::ceil(r.right * resolutionX)), A_long(std::ceil(r.bottom * resolutionY))};
+                PF_LRect other;
+                if (!MovedBounds(AtResolution(toComp, in_data), reduced, &other))
+                    return compBox;
+                placed = Union(placed, other);
+            }
+            return placed;
+        };
+
         TrailWalk walk;
         if (!err)
-            ERR(WalkTrail(
-                in_data, extra, request, metal->memo, view, grid, data->samplesPerStep, preRollLimit, data->sources,
-                firstTime, &nextId, &walk));
+            ERR(WalkTrail(in_data, extra, request, metal->memo, view, grid, data->samplesPerStep, preRollLimit, invisible,
+                          data->sources, firstTime, toCanvas, !data->canvas.compSpace,
+                          data->canvas.compSpace ? float(std::max(compBox.right - compBox.left, compBox.bottom - compBox.top)) * 0.5f
+                                                 : 0.0f,
+                          &nextId, &walk));
 
         // A failed walk keeps nothing, as what it read may not match any history.
         if (!err)
-            KeepFacts(in_data, utils, metal->memo, view, grid, walk);
+            KeepFacts(in_data, utils, metal->memo, view, grid, firstTime, walk);
 
         // Between frames, the layer at the moment asked for goes over the trail, which needs room for it.
         FrameFacts betweenFacts{};
         if (!err && grid.between())
         {
             ERR(ReadFrameFacts(in_data, extra, request, now, grid.step, 1, data->sources, &nextId, &betweenFacts));
-            const PF_LRect own = err ? PF_LRect{} : betweenFacts.samples.back().inputRect;
+            const PF_LRect own = err ? PF_LRect{} : toCanvas(betweenFacts.samples.back());
             if (!walk.limited && !IsEmpty(own))
             {
                 walk.area = walk.hasArea ? Union(walk.area, own) : own;
@@ -1961,13 +2236,14 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
         SnapCanvas(walk, &area);
         LimitCanvas(&area, walk.focusX, walk.focusY, pixelLimit);
         if (data->canvas.compSpace)
+            data->spreadWidest = float(std::max(compBox.right - compBox.left, compBox.bottom - compBox.top)) * 0.5f;
+        if (data->canvas.compSpace)
         {
-            // The comp and a margin, the same for every frame. What drifts further out is dropped.
-            const double sx = ScaleValue(in_data->downsample_x), sy = ScaleValue(in_data->downsample_y);
-            area.left = A_long(std::floor(-kCompMargin * sx));
-            area.top = A_long(std::floor(-kCompMargin * sy));
-            area.right = A_long(std::ceil((motion.compWidth() + kCompMargin) * sx));
-            area.bottom = A_long(std::ceil((motion.compHeight() + kCompMargin) * sy));
+            // Where the trail can be, within the comp and a margin: what drifts further out is dropped.
+            // While Transform moves the trail, which can carry it anywhere, the whole of that.
+            const double sx = resolutionX, sy = resolutionY;
+            const PF_LRect fitted = walk.hasArea && !walk.limited && !WholeCanvas() ? Intersect(area, compBox) : PF_LRect{};
+            area = IsEmpty(fitted) ? compBox : fitted;
             // A comp too large to hold keeps the part around the layer, as it is now.
             Projective toComp;
             double focusX = 0.5 * (area.left + area.right), focusY = 0.5 * (area.top + area.bottom);
@@ -1992,11 +2268,37 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
         data->canvas.downsampleY = in_data->downsample_y;
         data->canvas.firstTime = firstTime;
 
+        // A step reads a map only over the canvas, so AE renders no more of it than that. In the layer,
+        // the canvas's own pixels; in comp space, the canvas taken back to where the map layer is then,
+        // or where this one is if that can't be read. Two pixels more each way for filtering.
+        const PF_LRect canvasRect{area.left - 2, area.top - 2, area.right + 2, area.bottom + 2};
+        const MapArea mapArea = [&](int slot, const SampleTime& time) -> PF_LRect
+        {
+            if (WholeCanvas())
+                return kWholeLayer;
+            if (!data->canvas.compSpace)
+                return canvasRect;
+            Projective toComp, fromComp;
+            const bool known = mapMotions[slot] ? mapMotions[slot]->layerToComp(time.value, time.scale, &toComp)
+                                                : motion.layerToComp(time.value, time.scale, &toComp);
+            PF_LRect seen;
+            if (!known || !AtResolution(toComp, in_data).inverse(&fromComp) || !MovedBounds(fromComp, canvasRect, &seen))
+                return kWholeLayer;
+            return PF_LRect{seen.left - 2, seen.top - 2, seen.right + 2, seen.bottom + 2};
+        };
+
         if (!err)
         {
             const SampleFacts& own = grid.between() ? betweenFacts.samples.back() : walk.window[0]->samples.back();
             data->updates = own.updates;
             ERR(CheckoutWholeLayer(in_data, extra, request, PARAM_INPUT, own.time, data->currentInputId, &data->currentInputRect));
+            if (data->staticMaps)
+            {
+                SubstepCheckout once{};
+                ERR(CheckOutMaps(in_data, extra, request, FetchContext{}, mapArea, own, &nextId, &once));
+                std::copy(std::begin(once.maps), std::end(once.maps), data->staticMap);
+                data->staticMapTime = own.time;
+            }
         }
 
         // With the trail in comp space, the output is the layer's view of the comp, around the layer.
@@ -2022,6 +2324,17 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             data->outputRect = extra->output->result_rect;
         }
 
+        // Layers other renders have fetched at the moments needed are used rather than fetched again.
+        // Static Maps fetches its maps once a render, at a moment no other frame needs. Not on an
+        // adjustment layer: its input is what's beneath it, which AE's state doesn't follow.
+        const FetchContext fetchContext{&utils, &metal->renderer->cache(),
+                                        data->watchesComp ? 0 : EffectInstance(in_data, out_data)};
+        if (!err)
+        {
+            const SampleFacts& own = grid.between() ? betweenFacts.samples.back() : walk.window[0]->samples.back();
+            MakeFetchTag(in_data, request, fetchContext, PARAM_INPUT, own.time, kWholeLayer, &data->currentInputFetch);
+        }
+
         // Only frames newer than the newest usable image need their pixels.
         int resumeK = -1;
         if (!err)
@@ -2030,8 +2343,8 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             resumeK = FindResume(
                 in_data, utils, metal->renderer->cache(), data->canvas, grid.last, grid.step, int(walk.window.size()),
                 current, &data->resumeImage, &data->resumeCanvas);
-            ERR(CheckOutFrames(
-                in_data, extra, request, walk, resumeK >= 0 ? resumeK : int(walk.window.size()), &nextId, data.get()));
+            ERR(CheckOutFrames(in_data, extra, request, fetchContext, mapArea, walk, resumeK >= 0 ? resumeK : int(walk.window.size()),
+                               &nextId, data.get()));
         }
         if (!err && grid.between())
         {
@@ -2042,7 +2355,10 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             sub.inputId = data->currentInputId;
             if (sample.updates)
                 sub.inputRect = data->currentInputRect;
-            ERR(CheckOutMaps(in_data, extra, request, sample, &nextId, &sub));
+            if (data->staticMaps)
+                std::copy(std::begin(data->staticMap), std::end(data->staticMap), sub.maps);
+            else
+                ERR(CheckOutMaps(in_data, extra, request, fetchContext, mapArea, sample, &nextId, &sub));
             data->between = sub;
         }
         // Where the layer is at each moment to be computed, and what each frame's image is kept with.
@@ -2054,8 +2370,9 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             {
                 SubstepCheckout::Map& map = sub.maps[slot];
                 map.toComp = sub.layerToComp;
+                const SampleTime& at = data->staticMaps ? data->staticMapTime : sub.time;
                 if (!err && mapMotions[slot] && !IsEmpty(map.rect) &&
-                    !mapMotions[slot]->layerToComp(sub.time.value, sub.time.scale, &map.toComp))
+                    !mapMotions[slot]->layerToComp(at.value, at.scale, &map.toComp))
                     err = PF_Err_INTERNAL_STRUCT_DAMAGED;
             }
         };
@@ -2118,11 +2435,56 @@ struct GpuRender
 
     StepBatch batch;
     std::vector<A_long> checkedOut; // what the queued steps read, which AE must keep until they've run
+    PF_EffectWorld* staticMaps[SLOT_COUNT] = {}; // with Static Maps, checked out once and in at the end
+
+    // Fetched layers copied for other renders, kept once the batch that copies them has run.
+    struct Kept
+    {
+        FetchKey key;
+        PF_State state;
+        FetchedPixels pixels;
+    };
+    std::vector<Kept> keep;
+
+    // Fetched ahead, newest first, by FetchTag; and what the lookups need.
+    std::map<const FetchTag*, FetchedPixels> prefetched;
+    const PF_ParamUtilsSuite3* utils = nullptr;
+
+    // Pixels for a tag that this render fetched ahead, or another render has kept since PreRender looked.
+    bool found(const FetchTag& tag, FetchedPixels* pixels)
+    {
+        if (tag.shared.buffer)
+        {
+            *pixels = tag.shared;
+            shared++;
+            return true;
+        }
+        auto ahead = prefetched.find(&tag);
+        if (ahead != prefetched.end())
+        {
+            *pixels = ahead->second;
+            return true;
+        }
+        if (!tag.tagged || !utils)
+            return false;
+        for (const auto& candidate : renderer.cache().fetchCandidates(tag.key))
+        {
+            A_Boolean same = 0;
+            utils->PF_AreStatesIdentical(in_data->effect_ref, &candidate.state, &tag.state, &same);
+            if (same)
+            {
+                *pixels = candidate.pixels;
+                shared++;
+                return true;
+            }
+        }
+        return false;
+    }
     int queuedSteps = 0;
 
     // Timings for the log.
-    int fetched = 0;
-    double fetchMs = 0.0, gpuMs = 0.0;
+    int fetched = 0, mapsFetched = 0, shared = 0;
+    double fetchMs = 0.0, mapMs = 0.0, gpuMs = 0.0; // fetchMs includes mapMs
 
     // Reads a checked-out world as a placed image. A missing world means nothing there, not failure.
     PF_Err place(PF_EffectWorld* world, const PF_LRect& rect, PlacedImage* image) const
@@ -2148,6 +2510,32 @@ struct GpuRender
         }
         return e;
     }
+
+    // Places pixels another render fetched, or this one kept.
+    PlacedImage placeShared(const FetchedPixels& pixels) const
+    {
+        PlacedImage image{};
+        image.buffer = pixels.buffer;
+        image.pitch = pixels.pitch;
+        image.offsetX = pixels.rect.left - data.canvas.left;
+        image.offsetY = pixels.rect.top - data.canvas.top;
+        image.width = pixels.width;
+        image.height = pixels.height;
+        return image;
+    }
+
+    // Copies what AE gave into a buffer of this effect's own, in the batch, and uses that instead, so
+    // other renders can have it once the batch has run.
+    void keepFetched(const FetchTag& tag, const PF_LRect& rect, PlacedImage* image)
+    {
+        if (!tag.keep || !image->buffer)
+            return;
+        id<MTLBuffer> copy = renderer.copyPixels(batch, image->buffer, image->pitch, image->height);
+        if (!copy)
+            return;
+        image->buffer = copy;
+        keep.push_back({tag.key, tag.state, FetchedPixels{copy, rect, image->pitch, image->width, image->height}});
+    }
 };
 
 double MsSince(std::chrono::steady_clock::time_point t)
@@ -2161,6 +2549,10 @@ PF_Err FlushSteps(GpuRender& render)
     auto start = std::chrono::steady_clock::now();
     const bool ok = render.renderer.flush(render.batch);
     render.gpuMs += MsSince(start);
+    if (ok)
+        for (const auto& k : render.keep)
+            render.renderer.cache().publishFetch(k.key, k.state, k.pixels);
+    render.keep.clear();
     for (A_long id : render.checkedOut)
         render.extra->cb->checkin_layer_pixels(render.in_data->effect_ref, id);
     render.checkedOut.clear();
@@ -2188,37 +2580,75 @@ PF_Err ComputeSample(
     FrameParams params{};
     if (!err)
         params = DivideIntoSteps(ReadFrameParams(in_data, sub.time, &err), share, frameEnd);
+    params.spreadWidest = render.data.spreadWidest;
     std::copy(render.data.sources.begin(), render.data.sources.end(), params.sources);
 
     auto fetchStart = std::chrono::steady_clock::now();
     // With Update off, the layer adds nothing, as if it were empty.
     PF_EffectWorld* inputWorld = isCurrent && sub.updates ? render.currentInput : nullptr;
-    if (!err && !isCurrent && !IsEmpty(sub.inputRect))
+    FetchedPixels sharedInput{}, sharedMaps[SLOT_COUNT]{};
+    const bool inputShared = !isCurrent && !IsEmpty(sub.inputRect) && render.found(sub.inputFetch, &sharedInput);
+    bool mapShared[SLOT_COUNT] = {};
+    for (int slot = 0; slot < SLOT_COUNT; slot++)
+        mapShared[slot] = !IsEmpty(sub.maps[slot].rect) && render.found(sub.maps[slot].fetch, &sharedMaps[slot]);
+    if (!err && !isCurrent && !IsEmpty(sub.inputRect) && !inputShared)
     {
         ERR(extra->cb->checkout_layer_pixels(in_data->effect_ref, sub.inputId, &inputWorld));
         render.fetched++;
     }
     PF_EffectWorld* mapWorlds[SLOT_COUNT] = {};
+    auto mapStart = std::chrono::steady_clock::now();
     for (int slot = 0; !err && slot < SLOT_COUNT; slot++)
-        if (!IsEmpty(sub.maps[slot].rect))
+        if (!IsEmpty(sub.maps[slot].rect) && !mapShared[slot])
+        {
+            if (render.data.staticMaps && render.staticMaps[slot])
+            {
+                mapWorlds[slot] = render.staticMaps[slot];
+                continue;
+            }
             ERR(extra->cb->checkout_layer_pixels(in_data->effect_ref, sub.maps[slot].id, &mapWorlds[slot]));
+            render.mapsFetched++;
+            if (render.data.staticMaps)
+                render.staticMaps[slot] = mapWorlds[slot];
+        }
+    render.mapMs += MsSince(mapStart);
     render.fetchMs += MsSince(fetchStart);
 
     PlacedImage input{}, maps[SLOT_COUNT]{};
-    if (!err)
+    if (!err && inputShared)
+        input = render.placeShared(sharedInput);
+    else if (!err)
+    {
         ERR(render.place(inputWorld, sub.inputRect, &input));
+        if (!err)
+            render.keepFetched(isCurrent ? render.data.currentInputFetch : sub.inputFetch, sub.inputRect, &input);
+    }
     for (int slot = 0; !err && slot < SLOT_COUNT; slot++)
+    {
+        if (mapShared[slot])
+        {
+            maps[slot] = render.placeShared(sharedMaps[slot]);
+            continue;
+        }
         ERR(render.place(mapWorlds[slot], sub.maps[slot].rect, &maps[slot]));
+        if (!err)
+            render.keepFetched(sub.maps[slot].fetch, sub.maps[slot].rect, &maps[slot]);
+    }
 
     // In comp space, the input and maps are where their layers are at this moment, and Centre goes with it.
+    // Pixels another render fetched cover what it asked for, which can be more than this one did.
     if (!err && render.data.canvas.compSpace)
     {
         const CanvasKey& canvas = render.data.canvas;
-        if (input.buffer && !WarpOntoCanvas(&input, sub.layerToComp, sub.inputRect, canvas, in_data))
+        const PF_LRect& inputRect = inputShared ? sharedInput.rect : sub.inputRect;
+        if (input.buffer && !WarpOntoCanvas(&input, sub.layerToComp, inputRect, canvas, in_data))
             err = PF_Err_INTERNAL_STRUCT_DAMAGED;
         for (int slot = 0; !err && slot < SLOT_COUNT; slot++)
-            if (maps[slot].buffer && !WarpOntoCanvas(&maps[slot], sub.maps[slot].toComp, sub.maps[slot].rect, canvas, in_data))
+        {
+            const PF_LRect& mapRect = mapShared[slot] ? sharedMaps[slot].rect : sub.maps[slot].rect;
+            if (maps[slot].buffer && !WarpOntoCanvas(&maps[slot], sub.maps[slot].toComp, mapRect, canvas, in_data))
                 err = PF_Err_INTERNAL_STRUCT_DAMAGED;
+        }
 
         const Projective toComp = AtResolution(sub.layerToComp, in_data);
         double centreX, centreY;
@@ -2240,8 +2670,134 @@ PF_Err ComputeSample(
     if (!isCurrent && inputWorld)
         render.checkedOut.push_back(sub.inputId);
     for (int slot = 0; slot < SLOT_COUNT; slot++)
-        if (mapWorlds[slot])
+        if (mapWorlds[slot] && !render.data.staticMaps)
             render.checkedOut.push_back(sub.maps[slot].id);
+    return err;
+}
+
+// How many of the newest frames a render fetches before computing any.
+const int kFramesFetchedAhead = 8;
+
+// Fetches the layers for the newest `frames` frames to compute, newest first, before any are
+// computed, which needs the oldest first. AE renders several frames at once, which would otherwise
+// fetch the same moments at the same time; this way each fetches its own newest moment while the
+// render of the frame before fetches the one before that, and finds it kept when it gets there. A
+// moment another render is fetching is left until last, and fetched here only if it still isn't kept.
+// Each is copied and handed straight back to AE.
+PF_Err FetchAhead(GpuRender& render, int frames, bool startsBlank)
+{
+    PF_Err err = PF_Err_NONE;
+    PF_InData* in_data = render.in_data;
+    const PreRenderData& data = render.data;
+    FeedbackCache& cache = render.renderer.cache();
+
+    struct Need
+    {
+        const FetchTag* tag;
+        A_long id;
+        PF_LRect rect;
+        bool map;
+    };
+    std::vector<Need> needs;
+    for (int k = 0; k < frames && k < int(data.frames.size()); k++)
+    {
+        const FrameCheckout& frame = data.frames[size_t(k)];
+        for (int s = int(frame.substeps.size()) - 1; s >= 0; s--)
+        {
+            const SubstepCheckout& sub = frame.substeps[size_t(s)];
+            const bool isCurrent = k == 0 && s == int(frame.substeps.size()) - 1 && !data.between;
+            // A rebuild from blank skips steps until there's an input; their maps aren't needed.
+            if (startsBlank && IsEmpty(sub.inputRect) && !isCurrent)
+                continue;
+            const auto add = [&](const FetchTag& tag, A_long id, const PF_LRect& rect, bool map)
+            {
+                if (tag.tagged && !tag.shared.buffer && !IsEmpty(rect))
+                    needs.push_back({&tag, id, rect, map});
+            };
+            if (!isCurrent)
+                add(sub.inputFetch, sub.inputId, sub.inputRect, false);
+            if (!data.staticMaps)
+                for (int slot = 0; slot < SLOT_COUNT; slot++)
+                    add(sub.maps[slot].fetch, sub.maps[slot].id, sub.maps[slot].rect, true);
+        }
+    }
+
+    const auto fetchOne = [&](const Need& need) -> PF_Err
+    {
+        PF_Err e = PF_Err_NONE;
+        const auto started = std::chrono::steady_clock::now();
+        PF_EffectWorld* world = nullptr;
+        e = render.extra->cb->checkout_layer_pixels(in_data->effect_ref, need.id, &world);
+        const double ms = MsSince(started);
+        render.fetchMs += ms;
+        if (need.map)
+        {
+            render.mapMs += ms;
+            render.mapsFetched++;
+        }
+        else
+            render.fetched++;
+        PlacedImage placed{};
+        if (!e && world)
+            e = render.place(world, need.rect, &placed);
+        if (!e && placed.buffer)
+        {
+            StepBatch copying{render.queue, nil, {}};
+            id<MTLBuffer> copy = render.renderer.copyPixels(copying, placed.buffer, placed.pitch, placed.height);
+            if (copy && render.renderer.flush(copying))
+            {
+                const FetchedPixels pixels{copy, need.rect, placed.pitch, placed.width, placed.height};
+                cache.publishFetch(need.tag->key, need.tag->state, pixels);
+                render.prefetched[need.tag] = pixels;
+            }
+        }
+        // Copied, or not worth keeping: either way AE can have it back now. If the copy failed, the
+        // step fetches it again.
+        if (world)
+            render.extra->cb->checkin_layer_pixels(in_data->effect_ref, need.id);
+        return e;
+    };
+
+    std::vector<Need> later;
+    for (const Need& need : needs)
+    {
+        ERR(PF_ABORT(in_data));
+        if (err)
+            return err;
+        FetchedPixels pixels;
+        if (render.found(*need.tag, &pixels))
+        {
+            render.prefetched[need.tag] = pixels;
+            continue;
+        }
+        if (!cache.beginFetch(need.tag->key))
+        {
+            later.push_back(need);
+            continue;
+        }
+        err = fetchOne(need);
+        cache.endFetch(need.tag->key);
+        if (err)
+            return err;
+    }
+    for (const Need& need : later)
+    {
+        ERR(PF_ABORT(in_data));
+        if (err)
+            return err;
+        FetchedPixels pixels;
+        if (render.found(*need.tag, &pixels))
+        {
+            render.prefetched[need.tag] = pixels;
+            continue;
+        }
+        const bool mine = cache.beginFetch(need.tag->key);
+        err = fetchOne(need);
+        if (mine)
+            cache.endFetch(need.tag->key);
+        if (err)
+            return err;
+    }
     return err;
 }
 
@@ -2345,7 +2901,7 @@ PF_Err RenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* 
             {
                 // [k] is k frames before the current one.
                 const auto& frames = data->frames;
-                if (step > 0 && !frames.empty() && (frames.front().time - t) % step == 0)
+                if (step != 0 && !frames.empty() && (frames.front().time - t) % step == 0)
                 {
                     const A_long k = (frames.front().time - t) / step;
                     if (k >= 0 && k < A_long(frames.size()) && frames[size_t(k)].time == t)
@@ -2378,6 +2934,10 @@ PF_Err RenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* 
             if (!image)
                 err = PF_Err_INTERNAL_STRUCT_DAMAGED;
         }
+
+        render.utils = &utils;
+        if (!err && resumeK > 0)
+            ERR(FetchAhead(render, std::min(resumeK, kFramesFetchedAhead), image == nil));
 
         for (int k = resumeK - 1; !err && k >= 0; k--)
         {
@@ -2422,12 +2982,13 @@ PF_Err RenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* 
             // Keep only the frames most likely to be asked for next; the rest of a long rebuild
             // would otherwise push useful images out of the cache.
             PF_State history;
-            if (image && k < kRebuildFramesKept && ReadHistory(in_data, utils, frame.time + step, &history))
+            if (image && k < kRebuildFramesKept &&
+                ReadHistory(in_data, utils, HistoryEnd(frame.time, step, canvas.firstTime), &history))
             {
                 ERR(FlushSteps(render));
                 if (!err)
                 {
-                    cache.publish(canvas, frame.time, history, frame.motion, data->made, image);
+                    cache.publish(canvas, frame.time, history, frame.motion, data->made, data->grid.last, image);
                     imageIsScratch = false;
                 }
             }
@@ -2462,10 +3023,14 @@ PF_Err RenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* 
 
         if (imageIsScratch)
             cache.releaseScratch(image);
+        // Every step has run by now, so the maps they shared can go back.
+        for (int slot = 0; slot < SLOT_COUNT; slot++)
+            if (render.staticMaps[slot])
+                extra->cb->checkin_layer_pixels(in_data->effect_ref, data->staticMap[slot].id);
         extra->cb->checkin_layer_pixels(in_data->effect_ref, data->currentInputId);
     }
 
-    Log("frame=%d computed=%d samples=%d fetched=%d fetchMs=%.1f gpuMs=%.1f %dx%d out=%dx%d took=%.1fms err=%d",
+    Log("frame=%d computed=%d samples=%d fetched=%d fetchMs=%.1f gpuMs=%.1f %dx%d out=%dx%d took=%.1fms err=%d maps=%d mapMs=%.1f shared=%d",
         step > 0 ? in_data->current_time / step : 0,
         framesComputed,
         data->samplesPerStep,
@@ -2477,7 +3042,10 @@ PF_Err RenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* 
         data->outputRect.right - data->outputRect.left,
         data->outputRect.bottom - data->outputRect.top,
         MsSince(startTime),
-        err);
+        err,
+        render.mapsFetched,
+        render.mapMs,
+        render.shared);
     return err;
 }
 

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 
 namespace
 {
@@ -26,6 +27,9 @@ FeedbackCache::FeedbackCache(id<MTLDevice> device)
 {
     const size_t usable = size_t(device.recommendedMaxWorkingSetSize);
     mBudgetBytes = std::min(kMostBudgetBytes, usable / kBudgetShare);
+    // Enough for the moments a few frames rendered at once share. Kept small: it comes on top of the
+    // trail's images, and memory the GPU pages to and from slows everything down.
+    mFetchBudgetBytes = mBudgetBytes / 4;
     mCanvasPixelLimit =
         std::clamp(usable / kStepShare / (kStepCanvases * 16), kLeastCanvasPixels, kMostCanvasPixels);
 #ifdef FEEDBACK_LOG
@@ -41,7 +45,7 @@ std::vector<FeedbackCache::Candidate> FeedbackCache::candidates(const CanvasKey&
     std::vector<Candidate> out;
     for (const Entry& e : mEntries)
         if (e.time == time && e.key.compatible(key))
-            out.push_back({e.key, e.history, e.motion, e.made, e.buffer});
+            out.push_back({e.key, e.history, e.motion, e.made, e.drawnFor, e.buffer});
     return out;
 }
 
@@ -55,10 +59,10 @@ void FeedbackCache::touch(id<MTLBuffer> buffer)
 
 void FeedbackCache::publish(
     const CanvasKey& key, A_long time, const PF_State& history, uint64_t motion, const AEGP_TimeStamp& made,
-    id<MTLBuffer> buffer)
+    A_long drawnFor, id<MTLBuffer> buffer)
 {
     std::lock_guard<std::mutex> lock(mMutex);
-    mEntries.push_back({key, time, history, motion, made, buffer, ++mClock});
+    mEntries.push_back({key, time, history, motion, made, drawnFor, buffer, ++mClock});
     mEntryBytes += buffer.length;
     evictLocked();
 }
@@ -106,4 +110,64 @@ void FeedbackCache::releaseScratch(id<MTLBuffer> buffer)
     mScratch.push_back(buffer);
     if (mScratch.size() > kMaxScratchBuffers)
         mScratch.erase(mScratch.begin());
+}
+
+std::vector<FeedbackCache::FetchCandidate> FeedbackCache::fetchCandidates(const FetchKey& key)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    std::vector<FetchCandidate> out;
+    for (FetchEntry& e : mFetches)
+        if (key.coveredBy(e.key))
+        {
+            e.lastUsed = ++mClock;
+            out.push_back({e.state, e.pixels});
+        }
+    return out;
+}
+
+void FeedbackCache::publishFetch(const FetchKey& key, const PF_State& state, const FetchedPixels& pixels)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    // Another render may have kept the same already. Only to save memory, so comparing bytes is enough.
+    for (const FetchEntry& e : mFetches)
+        if (key.coveredBy(e.key) && memcmp(&e.state, &state, sizeof(state)) == 0)
+            return;
+    mFetches.push_back({key, state, pixels, ++mClock});
+    mFetchBytes += pixels.buffer.length;
+    while (mFetchBytes > mFetchBudgetBytes && !mFetches.empty())
+    {
+        auto oldest = std::min_element(mFetches.begin(), mFetches.end(),
+                                       [](const FetchEntry& a, const FetchEntry& b) { return a.lastUsed < b.lastUsed; });
+        mFetchBytes -= oldest->pixels.buffer.length;
+        mFetches.erase(oldest);
+    }
+}
+
+namespace
+{
+bool SameFetch(const FetchKey& a, const FetchKey& b)
+{
+    return a.coveredBy(b) && b.coveredBy(a);
+}
+} // namespace
+
+bool FeedbackCache::beginFetch(const FetchKey& key)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    for (const FetchKey& k : mInFlight)
+        if (SameFetch(k, key))
+            return false;
+    mInFlight.push_back(key);
+    return true;
+}
+
+void FeedbackCache::endFetch(const FetchKey& key)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    for (auto it = mInFlight.begin(); it != mInFlight.end(); ++it)
+        if (SameFetch(*it, key))
+        {
+            mInFlight.erase(it);
+            return;
+        }
 }

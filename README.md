@@ -25,11 +25,21 @@ Feedback Effect for Adobe After Effects
 - Transform's Scale goes down to 0, which shrinks the whole trail away in a single frame.
 - The trail moves on once per frame of the comp its layer is in. Nested in a comp at another frame
   rate, or stretched, it still looks as it does in its own comp at those frames, and between them it
-  goes part of the way to the next.
+  goes part of the way to the next. A time-reversed layer leaves its trail through the comp's earlier
+  frames too.
 - Jumping to a frame recalculates the whole trail before it, so the trail is always complete, though a
   long one that never fades takes a while. Turn on Limit Pre-Roll to recalculate only the last
-  Pre-Roll Limit frames instead: quicker, but a long trail can look shorter after a jump. Playing
-  forward keeps the full trail either way.
+  Pre-Roll Limit frames instead (300 by default): quicker, but a long trail can look shorter after a
+  jump. Playing forward keeps the full trail either way.
+- Precision, under Input, sets how faint the oldest frames may get before recalculating leaves them
+  out: below what 8 bit, 16 bit or 32 bit float can show. 8 bit is quickest, and right for most work;
+  a deeper setting recalculates further back, for a project at that depth.
+- Static Maps, under Input, reads each map and mask layer once, at the frame shown, for the whole
+  trail. That's far quicker, and right for maps that don't change. An animated map then looks
+  different depending on which frame the trail was recalculated from.
+- Work is kept to where the trail can be: a small layer's trail is worked on, and its maps read, only
+  around it. Blur, large displacement and Transform can carry a trail anywhere, so with those it
+  covers the whole comp, as before.
 
 ## Building
 

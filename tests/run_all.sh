@@ -20,6 +20,7 @@ if ! built=$(cmake --build "$ROOT/Build" -j8 2>&1); then
 fi
 
 cd "$HERE"
+./make_footage.sh >/dev/null || { echo "Couldn't make the test footage"; exit 2; }
 : > $LOG
 rm -rf out/live "out/$LABEL"
 mkdir -p out/live
