@@ -167,28 +167,39 @@ inline float4 catmullRom(float t)
 // negative weights sharpen, which keeps a trail moved by fractions of a pixel far crisper than
 // bilinear, but they also overshoot at edges, and fed back step after step that would build up into
 // bright and dark fringes. Held to what the nearest pixels span, it can't add any.
+// As tap, but `inside` says the pixel is known to be in the image, so it needn't be checked.
+inline float4 texel(device const float4* src, int pitch, int w, int h, int2 i, bool straight, bool inside)
+{
+    if (!inside)
+        return tap(src, pitch, w, h, i, straight);
+    float4 v = src[i.y * pitch + i.x];
+    if (straight)
+        v.xyz *= v.w;
+    return v;
+}
+
 inline float4 bicubicPremultiplied(device const float4* src, int pitch, int w, int h, float2 pos, bool straight)
 {
     const int2 i0 = int2(floor(pos));
     const float2 f = pos - float2(i0);
     const float4 wx = catmullRom(f.x), wy = catmullRom(f.y);
-    float4 sum = float4(0.0), lo = float4(INFINITY), hi = float4(-INFINITY);
+    // Most of the image is far enough from its border that none of the 4x4 needs checking.
+    const bool inside = i0.x >= 1 && i0.y >= 1 && i0.x + 2 < w && i0.y + 2 < h;
+    float4 sum = float4(0.0);
     for (int j = 0; j < 4; j++)
     {
-        float4 row = float4(0.0);
-        for (int k = 0; k < 4; k++)
-        {
-            const float4 v = tap(src, pitch, w, h, i0 + int2(k - 1, j - 1), straight);
-            row += wx[k] * v;
-            if ((k == 1 || k == 2) && (j == 1 || j == 2))
-            {
-                lo = min(lo, v);
-                hi = max(hi, v);
-            }
-        }
+        const int y = i0.y + j - 1;
+        const float4 row = wx[0] * texel(src, pitch, w, h, int2(i0.x - 1, y), straight, inside) +
+                           wx[1] * texel(src, pitch, w, h, int2(i0.x, y), straight, inside) +
+                           wx[2] * texel(src, pitch, w, h, int2(i0.x + 1, y), straight, inside) +
+                           wx[3] * texel(src, pitch, w, h, int2(i0.x + 2, y), straight, inside);
         sum += wy[j] * row;
     }
-    return clamp(sum, lo, hi);
+    const float4 a = texel(src, pitch, w, h, i0, straight, inside);
+    const float4 b = texel(src, pitch, w, h, i0 + int2(1, 0), straight, inside);
+    const float4 c = texel(src, pitch, w, h, i0 + int2(0, 1), straight, inside);
+    const float4 d = texel(src, pitch, w, h, i0 + int2(1, 1), straight, inside);
+    return clamp(sum, min(min(a, b), min(c, d)), max(max(a, b), max(c, d)));
 }
 
 inline float4 resample(device const float4* src, int pitch, int w, int h, float2 pos, bool straight, int filter)
@@ -339,6 +350,20 @@ kernel void blurAxis(
     int2 size = int2(p.width, p.height);
     int2 dir = int2(p.dirX, p.dirY);
     float4 sum = src[c.y * p.srcPitch + c.x] * p.weights[0];
+    // Most pixels are far enough from the border that every tap is on the canvas, and need no checks.
+    const int along = p.dirX != 0 ? c.x : c.y;
+    const int extent = p.dirX != 0 ? size.x : size.y;
+    if (along >= p.radius && along + p.radius < extent)
+    {
+        const int centre = c.y * p.srcPitch + c.x, stride = p.dirX != 0 ? 1 : p.srcPitch;
+        for (int i = 1; i <= p.radius; i++)
+        {
+            sum += src[centre + i * stride] * p.weights[i];
+            sum += src[centre - i * stride] * p.weights[i];
+        }
+        dst[xy.y * p.dstPitch + xy.x] = sum;
+        return;
+    }
     // Beyond the canvas is transparent, since repeating the edge would smear it inwards, except for
     // the edges' smoothing, where a fade at the border would read as an edge.
     for (int i = 1; i <= p.radius; i++)
