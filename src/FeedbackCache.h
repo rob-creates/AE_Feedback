@@ -179,7 +179,8 @@ private:
     size_t mCanvasPixelLimit;
     std::mutex mMutex;
     std::vector<Entry> mEntries;
-    std::vector<id<MTLBuffer>> mScratch;
+    std::vector<id<MTLBuffer>> mScratch; // guarded by mMutex, oldest first
+    size_t mScratchBytes = 0;            // what they come to
     uint64_t mClock = 0;
     size_t mEntryBytes = 0;
 

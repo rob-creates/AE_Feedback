@@ -18,8 +18,8 @@ const size_t kStepCanvases = 12;
 const size_t kMostCanvasPixels = size_t(8192) * 8192;
 // Nor below about 4K, which a machine that can run AE at all can hold.
 const size_t kLeastCanvasPixels = size_t(4096) * 2304;
-// A step with displacement and a downsampled blur has seven free at rest.
-const size_t kMaxScratchBuffers = 8;
+// Scratch buffers kept for reuse come to no more than a step's worth: kStepCanvases of the largest kept,
+// however many smaller ones, such as a blur's, that takes.
 } // namespace
 
 FeedbackCache::FeedbackCache(id<MTLDevice> device)
@@ -94,6 +94,7 @@ id<MTLBuffer> FeedbackCache::acquireScratch(size_t bytes)
         {
             id<MTLBuffer> buffer = *best;
             mScratch.erase(best);
+            mScratchBytes -= buffer.length;
             return buffer;
         }
     }
@@ -106,8 +107,20 @@ void FeedbackCache::releaseScratch(id<MTLBuffer> buffer)
         return;
     std::lock_guard<std::mutex> lock(mMutex);
     mScratch.push_back(buffer);
-    if (mScratch.size() > kMaxScratchBuffers)
+    mScratchBytes += buffer.length;
+    // The oldest go first. Once a larger canvas's buffers have gone, the limit comes down with them.
+    const auto largest = [this]
+    {
+        size_t most = 0;
+        for (id<MTLBuffer> kept : mScratch)
+            most = std::max<size_t>(most, kept.length);
+        return most;
+    };
+    while (mScratch.size() > 1 && mScratchBytes > kStepCanvases * largest())
+    {
+        mScratchBytes -= mScratch.front().length;
         mScratch.erase(mScratch.begin());
+    }
 }
 
 std::vector<FeedbackCache::FetchCandidate> FeedbackCache::fetchCandidates(const FetchKey& key)
