@@ -128,18 +128,18 @@
         // Moved down a fraction of a pixel each sub-step, with nothing fading, so only edges are in between.
         // Bilinear softens the trail with every move, Bicubic far less, and Pixel keeps it as sharp as the
         // dot, while each moves it just as far.
-        dotComp("sampling_smooth", 72, { "Alpha Max": 1, "Position": [0, 2.5], "Sub-steps": 5 });
+        dotComp("sampling_bilinear", 72, { "Alpha Max": 1, "Position": [0, 2.5], "Sub-steps": 5 });
         dotComp("sampling_bicubic", 72, { "Alpha Max": 1, "Position": [0, 2.5], "Sub-steps": 5, "Pixel Sampling": 2 });
         dotComp("sampling_pixel", 72, { "Alpha Max": 1, "Position": [0, 2.5], "Sub-steps": 5, "Pixel Sampling": 3 });
 
         // Opacity held at 1 only every 4th frame, and 0 between: the trail moves every frame, but takes in
         // the dot only then.
-        var stamp = stillDot("update_stamp", 16, [100, 180], 5, { "Alpha Max": 0.9, "Position": [20, 0] });
+        var stamp = stillDot("opacity_stamp", 16, [100, 180], 5, { "Alpha Max": 0.9, "Position": [20, 0] });
         heldKeys(find(stamp, "Opacity"), 16, function (f) { return f % 4 === 0 ? 1 : 0; });
         // The same, for live_session.jsx to drive Opacity by expressions added part way through.
         stillDot("expression_stamp", 16, [100, 180], 5, { "Alpha Max": 0.9, "Position": [20, 0] });
         // Opacity 0 throughout leaves nothing, with sub-steps and Add, where the layer would go on top.
-        dotComp("update_off", 24, { "Alpha Max": 0.9, "Composite": 3, "Sub-steps": 1, "Opacity": 0 });
+        dotComp("opacity_off", 24, { "Alpha Max": 0.9, "Composite": 3, "Sub-steps": 1, "Opacity": 0 });
         // Opacity 0.5 lays each frame's dot in at half strength.
         stillDot("opacity_half", 12, [200, 180], 5, { "Alpha Max": 0.9, "Position": [20, 0], "Opacity": 0.5 });
         // Scale 0 shrinks the trail to nothing each frame: a dot on Centre, stamped once, is gone by the

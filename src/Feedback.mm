@@ -517,12 +517,13 @@ private:
 // anything in the project changes, as the project's timestamp tells. A moment is a time and its scale.
 struct ExpressionReadings
 {
-    using Values = std::map<std::pair<A_long, A_u_long>, uint64_t>;
+    using Values = std::unordered_map<uint64_t, uint64_t>; // by ExpressionPrints::Moment
     struct Instance
     {
         AEGP_TimeStamp made{};
         std::vector<int> params; // the controls an expression drives
-        std::shared_ptr<const Values> readings;
+        // Shared with each call reading it, and copied before a change only while one is.
+        std::shared_ptr<Values> readings;
     };
     std::mutex lock;
     std::unordered_map<uint64_t, Instance> instances;
@@ -956,7 +957,6 @@ FrameParams PixelSteps(const FrameParams& whole, float share, bool frameEnd, flo
 
     f.amountX = frameEnd ? whole.amountX : 0.0f;
     f.amountY = frameEnd ? whole.amountY : 0.0f;
-    f.filter = FILTER_NEAREST;
     return f;
 }
 
@@ -1018,21 +1018,23 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
         PF_END_TOPIC(DiskId(id));
         return err;
     };
-    auto popup = [&](const char* name, int choices, int dflt, const char* items, int id)
+    // Controls that describe the whole loop rather than a moment in it are `fixed`: they can't be keyframed.
+    auto popup = [&](const char* name, int choices, int dflt, const char* items, int id, bool fixed = false)
     {
         AEFX_CLR_STRUCT(def);
+        if (fixed)
+            def.flags = PF_ParamFlag_CANNOT_TIME_VARY;
         PF_ADD_POPUP(name, choices, dflt, items, DiskId(id));
         return err;
     };
-    // Each group's mask: its luminance at each pixel is how much of the group applies there, from none
-    // at black to all of it at white. None applies it everywhere.
-    auto maskLayer = [&](const char* name, int id)
+    // A layer to read, starting at None. Each group's mask: its luminance at each pixel is how much of
+    // the group applies there, from none at black to all of it at white. None applies it everywhere.
+    auto layerControl = [&](const char* name, int id)
     {
         AEFX_CLR_STRUCT(def);
         PF_ADD_LAYER(name, PF_LayerDefault_NONE, DiskId(id));
         return err;
     };
-    // These describe the whole loop rather than a moment in it, so they can't be keyframed.
     auto fixedInteger = [&](const char* name, int min, int max, int sliderMax, int dflt, int id)
     {
         AEFX_CLR_STRUCT(def);
@@ -1051,13 +1053,13 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
     topic("Alpha", PARAM_ALPHA_START);
     slider("Alpha Max", 0, 1, 0, 1, 0.85, 3, PARAM_ALPHA_MAX);
     slider("Alpha Min", 0, 1, 0, 1, 0, 3, PARAM_ALPHA_MIN);
-    maskLayer("Alpha Mask Layer", PARAM_ALPHA_MASK);
+    layerControl("Alpha Mask Layer", PARAM_ALPHA_MASK);
     endTopic(PARAM_ALPHA_END);
 
     topic("Blur", PARAM_BLUR_START);
     slider("Blur Radius", 0, 500, 0, 50, 0, 2, PARAM_BLUR);
     // Scales Blur Radius at each pixel, so black blurs nothing and white the whole radius.
-    maskLayer("Blur Mask Layer", PARAM_BLUR_LAYER);
+    layerControl("Blur Mask Layer", PARAM_BLUR_LAYER);
     endTopic(PARAM_BLUR_END);
 
     topic("Levels", PARAM_LEVELS_START);
@@ -1066,7 +1068,7 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
     slider("Gamma", 0.1, 10, 0.5, 2, 1, 3, PARAM_GAMMA);
     slider("Output Black", -1, 2, 0, 1, 0, 3, PARAM_OUTPUT_BLACK);
     slider("Output White", -1, 2, 0, 1, 1, 3, PARAM_OUTPUT_WHITE);
-    maskLayer("Levels Mask Layer", PARAM_LEVELS_MASK);
+    layerControl("Levels Mask Layer", PARAM_LEVELS_MASK);
     endTopic(PARAM_LEVELS_END);
 
     topic("HSL", PARAM_HSL_START);
@@ -1074,7 +1076,7 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
     PF_ADD_ANGLE("Hue Shift", 0, DiskId(PARAM_HUE));
     slider("Saturation", 0, 400, 0, 200, 100, 1, PARAM_SATURATION);
     slider("Lightness", -100, 100, -10, 10, 0, 2, PARAM_LIGHTNESS);
-    maskLayer("HSL Mask Layer", PARAM_HSL_MASK);
+    layerControl("HSL Mask Layer", PARAM_HSL_MASK);
     endTopic(PARAM_HSL_END);
 
     // Moves the trail each frame, before displacement shifts it: scaled and turned about Centre, then
@@ -1092,17 +1094,16 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
     AEFX_CLR_STRUCT(def);
     PF_ADD_ANGLE("Rotation", 0, DiskId(PARAM_ROTATION));
     // Each pixel moves this much of the way.
-    maskLayer("Transform Mask Layer", PARAM_TRANSFORM_MASK);
+    layerControl("Transform Mask Layer", PARAM_TRANSFORM_MASK);
     endTopic(PARAM_TRANSFORM_END);
 
     topic("Displacement", PARAM_DISPLACE_START);
-    AEFX_CLR_STRUCT(def);
-    PF_ADD_LAYER("Map Layer", PF_LayerDefault_NONE, DiskId(PARAM_DISPLACE_LAYER));
+    layerControl("Map Layer", PARAM_DISPLACE_LAYER);
     popup("Horizontal Channel", 5, MAP_CHANNEL_LUMA, "Red|Green|Blue|Alpha|Luma", PARAM_CHANNEL_X);
     slider("Max Horizontal", -4000, 4000, -100, 100, 0, 2, PARAM_AMOUNT_X);
     popup("Vertical Channel", 5, MAP_CHANNEL_LUMA, "Red|Green|Blue|Alpha|Luma", PARAM_CHANNEL_Y);
     slider("Max Vertical", -4000, 4000, -100, 100, 0, 2, PARAM_AMOUNT_Y);
-    maskLayer("Displacement Mask Layer", PARAM_DISPLACE_MASK);
+    layerControl("Displacement Mask Layer", PARAM_DISPLACE_MASK);
     endTopic(PARAM_DISPLACE_END);
 
     // Found on the moved trail once a frame, then blurred and graded with it. Off at Strength 0.
@@ -1117,21 +1118,17 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
                          DiskId(PARAM_EDGE_SMOOTHING));
     popup("Edge Blend", 10, COMPOSITE_ADD,
           "Over|Behind|Add|Screen|Multiply|Lighten|Darken|Overlay|Add/Subtract|Difference", PARAM_EDGE_BLEND);
-    maskLayer("Edge Mask Layer", PARAM_EDGE_MASK);
+    layerControl("Edge Mask Layer", PARAM_EDGE_MASK);
     endTopic(PARAM_EDGE_END);
 
     topic("Sampling", PARAM_SAMPLING_GROUP_START);
     fixedInteger("Sub-steps", 0, kMaxSubsteps, kMaxSubsteps, 0, PARAM_SUBSTEPS);
     // How faint older frames may get before a rebuild leaves them out, and how far the blur's faint
     // tails are followed: below what the depth can show. The trail itself is always worked in float.
-    AEFX_CLR_STRUCT(def);
-    def.flags = PF_ParamFlag_CANNOT_TIME_VARY;
-    PF_ADD_POPUP("Cut-off Precision", 3, PRECISION_8_BIT, "8 bit|16 bit|32 bit float", DiskId(PARAM_PRECISION));
+    popup("Cut-off Precision", 3, PRECISION_8_BIT, "8 bit|16 bit|32 bit float", PARAM_PRECISION, true);
     // Bilinear softens a trail moved by fractions of a pixel, a little more with every step; Bicubic
     // keeps it far crisper; Pixel keeps it exactly as sharp, for pixel art and hard-edged graphics.
-    AEFX_CLR_STRUCT(def);
-    def.flags = PF_ParamFlag_CANNOT_TIME_VARY;
-    PF_ADD_POPUP("Pixel Sampling", 3, FILTER_BILINEAR, "Bilinear|Bicubic|Pixel", DiskId(PARAM_SAMPLING));
+    popup("Pixel Sampling", 3, FILTER_BILINEAR, "Bilinear|Bicubic|Pixel", PARAM_SAMPLING, true);
     // Off, jumping to a frame recalculates the whole trail before it, however long that takes. On, only
     // the last Pre-Roll Limit frames are, which is quicker but can show a shorter trail.
     AEFX_CLR_STRUCT(def);
@@ -1340,6 +1337,23 @@ const A_long kAnyLayer = 1000000;
 const PF_LRect kWholeLayer{-kAnyLayer, -kAnyLayer, kAnyLayer, kAnyLayer};
 
 // Checks out `area` of a layer at a moment, unless another render has fetched it, unchanged since.
+// Pixels another render fetched for what `tag` names, while the project is as it was then.
+bool FindFetched(PF_InData* in_data, const PF_ParamUtilsSuite3& utils, FeedbackCache& cache, const FetchTag& tag,
+                 FetchedPixels* pixels)
+{
+    for (const auto& candidate : cache.fetchCandidates(tag.key))
+    {
+        A_Boolean same = 0;
+        utils.PF_AreStatesIdentical(in_data->effect_ref, &candidate.state, &tag.state, &same);
+        if (same)
+        {
+            *pixels = candidate.pixels;
+            return true;
+        }
+    }
+    return false;
+}
+
 PF_Err CheckoutOrShare(
     PF_InData* in_data,
     PF_PreRenderExtra* extra,
@@ -1352,20 +1366,12 @@ PF_Err CheckoutOrShare(
     PF_LRect* rect,
     FetchTag* tag)
 {
-    if (MakeFetchTag(in_data, request, fetch, param, time, area, tag))
+    if (MakeFetchTag(in_data, request, fetch, param, time, area, tag) &&
+        FindFetched(in_data, *fetch.utils, *fetch.cache, *tag, &tag->shared))
     {
-        for (const auto& candidate : fetch.cache->fetchCandidates(tag->key))
-        {
-            A_Boolean same = 0;
-            fetch.utils->PF_AreStatesIdentical(in_data->effect_ref, &candidate.state, &tag->state, &same);
-            if (same)
-            {
-                tag->shared = candidate.pixels;
-                tag->keep = false;
-                *rect = candidate.pixels.rect;
-                return PF_Err_NONE;
-            }
-        }
+        tag->keep = false;
+        *rect = tag->shared.rect;
+        return PF_Err_NONE;
     }
     PF_CheckoutResult result;
     const PF_Err err = CheckoutLayer(in_data, extra, request, area, param, time, id, &result);
@@ -1373,11 +1379,12 @@ PF_Err CheckoutOrShare(
     return err;
 }
 
-// Where a comp-space trail's layer went up to a frame; null for trails kept in the layer.
+// The fingerprint of what AE's history doesn't show up to a frame: where a comp-space trail's layer went,
+// and what expressions gave. Null when there's nothing to fingerprint.
 using MotionAt = std::function<uint64_t(A_long)>;
 
-// What else an image must match, beyond the effect's history, to be used: where a comp-space trail's
-// layer went, and on an adjustment layer, that nothing in the comp has changed since it was made.
+// What else an image must match, beyond the effect's history, to be used: that fingerprint, and on an
+// adjustment layer, that nothing in the comp has changed since it was made.
 using StillCurrent = std::function<bool(const FeedbackCache::Candidate&, A_long time)>;
 
 // With `watch`, the comp is checked; one that couldn't be set up passes nothing.
@@ -1555,21 +1562,17 @@ PF_Err ReadFrameFacts(
         SampleFacts sample{};
         if (!MakeSampleTime(in_data, time, step, before, samplesPerStep, &sample.time))
             sample.time = FrameSample(in_data, time - before * step / samplesPerStep);
+        ParamReader at{in_data, sample.time};
         // Each sub-step moves by Transform at its own moment, which can differ from the frame's.
         if (!facts->moves)
         {
-            ParamReader at{in_data, sample.time};
             FrameParams f{};
             ReadMove(at, &f.moveX, &f.moveY, &f.scaleX, &f.scaleY, &f.rotationDegrees);
-            ERR(at.err);
             SetLinear(f.rotationDegrees, f.scaleX, f.scaleY, f.linear);
             facts->moves = MovesTrail(f);
         }
-        {
-            ParamReader at{in_data, sample.time};
-            sample.opacity = std::clamp(at.slider(PARAM_OPACITY), 0.0f, 1.0f);
-            ERR(at.err);
-        }
+        sample.opacity = std::clamp(at.slider(PARAM_OPACITY), 0.0f, 1.0f);
+        ERR(at.err);
         if (sample.opacity > 0.0f)
             ERR(LayerBounds(in_data, extra, request, PARAM_INPUT, sample.time, nextId, &sample.inputRect));
         for (int slot = 0; !err && slot < SLOT_COUNT; slot++)
@@ -1743,8 +1746,9 @@ void MixValue(uint64_t& h, const PF_ParamDef& d)
 class ExpressionPrints
 {
 public:
-    ExpressionPrints(PF_InData* in_data, PF_OutData* out_data, ExpressionReadings& shared)
-        : mInData(in_data), mShared(shared)
+    // `instance` is EffectInstance's: readings are kept for each instance of the effect.
+    ExpressionPrints(PF_InData* in_data, PF_OutData* out_data, uint64_t instance, ExpressionReadings& shared)
+        : mInData(in_data), mShared(shared), mInstance(instance)
     {
         try
         {
@@ -1755,7 +1759,6 @@ public:
         {
             mHaveMade = false;
         }
-        mInstance = EffectInstance(in_data, out_data);
         if (mHaveMade && mInstance)
         {
             std::lock_guard<std::mutex> guard(shared.lock);
@@ -1775,29 +1778,24 @@ public:
     {
         if (!mHaveMade || !mInstance || (mFound && mNew.empty()))
             return;
+        // Let go first, so the kept readings can be added to in place if no other call holds them.
+        mKnown.reset();
         std::lock_guard<std::mutex> guard(mShared.lock);
         ExpressionReadings::Instance& kept = mShared.instances[mInstance];
-        auto values = std::make_shared<ExpressionReadings::Values>();
-        if (SameStamp(kept.made, mMade) && kept.readings)
-            *values = *kept.readings;
+        if (!SameStamp(kept.made, mMade) || !kept.readings)
+            kept.readings = std::make_shared<ExpressionReadings::Values>();
+        else if (kept.readings.use_count() > 1)
+            kept.readings = std::make_shared<ExpressionReadings::Values>(*kept.readings);
         // Long sessions on one project mustn't grow this without end.
-        if (values->size() > 1000000)
-            values->clear();
-        values->insert(mNew.begin(), mNew.end());
+        if (kept.readings->size() > 1000000)
+            kept.readings->clear();
+        kept.readings->insert(mNew.begin(), mNew.end());
         kept.made = mMade;
         kept.params = mParams;
-        kept.readings = values;
     }
 
     bool active() const { return !mParams.empty(); }
     int count() const { return int(mParams.size()); }
-    bool reused() const { return mFound; } // its readings came from an earlier call at this timestamp
-    uint32_t stamp() const
-    {
-        uint32_t s = 0;
-        std::memcpy(&s, mMade.a, sizeof(s));
-        return s;
-    }
 
     // For FrameFactsMemo::Key: changes with anything in the project while there are expressions. A
     // timestamp that can't be read never matches.
@@ -1806,10 +1804,7 @@ public:
         if (!active())
             return 0;
         if (!mHaveMade)
-        {
-            static std::atomic<uint64_t> never{1};
-            return never++ | 1ull << 63;
-        }
+            return Unmatched();
         uint32_t stamp;
         std::memcpy(&stamp, mMade.a, sizeof(stamp));
         return uint64_t(stamp) + 1;
@@ -1820,27 +1815,20 @@ public:
     {
         if (mParams.empty())
             return 0;
-        const auto key = std::make_pair(t.value, t.scale);
+        const uint64_t moment = Moment(t);
         if (mKnown)
-            if (auto found = mKnown->find(key); found != mKnown->end())
+            if (auto found = mKnown->find(moment); found != mKnown->end())
                 return found->second;
-        if (auto found = mNew.find(key); found != mNew.end())
+        if (auto found = mNew.find(moment); found != mNew.end())
             return found->second;
         uint64_t print = 0xCBF29CE484222325ull;
+        ParamReader r{mInData, t};
         for (int index : mParams)
-        {
-            PF_ParamDef def;
-            AEFX_CLR_STRUCT(def);
-            if (PF_CHECKOUT_PARAM(mInData, index, t.value, t.step, t.scale, &def))
-            {
-                // Unreadable, so never the same as anything kept.
-                static std::atomic<uint64_t> unread{1};
-                return unread++ | 1ull << 63;
-            }
-            MixValue(print, def);
-            PF_CHECKIN_PARAM(mInData, &def);
-        }
-        mNew.emplace(key, print);
+            r.read(index, [&](const PF_ParamDef& def) { MixValue(print, def); return 0; });
+        // Unreadable, so never the same as anything kept.
+        if (r.err)
+            return Unmatched();
+        mNew.emplace(moment, print);
         return print;
     }
 
@@ -1850,11 +1838,21 @@ private:
         return std::memcmp(&a, &b, sizeof(a)) == 0;
     }
 
+    // A moment as one key: its time and that time's scale.
+    static uint64_t Moment(const SampleTime& t) { return uint64_t(uint32_t(t.value)) << 32 | uint32_t(t.scale); }
+
+    // A different value each time, which no reading can equal.
+    static uint64_t Unmatched()
+    {
+        static std::atomic<uint64_t> next{1};
+        return next++ | 1ull << 63;
+    }
+
     PF_InData* mInData;
     ExpressionReadings& mShared;
+    uint64_t mInstance;
     AEGP_TimeStamp mMade{};
     bool mHaveMade = false;
-    uint64_t mInstance = 0;
     bool mFound = false;
     std::vector<int> mParams;
     std::shared_ptr<const ExpressionReadings::Values> mKnown;
@@ -2238,29 +2236,13 @@ PF_Err WalkTrail(
 // down can see far further than it's worth drawing, so this is kept to the longest canvas side.
 PF_LRect LayerViewOfComp(const Projective& layerToComp, const PF_LRect& canvas, const PF_LRect& layer)
 {
-    Projective compToLayer;
-    bool seen = layerToComp.inverse(&compToLayer);
-    double lo[2] = {1e18, 1e18}, hi[2] = {-1e18, -1e18};
-    for (A_long x : {canvas.left, canvas.right})
-        for (A_long y : {canvas.top, canvas.bottom})
-        {
-            double p[2];
-            seen = seen && compToLayer.apply(double(x), double(y), &p[0], &p[1]);
-            for (int i = 0; seen && i < 2; i++)
-            {
-                lo[i] = std::min(lo[i], p[i]);
-                hi[i] = std::max(hi[i], p[i]);
-            }
-        }
     const A_long focusX = (layer.left + layer.right) / 2, focusY = (layer.top + layer.bottom) / 2;
     PF_LRect view{focusX - kMaxCanvasSide / 2, focusY - kMaxCanvasSide / 2, focusX + kMaxCanvasSide / 2,
                   focusY + kMaxCanvasSide / 2};
-    if (seen)
-    {
-        auto clampLong = [](double v) { return A_long(std::clamp(v, -1e8, 1e8)); };
-        view = PF_LRect{clampLong(std::floor(lo[0])), clampLong(std::floor(lo[1])), clampLong(std::ceil(hi[0])),
-                        clampLong(std::ceil(hi[1]))};
-    }
+    Projective compToLayer;
+    PF_LRect seen;
+    if (layerToComp.inverse(&compToLayer) && MovedBounds(compToLayer, canvas, &seen))
+        view = seen;
     if (!IsEmpty(layer))
         view = IsEmpty(view) ? layer : Union(view, layer);
     TrimAxis(&view.left, &view.right, focusX, kMaxCanvasSide);
@@ -2458,13 +2440,15 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
         // this effect.
         LayerMotion motion(in_data, out_data);
         const CompWatch watch(in_data, out_data);
-        ExpressionPrints expressions(in_data, out_data, metal->expressions);
+        // Which instance of the effect this is, which AEGP takes a while to tell.
+        const uint64_t instance = EffectInstance(in_data, out_data);
+        ExpressionPrints expressions(in_data, out_data, instance, metal->expressions);
         data->watchesComp = watch.active();
         if (data->watchesComp)
             watch.timestamp(&data->made);
         data->canvas.compSpace = motion.usable();
         if (data->watchesComp)
-            data->canvas.owner = EffectInstance(in_data, out_data);
+            data->canvas.owner = instance;
         // A missing map displaces nothing, and a missing mask masks nothing.
         MapSources fallback;
         fallback.fill(MAP_NONE);
@@ -2524,13 +2508,12 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             return placed;
         };
 
+        if (data->canvas.compSpace)
+            data->spreadWidest = float(std::max(compBox.right - compBox.left, compBox.bottom - compBox.top)) * 0.5f;
         TrailWalk walk;
         if (!err)
             ERR(WalkTrail(in_data, extra, request, metal->memo, view, grid, data->samplesPerStep, preRollLimit, invisible,
-                          data->sources, firstTime, toCanvas, !data->canvas.compSpace,
-                          data->canvas.compSpace ? float(std::max(compBox.right - compBox.left, compBox.bottom - compBox.top)) * 0.5f
-                                                 : 0.0f,
-                          &nextId, &walk));
+                          data->sources, firstTime, toCanvas, !data->canvas.compSpace, data->spreadWidest, &nextId, &walk));
 
         // A failed walk keeps nothing, as what it read may not match any history.
         if (!err)
@@ -2553,8 +2536,6 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
         PF_LRect area = walk.hasArea ? walk.area : extra->input->output_request.rect;
         SnapCanvas(walk, &area);
         LimitCanvas(&area, walk.focusX, walk.focusY, pixelLimit);
-        if (data->canvas.compSpace)
-            data->spreadWidest = float(std::max(compBox.right - compBox.left, compBox.bottom - compBox.top)) * 0.5f;
         if (data->canvas.compSpace)
         {
             // Where the trail can be, within the comp and a margin: what drifts further out is dropped.
@@ -2605,14 +2586,14 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             return PF_LRect{seen.left - 2, seen.top - 2, seen.right + 2, seen.bottom + 2};
         };
 
+        // The moment shown.
+        const SampleFacts* own = err ? nullptr : grid.between() ? &betweenFacts.samples.back() : &walk.window[0]->samples.back();
         if (!err)
         {
-            const SampleFacts& own = grid.between() ? betweenFacts.samples.back() : walk.window[0]->samples.back();
-            data->opacity = own.opacity;
-            ERR(CheckoutWholeLayer(in_data, extra, request, PARAM_INPUT, own.time, data->currentInputId, &data->currentInputRect));
+            data->opacity = own->opacity;
+            ERR(CheckoutWholeLayer(in_data, extra, request, PARAM_INPUT, own->time, data->currentInputId, &data->currentInputRect));
         }
 
-        // With the trail in comp space, the output is the layer's view of the comp, around the layer.
         data->fingerprinted = data->canvas.compSpace || expressions.active();
         std::function<uint64_t(const SampleTime&)> expressionsAt;
         if (expressions.active())
@@ -2630,6 +2611,7 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             ERR(extra->cb->GuidMixInPtr(in_data->effect_ref, sizeof(moved), &moved));
             ERR(extra->cb->GuidMixInPtr(in_data->effect_ref, sizeof(movedSince), &movedSince));
         }
+        // With the trail in comp space, the output is the layer's view of the comp, around the layer.
         if (!err && data->canvas.compSpace && !motion.layerToComp(now, A_u_long(in_data->time_scale), &data->layerToCompNow))
             err = PF_Err_INTERNAL_STRUCT_DAMAGED;
         if (!err && data->canvas.compSpace)
@@ -2643,12 +2625,9 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
         // Layers other renders have fetched at the moments needed are used rather than fetched again. Not
         // on an adjustment layer: its input is what's beneath it, which AE's state doesn't follow.
         const FetchContext fetchContext{&utils, &metal->renderer->cache(),
-                                        data->watchesComp ? 0 : EffectInstance(in_data, out_data)};
+                                        data->watchesComp ? 0 : instance};
         if (!err)
-        {
-            const SampleFacts& own = grid.between() ? betweenFacts.samples.back() : walk.window[0]->samples.back();
-            MakeFetchTag(in_data, request, fetchContext, PARAM_INPUT, own.time, kWholeLayer, &data->currentInputFetch);
-        }
+            MakeFetchTag(in_data, request, fetchContext, PARAM_INPUT, own->time, kWholeLayer, &data->currentInputFetch);
 
         // Only frames newer than the newest usable image need their pixels.
         int resumeK = -1;
@@ -2701,7 +2680,7 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             place(*data->between);
 
         Log("prerender frame=%d window=%d samples=%d read=%d resume=%d checkouts=%d canvas=%dx%d at %d,%d layer=%dx%d "
-            "downsample=%.2f ms=%.2f time=%d step=%d scale=%u first=%d adjust=%d last=%d every=%d share=%.3f expressions=%d stamp=%08x reused=%d print=%016llx",
+            "downsample=%.2f ms=%.2f time=%d step=%d scale=%u first=%d adjust=%d last=%d every=%d share=%.3f expressions=%d",
             step > 0 ? now / step : 0,
             int(walk.window.size()) - 1,
             data->samplesPerStep,
@@ -2724,10 +2703,7 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             grid.last,
             grid.step,
             grid.share,
-            expressions.count(),
-            expressions.stamp(),
-            int(expressions.reused()),
-            (unsigned long long)(data->fingerprinted ? prints.at(grid.last) : 0));
+            expressions.count());
     }
 
     if (!err)
@@ -2781,20 +2757,10 @@ struct GpuRender
             *pixels = ahead->second;
             return true;
         }
-        if (!tag.tagged || !utils)
+        if (!tag.tagged || !utils || !FindFetched(in_data, *utils, renderer.cache(), tag, pixels))
             return false;
-        for (const auto& candidate : renderer.cache().fetchCandidates(tag.key))
-        {
-            A_Boolean same = 0;
-            utils->PF_AreStatesIdentical(in_data->effect_ref, &candidate.state, &tag.state, &same);
-            if (same)
-            {
-                *pixels = candidate.pixels;
-                shared++;
-                return true;
-            }
-        }
-        return false;
+        shared++;
+        return true;
     }
     int queuedSteps = 0;
 
@@ -3073,46 +3039,37 @@ PF_Err FetchAhead(GpuRender& render, int frames, bool startsBlank)
         return e;
     };
 
-    std::vector<Need> later;
-    for (const Need& need : needs)
+    // Fetches what another render hasn't already kept. One that another render is fetching goes on
+    // `later`, if given, and is otherwise fetched here too.
+    const auto tryFetch = [&](const Need& need, std::vector<Need>* later) -> PF_Err
     {
-        ERR(PF_ABORT(in_data));
-        if (err)
-            return err;
+        if (const PF_Err aborted = PF_ABORT(in_data))
+            return aborted;
         FetchedPixels pixels;
         if (render.found(*need.tag, &pixels))
         {
             render.prefetched[need.tag] = pixels;
-            continue;
-        }
-        if (!cache.beginFetch(need.tag->key))
-        {
-            later.push_back(need);
-            continue;
-        }
-        err = fetchOne(need);
-        cache.endFetch(need.tag->key);
-        if (err)
-            return err;
-    }
-    for (const Need& need : later)
-    {
-        ERR(PF_ABORT(in_data));
-        if (err)
-            return err;
-        FetchedPixels pixels;
-        if (render.found(*need.tag, &pixels))
-        {
-            render.prefetched[need.tag] = pixels;
-            continue;
+            return PF_Err_NONE;
         }
         const bool mine = cache.beginFetch(need.tag->key);
-        err = fetchOne(need);
+        if (!mine && later)
+        {
+            later->push_back(need);
+            return PF_Err_NONE;
+        }
+        const PF_Err e = fetchOne(need);
         if (mine)
             cache.endFetch(need.tag->key);
-        if (err)
+        return e;
+    };
+
+    std::vector<Need> later;
+    for (const Need& need : needs)
+        if ((err = tryFetch(need, &later)))
             return err;
-    }
+    for (const Need& need : later)
+        if ((err = tryFetch(need, nullptr)))
+            return err;
     return err;
 }
 
@@ -3124,8 +3081,8 @@ PF_Err ShowImage(GpuRender& render, id<MTLBuffer> image, PF_EffectWorld* output)
     FeedbackRenderer& renderer = render.renderer;
 
     // With sub-steps, or between frames, all but In Front and Behind store only the trail, so the current
-    // frame goes on top at full strength here. It stays sharp, and isn't fed back in twice. With Update
-    // off, the layer isn't there to go on top.
+    // frame goes on top here, at its Opacity. It stays sharp, and isn't fed back in twice. At Opacity 0,
+    // the layer isn't there to go on top.
     id<MTLBuffer> shown = image;
     bool shownIsScratch = false;
     if ((render.data.samplesPerStep > 1 || render.data.between) && render.data.opacity > 0.0f && render.currentInput)
@@ -3259,6 +3216,24 @@ PF_Err RenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* 
         if (!err && resumeK > 0)
             ERR(FetchAhead(render, std::min(resumeK, kFramesFetchedAhead), image == nil));
 
+        // A step's result becomes the image, and the one before it can be reused once the GPU is done.
+        const auto adopt = [&](id<MTLBuffer> next)
+        {
+            if (!next)
+                return;
+            if (imageIsScratch)
+                render.batch.freeBuffers.push_back(image);
+            image = next;
+            imageIsScratch = true;
+        };
+        // Runs the queued steps, keeping the first error.
+        const auto flush = [&]
+        {
+            const PF_Err flushErr = FlushSteps(render);
+            if (!err)
+                err = flushErr;
+        };
+
         for (int k = resumeK - 1; !err && k >= 0; k--)
         {
             const FrameCheckout& frame = data->frames[k];
@@ -3280,19 +3255,9 @@ PF_Err RenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* 
                     id<MTLBuffer> next = nil;
                     ERR(ComputeSample(render, sub, 1.0f / float(data->samplesPerStep), s == subCount - 1, isCurrent,
                                       image, &carry, &next));
-                    if (next)
-                    {
-                        if (imageIsScratch)
-                            render.batch.freeBuffers.push_back(image);
-                        image = next;
-                        imageIsScratch = true;
-                    }
+                    adopt(next);
                     if (render.queuedSteps >= kStepsPerBatch)
-                    {
-                        const PF_Err flushErr = FlushSteps(render);
-                        if (!err)
-                            err = flushErr;
-                    }
+                        flush();
                 }
             }
 
@@ -3324,21 +3289,11 @@ PF_Err RenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* 
                 // Only shown, so what it owes is left with the last frame's image.
                 TrailCarry shownCarry = carry;
                 ERR(ComputeSample(render, *data->between, data->grid.share, false, true, image, &shownCarry, &next));
-                if (next)
-                {
-                    if (imageIsScratch)
-                        render.batch.freeBuffers.push_back(image);
-                    image = next;
-                    imageIsScratch = true;
-                }
+                adopt(next);
             }
         }
 
-        {
-            const PF_Err flushErr = FlushSteps(render);
-            if (!err)
-                err = flushErr;
-        }
+        flush();
 
         if (!err && image && output)
             ERR(ShowImage(render, image, output));

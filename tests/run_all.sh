@@ -69,27 +69,7 @@ echo "render errors: $errors, CPU renders: $(grep -c 'CPU render' $LOG)"
 [ "$errors" -eq 0 ] || failed=1
 
 if [ -n "$BASE" ]; then
-    python3 - "$BASE" "$LABEL" <<'PY'
-import sys
-import numpy as np
-from run_tests import read_tiff, OUT
-a, b = sys.argv[1:3]
-worst, n = [], 0
-for folder in sorted((OUT / b).iterdir()):
-    if not folder.is_dir() or not (OUT / a / folder.name).is_dir():
-        continue
-    peak, where = 0, ""
-    for t in folder.glob("f_*.tif"):
-        other = OUT / a / folder.name / t.name
-        if other.exists():
-            n += 1
-            d = int(np.abs(read_tiff(t) - read_tiff(other)).max())
-            if d > peak:
-                peak, where = d, t.name
-    worst.append((peak, folder.name, where))
-worst.sort(reverse=True)
-print(f"{a} against {b}: {n} frames, largest differences {worst[:6]}")
-PY
+    python3 run_tests.py compare "$BASE" "$LABEL" 2>&1 | grep "largest differences"
 fi
 rm -rf __pycache__
 

@@ -110,7 +110,7 @@ def main(label):
     print("Driving Opacity by expression during the session:")
     check("before any expression@12", live("expr_before", 12), ref("expression_stamp", 12))
     for frame in (4, 8, 11, 12):
-        check(f"stamping every 4th frame once added@{frame}", live("expr_added", frame), ref("update_stamp", frame))
+        check(f"stamping every 4th frame once added@{frame}", live("expr_added", frame), ref("opacity_stamp", frame))
     render("feedback_live_edited.aep", "expression_stamp", OUT / label / "edited_expression", 0, 13)
     for frame in (12, 13):
         check(f"after the slider it reads changed@{frame}", live("expr_read_5", frame), ref("edited_expression", frame))

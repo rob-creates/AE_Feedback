@@ -202,14 +202,15 @@ void InvertTransform(const FrameParams& f, const CanvasKey& canvas, DisplacePara
     p->offsetY = -(p->inverse[2] * t.tx + p->inverse[3] * t.ty);
 }
 
-// A missing input has zero size, so the kernel never reads it.
-CompositeParams MakeCompositeParams(const CanvasKey& canvas, const PlacedImage& input, int mode)
+// A missing input has zero size, so the kernel never reads it. `filter` and `opacity` are FrameParams'.
+CompositeParams MakeCompositeParams(const CanvasKey& canvas, const PlacedImage& input, int mode, int filter, float opacity)
 {
     CompositeParams p{};
     p.prevPitch = canvas.width;
     p.dstPitch = canvas.width;
     p.mode = mode;
-    p.inputOpacity = 1.0f;
+    p.filter = filter;
+    p.inputOpacity = opacity;
     p.inputPitch = input.pitch;
     p.inputOffsetX = input.offsetX;
     p.inputOffsetY = input.offsetY;
@@ -610,9 +611,7 @@ id<MTLBuffer> FeedbackRenderer::step(
     grade.lightness = f.lightness;
     grade.alphaSlope = f.alphaSlope;
     grade.alphaOffset = f.alphaOffset;
-    last.composite = MakeCompositeParams(canvas, input, f.compositeMode);
-    last.composite.filter = f.filter;
-    last.composite.inputOpacity = f.inputOpacity;
+    last.composite = MakeCompositeParams(canvas, input, f.compositeMode, f.filter, f.inputOpacity);
     last.composite.splitsInput = f.splitsInput;
     last.composite.frameAlpha = f.frameAlpha;
     last.composite.stepAlpha = f.stepAlpha;
@@ -654,9 +653,7 @@ id<MTLBuffer> FeedbackRenderer::compositeInput(
     float opacity)
 {
     id<MTLBuffer> result = mCache->acquireScratch(canvas.bytes());
-    CompositeParams p = MakeCompositeParams(canvas, input, compositeMode);
-    p.filter = filter;
-    p.inputOpacity = opacity;
+    CompositeParams p = MakeCompositeParams(canvas, input, compositeMode, filter, opacity);
     if (!RunOnce(queue, mComposite, {image, input.buffer ? input.buffer : mEmpty, result}, p, canvas.width, canvas.height))
     {
         mCache->releaseScratch(result);

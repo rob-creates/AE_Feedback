@@ -40,10 +40,10 @@ COMPS = ["trail", "behind", "screen_sub", "add_sub", "grade_blur", "self_disp", 
          *[f"blend_{m}{v}" for m in ("multiply", "lighten", "darken", "overlay", "add_subtract", "difference")
            for v in ("", "_sub", "_fade")],
          "transform_position", "transform_scale", "transform_scale_xy", "transform_rotate", "transform_sub",
-         "transform_sub_scale", "transform_sub_skew", "sampling_smooth", "sampling_bicubic", "sampling_pixel", "edge_multiply", "square_path", "square_path_plain",
+         "transform_sub_scale", "transform_sub_skew", "sampling_bilinear", "sampling_bicubic", "sampling_pixel", "edge_multiply", "square_path", "square_path_plain",
          "map_offset",
          *[f"comp_space_{v}{p}" for v in ("2d", "parented") for p in ("", "_plain")], "layer_3d", "layer_3d_plain",
-         "edge_luminance", "edge_colour", "edge_unsmoothed", "edge_trail", "update_stamp", "expression_stamp", "update_off", "opacity_half", "transform_scale_zero",
+         "edge_luminance", "edge_colour", "edge_unsmoothed", "edge_trail", "opacity_stamp", "expression_stamp", "opacity_off", "opacity_half", "transform_scale_zero",
          "adjust_single", "adjust_dup", "adjust_key_below", "nest_30", "nest_12", "nest_solid_sub", "nest_solid_sub_60",
          "subframe_motion", "border_drift", "canvas_limit", "stretch_1000", "stretch_25",
          "footage_trail", "footage_stretch", "footage_reverse", "footage_reverse_plain",
@@ -57,7 +57,7 @@ COLD = {"trail": 60, "behind": 60, "screen_sub": 60, "add_sub": 60, "grade_blur"
         "duplicate_fx": 40, "perf_long": 299, "limit_default": 699,
         "limit_800": 699, "limit_100": 299, "preroll_unlimited": 699, "flash_spread": 32, "blurmap_left": 60, "blurmap_trail": 60, "trim_48": 60, "trim_start": 60, "trim_stretch": 60,
         "blend_difference": 3, "blend_overlay_sub": 29, "comp_space_2d": 20, "layer_3d": 20, "transform_rotate": 12, "transform_sub": 60, "sampling_pixel": 60, "edge_trail": 60,
-        "update_stamp": 13, "adjust_dup": 23, "nest_30": 53, "nest_solid_sub_60": 70,
+        "opacity_stamp": 13, "adjust_dup": 23, "nest_30": 53, "nest_solid_sub_60": 70,
         "stretch_1000": 23, "stretch_25": 23,
         "footage_trail": 60, "footage_stretch": 60, "footage_reverse": 60, "precision_8": 95, "precision_16": 95, "precision_32": 95}
 STRETCHES = ["stretch_1000", "stretch_25"]
@@ -444,26 +444,26 @@ def cmd_check(label):
         soft = int(((column > 0.1 * top) & (column < 0.9 * top)).sum())
         rows = np.arange(len(column))
         return soft, float((column * rows).sum() / column.sum())
-    smooth_soft, smooth_centre = edge_and_centre("sampling_smooth")
+    bilinear_soft, bilinear_centre = edge_and_centre("sampling_bilinear")
     bicubic_soft, bicubic_centre = edge_and_centre("sampling_bicubic")
     pixel_soft, pixel_centre = edge_and_centre("sampling_pixel")
     report(pixel_soft <= 4, f"Pixel keeps the trail's edges as sharp as the dot's: {pixel_soft} soft pixels across both")
-    report(smooth_soft >= pixel_soft + 6, f"Bilinear softens them, as before: {smooth_soft} soft pixels")
-    report(bicubic_soft <= 0.6 * smooth_soft, f"Bicubic softens them far less: {bicubic_soft} soft pixels")
+    report(bilinear_soft >= pixel_soft + 6, f"Bilinear softens them, as before: {bilinear_soft} soft pixels")
+    report(bicubic_soft <= 0.6 * bilinear_soft, f"Bicubic softens them far less: {bicubic_soft} soft pixels")
     for name, centre in (("Pixel", pixel_centre), ("Bicubic", bicubic_centre)):
-        report(abs(centre - smooth_centre) <= 1,
-               f"{name} moves the trail as far as Bilinear: centred at row {centre:.1f} against {smooth_centre:.1f}")
+        report(abs(centre - bilinear_centre) <= 1,
+               f"{name} moves the trail as far as Bilinear: centred at row {centre:.1f} against {bilinear_centre:.1f}")
 
     print("Opacity held at 1 every 4th frame and 0 between, with Position 20 a frame:")
     for frame, newest in ((12, 0), (13, 1)):
         for k in range(4):
             x = 100 + 20 * (newest + 4 * k)
-            seen, want = alpha_at("update_stamp", frame, x, 180), 255 * 0.9 ** (newest + 4 * k)
+            seen, want = alpha_at("opacity_stamp", frame, x, 180), 255 * 0.9 ** (newest + 4 * k)
             report(abs(seen - want) <= 4, f"frame {frame}, stamped {newest + 4 * k} frames back at x={x}: alpha {seen}, expected {want:.0f}")
         gap = 100 + 20 * (newest + 2)
-        seen = alpha_at("update_stamp", frame, gap, 180)
+        seen = alpha_at("opacity_stamp", frame, gap, 180)
         report(seen == 0, f"frame {frame}: nothing from a frame at Opacity 0, at x={gap}: alpha {seen}")
-    peak = max(int(load(label, "update_off", f)[..., 3].max()) for f in (0, 12, 23))
+    peak = max(int(load(label, "opacity_off", f)[..., 3].max()) for f in (0, 12, 23))
     report(peak == 0, f"Opacity 0 throughout, with Add and sub-steps, leaves nothing: peak alpha {peak}")
     print("Opacity 0.5, with Position 20 a frame and Alpha Max 0.9:")
     for k in range(0, 5):
@@ -586,17 +586,22 @@ def cmd_check(label):
 
 
 def cmd_compare(a, b):
+    """Each comp's largest difference between two runs, then the comps that moved most."""
     print(f"{a} against {b}:")
+    frames, peaks = 0, []
     for folder in sorted(p.name for p in (OUT / a).iterdir() if p.is_dir()):
         if not (OUT / b / folder).is_dir():
             continue
-        names = sorted(p.name for p in (OUT / a / folder).glob("f_*.tif"))
+        names = sorted(p.name for p in (OUT / a / folder).glob("f_*.tif") if (OUT / b / folder / p.name).exists())
         worst, moved, where = 0, 0, ""
         for name in names:
             peak, count = difference(read_tiff(OUT / a / folder / name), read_tiff(OUT / b / folder / name))
             if peak > worst:
                 worst, moved, where = peak, count, name
+        frames += len(names)
+        peaks.append((worst, folder, where))
         report(worst == 0, f"{folder}: {len(names)} frames, peak {worst}/255 ({moved} pixels in {where})")
+    print(f"{a} against {b}: {frames} frames, largest differences {sorted(peaks, reverse=True)[:6]}")
 
 
 def cmd_perf(label):
