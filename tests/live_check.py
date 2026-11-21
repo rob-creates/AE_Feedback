@@ -107,6 +107,16 @@ def main(label):
         report(None, f"the edit itself changed the frame by a peak of "
                      f"{difference(live(f'{step}_before', frame), ref(f'edited_{step}', frame))[0]}/255")
 
+    print("Driving Opacity by expression during the session:")
+    check("before any expression@12", live("expr_before", 12), ref("expression_stamp", 12))
+    for frame in (4, 8, 11, 12):
+        check(f"stamping every 4th frame once added@{frame}", live("expr_added", frame), ref("update_stamp", frame))
+    render("feedback_live_edited.aep", "expression_stamp", OUT / label / "edited_expression", 0, 13)
+    for frame in (12, 13):
+        check(f"after the slider it reads changed@{frame}", live("expr_read_5", frame), ref("edited_expression", frame))
+    report(None, f"the slider itself changed the frame by a peak of "
+                 f"{difference(live('expr_read_3', 12), ref('edited_expression', 12))[0]}/255")
+
     print("A project saved by an earlier version of the effect:")
     render("old_project.aep", "trail", OUT / label / "old_project", 0, 60)
     check("opens and renders the same@60", ref("old_project", 60), ref("trail", 60))

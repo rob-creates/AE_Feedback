@@ -43,7 +43,7 @@ COMPS = ["trail", "behind", "screen_sub", "add_sub", "grade_blur", "self_disp", 
          "transform_sub_scale", "transform_sub_skew", "sampling_smooth", "sampling_bicubic", "sampling_pixel", "edge_multiply", "square_path", "square_path_plain",
          "map_offset",
          *[f"comp_space_{v}{p}" for v in ("2d", "parented") for p in ("", "_plain")], "layer_3d", "layer_3d_plain",
-         "edge_luminance", "edge_colour", "edge_unsmoothed", "edge_trail", "update_stamp", "update_off", "transform_scale_zero",
+         "edge_luminance", "edge_colour", "edge_unsmoothed", "edge_trail", "update_stamp", "expression_stamp", "update_off", "opacity_half", "transform_scale_zero",
          "adjust_single", "adjust_dup", "adjust_key_below", "nest_30", "nest_12", "nest_solid_sub", "nest_solid_sub_60",
          "subframe_motion", "border_drift", "canvas_limit", "stretch_1000", "stretch_25",
          "footage_trail", "footage_stretch", "footage_reverse", "footage_reverse_plain",
@@ -454,7 +454,7 @@ def cmd_check(label):
         report(abs(centre - smooth_centre) <= 1,
                f"{name} moves the trail as far as Bilinear: centred at row {centre:.1f} against {smooth_centre:.1f}")
 
-    print("Update on every 4th frame, with Position 20 a frame:")
+    print("Opacity held at 1 every 4th frame and 0 between, with Position 20 a frame:")
     for frame, newest in ((12, 0), (13, 1)):
         for k in range(4):
             x = 100 + 20 * (newest + 4 * k)
@@ -462,9 +462,13 @@ def cmd_check(label):
             report(abs(seen - want) <= 4, f"frame {frame}, stamped {newest + 4 * k} frames back at x={x}: alpha {seen}, expected {want:.0f}")
         gap = 100 + 20 * (newest + 2)
         seen = alpha_at("update_stamp", frame, gap, 180)
-        report(seen == 0, f"frame {frame}: nothing from a frame with Update off, at x={gap}: alpha {seen}")
+        report(seen == 0, f"frame {frame}: nothing from a frame at Opacity 0, at x={gap}: alpha {seen}")
     peak = max(int(load(label, "update_off", f)[..., 3].max()) for f in (0, 12, 23))
-    report(peak == 0, f"Update off throughout, with Add and sub-steps, leaves nothing: peak alpha {peak}")
+    report(peak == 0, f"Opacity 0 throughout, with Add and sub-steps, leaves nothing: peak alpha {peak}")
+    print("Opacity 0.5, with Position 20 a frame and Alpha Max 0.9:")
+    for k in range(0, 5):
+        seen, want = alpha_at("opacity_half", 11, 200 + 20 * k, 180), 255 * 0.5 * 0.9 ** k
+        report(abs(seen - want) <= 4, f"{k} frames back at x={200 + 20 * k}: alpha {seen}, expected {want:.0f}")
 
     print("Scale 0:")
     first = load(label, "transform_scale_zero", 0)[180, 320, 3]

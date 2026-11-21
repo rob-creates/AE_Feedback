@@ -478,6 +478,8 @@ inline float4 applyComposite(float4 f, device const float4* input, int2 xy, cons
         i = input[m.y * p.inputPitch + m.x];
         i.xyz *= i.w;
     }
+    // Premultiplied, so this fades colour and coverage together, as a layer's own Opacity does.
+    i *= p.inputOpacity;
     if (p.splitsInput != 0)
         i = inputShare(i, p);
 

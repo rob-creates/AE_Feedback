@@ -135,6 +135,22 @@
     keyBelow.layer("flash").property("Opacity").setValueAtKey(3, 10);
     queue(keyBelow, 40, "key_below_after");
 
+    // AE's history of the effect's controls doesn't change with an expression, so frames made before
+    // one is added, or before what it reads changes, mustn't be shown or resumed from after.
+    var stamped = comp("expression_stamp");
+    var opacity = find(stamped.layer("dot").property("Effects").property(1), "Opacity");
+    queue(stamped, 12, "expr_before", null, 13);
+    opacity.expression = "Math.round(time * " + FPS + ") % 4 == 0 ? 1 : 0";
+    queue(stamped, 12, "expr_added", null, 13);
+    var control = stamped.layers.addNull();
+    control.name = "control";
+    var slider = control.property("Effects").addProperty("ADBE Slider Control").property(1);
+    slider.setValue(3);
+    opacity.expression = "Math.round(time * " + FPS + ") % thisComp.layer(\"control\").effect(1)(1) == 0 ? 1 : 0";
+    queue(stamped, 12, "expr_read_3", null, 13);
+    slider.setValue(5);
+    queue(stamped, 13, "expr_read_5", null, 2);
+
     // Saved so that a fresh aerender can show what those last frames should be.
     app.project.save(new File(OUT + "/feedback_live_edited.aep"));
     app.endSuppressDialogs(false);

@@ -56,6 +56,7 @@ struct FrameParams
     // Pixel Sampling, as a SampleFilter: how the trail's move and the input's placement read between
     // pixels. At Pixel they copy whole pixels, so nothing softens however often the trail is moved.
     int filter;
+    float inputOpacity; // Opacity at this step's moment: how much of the input goes in
 };
 
 // x' = a x + b y + tx, y' = c x + d y + ty.
@@ -181,7 +182,8 @@ public:
         id<MTLBuffer> image,
         const PlacedImage& input,
         int compositeMode,
-        int filter);
+        int filter,
+        float opacity);
 
     // Queues a copy of a layer AE gave, `pitch` pixels a row, into a buffer of its own that outlives
     // AE's. Nil if there's no memory for it.

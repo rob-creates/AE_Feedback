@@ -17,6 +17,14 @@ function find(group, name) {
     return null;
 }
 
+// Keys `prop` at each frame from 0 with values(frame), held until the next, so it switches rather than
+// fading between them.
+function heldKeys(prop, frames, values) {
+    for (var f = 0; f < frames; f++) prop.setValueAtTime(f / FPS, values(f));
+    for (var k = 1; k <= prop.numKeys; k++)
+        prop.setInterpolationTypeAtKey(k, KeyframeInterpolationType.HOLD, KeyframeInterpolationType.HOLD);
+}
+
 function comp(name) {
     for (var i = 1; i <= app.project.numItems; i++) {
         var it = app.project.item(i);

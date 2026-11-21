@@ -16,13 +16,16 @@
 #include <dlfcn.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <climits>
 #include <complex>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <mutex>
@@ -54,6 +57,7 @@ enum
 {
     PARAM_INPUT = 0,
     PARAM_COMPOSITE,
+    PARAM_OPACITY,
     PARAM_ALPHA_START,
     PARAM_ALPHA_MAX,
     PARAM_ALPHA_MIN,
@@ -103,7 +107,6 @@ enum
     PARAM_EDGE_MASK,
     PARAM_EDGE_END,
     PARAM_SAMPLING_GROUP_START,
-    PARAM_UPDATE,
     PARAM_SUBSTEPS,
     PARAM_PRECISION,
     PARAM_SAMPLING,
@@ -116,11 +119,11 @@ enum
 // Saved projects find each control by this ID, so a control keeps its ID wherever it moves. In the
 // order above. ID 17 belonged to a Source popup, 33 and 34 to Position X and Y sliders, and 44 to a
 // Position where the centre went rather than how far it moved, 48 to a comp-space checkbox, 50 to a
-// Blur Type popup, 54 to Update Every (Frames), and 64 to a Static Maps checkbox, and they mustn't
-// be reused.
-const int kDiskIds[PARAM_COUNT] = {0, 1, 27, 2, 26, 55, 28, 29, 3, 51, 30, 4, 5, 6, 7, 8, 9, 56, 10, 11,
-                                    12, 13, 14, 57, 15, 31, 32, 47, 45, 35, 46, 36, 58, 37, 16, 18, 19, 20, 21, 22,
-                                    59, 23, 38, 39, 41, 40, 61, 42, 60, 43, 52, 62, 24, 63, 65, 49, 25, 53};
+// Blur Type popup, 54 to Update Every (Frames), 62 to an Update checkbox, which Opacity replaced, and 64
+// to a Static Maps checkbox, and they mustn't be reused.
+const int kDiskIds[PARAM_COUNT] = {0, 1, 66, 27, 2, 26, 55, 28, 29, 3, 51, 30, 4, 5, 6, 7, 8, 9, 56, 10,
+                                    11, 12, 13, 14, 57, 15, 31, 32, 47, 45, 35, 46, 36, 58, 37, 16, 18, 19, 20, 21,
+                                    22, 59, 23, 38, 39, 41, 40, 61, 42, 60, 43, 52, 24, 63, 65, 49, 25, 53};
 
 int DiskId(int param)
 {
@@ -218,8 +221,8 @@ using MapSources = std::array<int, SLOT_COUNT>;
 struct SampleFacts
 {
     SampleTime time;
-    bool updates; // Update: whether the layer goes into the trail at this moment
-    PF_LRect inputRect; // empty when it doesn't
+    float opacity; // Opacity: how much of the layer goes into the trail at this moment
+    PF_LRect inputRect; // empty when none does
     PF_LRect mapRects[SLOT_COUNT]; // each map layer's bounds, if it's read
 };
 
@@ -249,11 +252,15 @@ public:
         PF_RationalScale downsampleX, downsampleY;
         int samplesPerStep;
         uint64_t owner; // as CanvasKey::owner
+        // With expressions, AE's history can't vouch for the facts, so a run lasts only until anything in
+        // the project changes: ExpressionPrints::epoch. Zero without.
+        uint64_t expressionEpoch;
 
         bool operator==(const Key& o) const
         {
             return step == o.step && scale == o.scale && SameScale(downsampleX, o.downsampleX) &&
-                   SameScale(downsampleY, o.downsampleY) && samplesPerStep == o.samplesPerStep && owner == o.owner;
+                   SameScale(downsampleY, o.downsampleY) && samplesPerStep == o.samplesPerStep && owner == o.owner &&
+                   expressionEpoch == o.expressionEpoch;
         }
     };
 
@@ -290,7 +297,7 @@ struct FetchTag
 struct SubstepCheckout
 {
     SampleTime time;
-    bool updates; // whether the layer goes into the trail at this moment
+    float opacity; // how much of the layer goes into the trail at this moment
     A_long inputId;
     PF_LRect inputRect; // empty if there's no input to use
     FetchTag inputFetch;
@@ -308,7 +315,7 @@ struct FrameCheckout
 {
     A_long time;
     std::vector<SubstepCheckout> substeps; // oldest first; the last one is at the frame's own time
-    uint64_t motion = 0; // with the trail in comp space: the fingerprint an image of this frame is kept with
+    uint64_t motion = 0; // when fingerprinted: the fingerprint an image of this frame is kept with
 };
 
 // When the trail moves on: one frame of its layer's own comp at a time, whatever rate it's rendered at.
@@ -333,7 +340,7 @@ struct PreRenderData
     PF_LRect outputRect;
     TrailGrid grid;
     int samplesPerStep; // the frame's own moment plus any sub-steps
-    bool updates = true; // whether the layer goes into the trail at the moment shown
+    float opacity = 1.0f; // how much of the layer goes into the trail at the moment shown
 
     // FrameParams::spreadWidest: in comp space, half the longer side of the comp and its margin, as the
     // canvas was before it followed the trail. In the layer, from the canvas, as before.
@@ -364,6 +371,9 @@ struct PreRenderData
     // On an adjustment layer, images are kept with the project's timestamp from before their inputs
     // were read, and checked against the comp.
     bool watchesComp = false;
+    // Images are kept with a fingerprint of what AE's history doesn't show: where the layer went, for a
+    // comp-space trail, and what expressions gave. FrameCheckout::motion.
+    bool fingerprinted = false;
     AEGP_TimeStamp made{};
 };
 
@@ -407,15 +417,27 @@ inline bool Before(A_long a, A_long b, A_long step)
     return step > 0 ? a < b : a > b;
 }
 
+// splitmix64's finaliser: every bit of the result depends on every bit of `x`.
+inline uint64_t Scramble(uint64_t x)
+{
+    x ^= x >> 30;
+    x *= 0xBF58476D1CE4E5B9ull;
+    x ^= x >> 27;
+    x *= 0x94D049BB133111EBull;
+    return x ^ x >> 31;
+}
+
 class MotionPrints
 {
 public:
     // Where each map layer went counts too. Empty ones are left out. With sub-steps, a frame's reading
     // takes in each of its moments, as the layer is put where it is at each.
+    // `expressions`, if given, reads what the effect's expressions give at a moment, which counts too.
     MotionPrints(PF_InData* in_data, LayerMotion& motion, std::optional<LayerMotion> (&maps)[SLOT_COUNT],
-                 A_long firstTime, A_long step, int window, int samplesPerStep)
-        : mInData(in_data), mMotion(motion), mFirst(firstTime), mStep(step), mWindow(window),
-          mSamplesPerStep(samplesPerStep)
+                 A_long firstTime, A_long step, int window, int samplesPerStep,
+                 std::function<uint64_t(const SampleTime&)> expressions = nullptr)
+        : mInData(in_data), mMotion(motion), mExpressions(std::move(expressions)), mFirst(firstTime), mStep(step),
+          mWindow(window), mSamplesPerStep(samplesPerStep)
     {
         for (auto& map : maps)
             if (map)
@@ -472,8 +494,12 @@ private:
                 print = print * 0xD6E8FEB86659FD93ull + mMotion.fingerprint(at.value, at.scale);
                 for (LayerMotion* map : mMaps)
                     print = print * 0xC2B2AE3D27D4EB4Full + map->fingerprint(at.value, at.scale);
+                if (mExpressions)
+                    print = print * 0x165667B19E3779F9ull + mExpressions(at);
             }
-            found = mFrames.emplace(t, print * 0x9E3779B97F4A7C15ull + uint64_t(t)).first;
+            // Scrambled together with its time: the frames are summed, and a reading merely offset by its
+            // time would let two histories with the same readings at different frames sum alike.
+            found = mFrames.emplace(t, Scramble(print ^ uint64_t(t) * 0x9E3779B97F4A7C15ull)).first;
         }
         return found->second;
     }
@@ -481,15 +507,32 @@ private:
     PF_InData* mInData;
     LayerMotion& mMotion;
     std::vector<LayerMotion*> mMaps;
+    std::function<uint64_t(const SampleTime&)> mExpressions;
     A_long mFirst, mStep;
     int mWindow, mSamplesPerStep;
     std::unordered_map<A_long, uint64_t> mFrames, mSums;
+};
+
+// The values expressions gave, read by ExpressionPrints and kept for each instance of the effect until
+// anything in the project changes, as the project's timestamp tells. A moment is a time and its scale.
+struct ExpressionReadings
+{
+    using Values = std::map<std::pair<A_long, A_u_long>, uint64_t>;
+    struct Instance
+    {
+        AEGP_TimeStamp made{};
+        std::vector<int> params; // the controls an expression drives
+        std::shared_ptr<const Values> readings;
+    };
+    std::mutex lock;
+    std::unordered_map<uint64_t, Instance> instances;
 };
 
 struct MetalData
 {
     std::unique_ptr<FeedbackRenderer> renderer;
     FrameFactsMemo memo;
+    ExpressionReadings expressions;
 };
 
 void DisposePreRenderData(void* p)
@@ -1000,6 +1043,10 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
 
     popup("Composite", 10, COMPOSITE_INPUT_IN_FRONT,
           "Input In Front|Input Behind|Add|Screen|Multiply|Lighten|Darken|Overlay|Add/Subtract|Difference", PARAM_COMPOSITE);
+    // How much of the layer goes into the trail, as if it were that transparent. At 0 it adds nothing, as
+    // if it were empty, while the trail goes on moving and fading. Keyframed, it fades the layer in and out
+    // of the trail, or with Hold keyframes stamps it in at those moments.
+    slider("Opacity", 0, 1, 0, 1, 1, 3, PARAM_OPACITY);
 
     topic("Alpha", PARAM_ALPHA_START);
     slider("Alpha Max", 0, 1, 0, 1, 0.85, 3, PARAM_ALPHA_MAX);
@@ -1074,10 +1121,6 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
     endTopic(PARAM_EDGE_END);
 
     topic("Sampling", PARAM_SAMPLING_GROUP_START);
-    // Off, the layer adds nothing to the trail, as if it were empty, while the trail goes on moving and
-    // fading. Keyframed on and off, it stamps the layer into the trail at those moments.
-    AEFX_CLR_STRUCT(def);
-    PF_ADD_CHECKBOXX("Update", TRUE, 0, DiskId(PARAM_UPDATE));
     fixedInteger("Sub-steps", 0, kMaxSubsteps, kMaxSubsteps, 0, PARAM_SUBSTEPS);
     // How faint older frames may get before a rebuild leaves them out, and how far the blur's faint
     // tails are followed: below what the depth can show. The trail itself is always worked in float.
@@ -1524,10 +1567,10 @@ PF_Err ReadFrameFacts(
         }
         {
             ParamReader at{in_data, sample.time};
-            sample.updates = at.checkbox(PARAM_UPDATE);
+            sample.opacity = std::clamp(at.slider(PARAM_OPACITY), 0.0f, 1.0f);
             ERR(at.err);
         }
-        if (sample.updates)
+        if (sample.opacity > 0.0f)
             ERR(LayerBounds(in_data, extra, request, PARAM_INPUT, sample.time, nextId, &sample.inputRect));
         for (int slot = 0; !err && slot < SLOT_COUNT; slot++)
             if (sources[slot] == MAP_LAYER)
@@ -1606,6 +1649,217 @@ uint64_t EffectInstance(PF_InData* in_data, PF_OutData* out_data)
         return 0;
     }
 }
+
+// The controls of this effect that an expression drives, by index.
+std::vector<int> FindExpressions(PF_InData* in_data, PF_OutData* out_data)
+{
+    std::vector<int> found;
+    try
+    {
+        const AEGP_PluginID plugin = FeedbackPluginId(in_data, out_data);
+        AEFX_SuiteScoper<AEGP_PFInterfaceSuite1> face(in_data, kAEGPPFInterfaceSuite, kAEGPPFInterfaceSuiteVersion1, out_data);
+        AEFX_SuiteScoper<AEGP_EffectSuite5> effects(in_data, kAEGPEffectSuite, kAEGPEffectSuiteVersion5, out_data);
+        AEFX_SuiteScoper<AEGP_StreamSuite7> streams(in_data, kAEGPStreamSuite, kAEGPStreamSuiteVersion7, out_data);
+        AEGP_EffectRefH effect = nullptr;
+        if (!plugin || face->AEGP_GetNewEffectForEffect(plugin, in_data->effect_ref, &effect) || !effect)
+            return found;
+        for (int index = 1; index < PARAM_COUNT; index++)
+        {
+            AEGP_StreamRefH stream = nullptr;
+            if (streams->AEGP_GetNewEffectStreamByIndex(plugin, effect, index, &stream) || !stream)
+                continue;
+            // Only a control that can vary over time can have an expression, and AE stops with an error
+            // if asked about any other: group headings, layer controls and those that can't be keyframed.
+            A_Boolean canVary = false, enabled = false;
+            if (!streams->AEGP_CanVaryOverTime(stream, &canVary) && canVary &&
+                !streams->AEGP_GetExpressionState(plugin, stream, &enabled) && enabled)
+                found.push_back(index);
+            streams->AEGP_DisposeStream(stream);
+        }
+        effects->AEGP_DisposeEffect(effect);
+    }
+    catch (...)
+    {
+    }
+    return found;
+}
+
+// Mixes what a control holds into `h`. Layer controls hold no value of their own and are left out.
+void MixValue(uint64_t& h, const PF_ParamDef& d)
+{
+    const auto mix = [&](double v)
+    {
+        uint64_t bits;
+        std::memcpy(&bits, &v, sizeof(bits));
+        h = (h ^ bits) * 0x100000001B3ull;
+        h ^= h >> 29;
+    };
+    switch (d.param_type)
+    {
+    case PF_Param_FLOAT_SLIDER:
+        mix(d.u.fs_d.value);
+        break;
+    case PF_Param_SLIDER:
+        mix(d.u.sd.value);
+        break;
+    case PF_Param_FIX_SLIDER:
+        mix(d.u.fd.value);
+        break;
+    case PF_Param_ANGLE:
+        mix(d.u.ad.value);
+        break;
+    case PF_Param_CHECKBOX:
+        mix(d.u.bd.value);
+        break;
+    case PF_Param_POPUP:
+        mix(d.u.pd.value);
+        break;
+    case PF_Param_POINT:
+        mix(d.u.td.x_value);
+        mix(d.u.td.y_value);
+        break;
+    case PF_Param_POINT_3D:
+        mix(d.u.point3d_d.x_value);
+        mix(d.u.point3d_d.y_value);
+        mix(d.u.point3d_d.z_value);
+        break;
+    case PF_Param_COLOR:
+        mix(d.u.cd.value.alpha);
+        mix(d.u.cd.value.red);
+        mix(d.u.cd.value.green);
+        mix(d.u.cd.value.blue);
+        break;
+    default:
+        break;
+    }
+}
+
+// AE's history of the effect's controls doesn't change when an expression is added or edited, or when
+// what one reads changes, so neither AE's cache of finished frames nor the trail's own images can tell
+// a trail made before from one made after, and both go on showing what was made before. So what each
+// expression gives is read at every moment of the trail and goes into the fingerprint frames are kept
+// with, as where the layer went does. Readings are kept until anything in the project changes, so
+// playing on reads only the new moments.
+class ExpressionPrints
+{
+public:
+    ExpressionPrints(PF_InData* in_data, PF_OutData* out_data, ExpressionReadings& shared)
+        : mInData(in_data), mShared(shared)
+    {
+        try
+        {
+            AEFX_SuiteScoper<AEGP_RenderSuite5> render(in_data, kAEGPRenderSuite, kAEGPRenderSuiteVersion5, out_data);
+            mHaveMade = render->AEGP_GetCurrentTimestamp(&mMade) == A_Err_NONE;
+        }
+        catch (...)
+        {
+            mHaveMade = false;
+        }
+        mInstance = EffectInstance(in_data, out_data);
+        if (mHaveMade && mInstance)
+        {
+            std::lock_guard<std::mutex> guard(shared.lock);
+            auto found = shared.instances.find(mInstance);
+            if (found != shared.instances.end() && SameStamp(found->second.made, mMade))
+            {
+                mParams = found->second.params;
+                mKnown = found->second.readings;
+                mFound = true;
+            }
+        }
+        if (!mFound)
+            mParams = FindExpressions(in_data, out_data);
+    }
+
+    ~ExpressionPrints()
+    {
+        if (!mHaveMade || !mInstance || (mFound && mNew.empty()))
+            return;
+        std::lock_guard<std::mutex> guard(mShared.lock);
+        ExpressionReadings::Instance& kept = mShared.instances[mInstance];
+        auto values = std::make_shared<ExpressionReadings::Values>();
+        if (SameStamp(kept.made, mMade) && kept.readings)
+            *values = *kept.readings;
+        // Long sessions on one project mustn't grow this without end.
+        if (values->size() > 1000000)
+            values->clear();
+        values->insert(mNew.begin(), mNew.end());
+        kept.made = mMade;
+        kept.params = mParams;
+        kept.readings = values;
+    }
+
+    bool active() const { return !mParams.empty(); }
+    int count() const { return int(mParams.size()); }
+    bool reused() const { return mFound; } // its readings came from an earlier call at this timestamp
+    uint32_t stamp() const
+    {
+        uint32_t s = 0;
+        std::memcpy(&s, mMade.a, sizeof(s));
+        return s;
+    }
+
+    // For FrameFactsMemo::Key: changes with anything in the project while there are expressions. A
+    // timestamp that can't be read never matches.
+    uint64_t epoch() const
+    {
+        if (!active())
+            return 0;
+        if (!mHaveMade)
+        {
+            static std::atomic<uint64_t> never{1};
+            return never++ | 1ull << 63;
+        }
+        uint32_t stamp;
+        std::memcpy(&stamp, mMade.a, sizeof(stamp));
+        return uint64_t(stamp) + 1;
+    }
+
+    // What the expressions give at a moment.
+    uint64_t at(const SampleTime& t)
+    {
+        if (mParams.empty())
+            return 0;
+        const auto key = std::make_pair(t.value, t.scale);
+        if (mKnown)
+            if (auto found = mKnown->find(key); found != mKnown->end())
+                return found->second;
+        if (auto found = mNew.find(key); found != mNew.end())
+            return found->second;
+        uint64_t print = 0xCBF29CE484222325ull;
+        for (int index : mParams)
+        {
+            PF_ParamDef def;
+            AEFX_CLR_STRUCT(def);
+            if (PF_CHECKOUT_PARAM(mInData, index, t.value, t.step, t.scale, &def))
+            {
+                // Unreadable, so never the same as anything kept.
+                static std::atomic<uint64_t> unread{1};
+                return unread++ | 1ull << 63;
+            }
+            MixValue(print, def);
+            PF_CHECKIN_PARAM(mInData, &def);
+        }
+        mNew.emplace(key, print);
+        return print;
+    }
+
+private:
+    static bool SameStamp(const AEGP_TimeStamp& a, const AEGP_TimeStamp& b)
+    {
+        return std::memcmp(&a, &b, sizeof(a)) == 0;
+    }
+
+    PF_InData* mInData;
+    ExpressionReadings& mShared;
+    AEGP_TimeStamp mMade{};
+    bool mHaveMade = false;
+    uint64_t mInstance = 0;
+    bool mFound = false;
+    std::vector<int> mParams;
+    std::shared_ptr<const ExpressionReadings::Values> mKnown;
+    ExpressionReadings::Values mNew;
+};
 
 // Both map layer controls, read through one effect reference. `fallback` is each one's source if it
 // can't be read.
@@ -2097,12 +2351,12 @@ PF_Err CheckOutFrames(
             const SampleFacts& sample = facts.samples[i];
             SubstepCheckout sub{};
             sub.time = sample.time;
-            sub.updates = sample.updates;
+            sub.opacity = sample.opacity;
             if (k == 0 && i + 1 == facts.samples.size() && !data->grid.between())
             {
-                // Checked out either way, as AE needs, but only used while the layer updates the trail.
+                // Checked out either way, as AE needs, but only used while some of the layer goes in.
                 sub.inputId = data->currentInputId;
-                if (sample.updates)
+                if (sample.opacity > 0.0f)
                     sub.inputRect = data->currentInputRect;
             }
             else if (!IsEmpty(sample.inputRect))
@@ -2204,6 +2458,7 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
         // this effect.
         LayerMotion motion(in_data, out_data);
         const CompWatch watch(in_data, out_data);
+        ExpressionPrints expressions(in_data, out_data, metal->expressions);
         data->watchesComp = watch.active();
         if (data->watchesComp)
             watch.timestamp(&data->made);
@@ -2234,7 +2489,8 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             in_data->downsample_x,
             in_data->downsample_y,
             data->samplesPerStep,
-            data->canvas.owner};
+            data->canvas.owner,
+            expressions.epoch()};
         RunView view;
         if (!err)
             view = FindFacts(in_data, extra, request, utils, metal->memo, factsKey, &nextId, &err);
@@ -2352,25 +2608,30 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
         if (!err)
         {
             const SampleFacts& own = grid.between() ? betweenFacts.samples.back() : walk.window[0]->samples.back();
-            data->updates = own.updates;
+            data->opacity = own.opacity;
             ERR(CheckoutWholeLayer(in_data, extra, request, PARAM_INPUT, own.time, data->currentInputId, &data->currentInputRect));
         }
 
         // With the trail in comp space, the output is the layer's view of the comp, around the layer.
+        data->fingerprinted = data->canvas.compSpace || expressions.active();
+        std::function<uint64_t(const SampleTime&)> expressionsAt;
+        if (expressions.active())
+            expressionsAt = [&expressions](const SampleTime& t) { return expressions.at(t); };
         MotionPrints prints(in_data, motion, mapMotions, firstTime, grid.step, int(walk.window.size()),
-                            data->samplesPerStep);
+                            data->samplesPerStep, expressionsAt);
         MotionAt motionAt;
-        if (!err && data->canvas.compSpace)
+        if (!err && data->fingerprinted)
         {
             motionAt = [&prints](A_long t) { return prints.at(t); };
-            // Where the layer went changes the frame, though AE's history doesn't show it. Between
-            // frames, so does where it is now.
-            const uint64_t moved = prints.at(grid.last), movedSince = grid.between() ? motion.fingerprint(now) : 0;
+            // Where the layer went, and what expressions gave, change the frame, though AE's history
+            // doesn't show either. Between frames, so does where the layer is now.
+            const uint64_t moved = prints.at(grid.last);
+            const uint64_t movedSince = grid.between() && data->canvas.compSpace ? motion.fingerprint(now) : 0;
             ERR(extra->cb->GuidMixInPtr(in_data->effect_ref, sizeof(moved), &moved));
             ERR(extra->cb->GuidMixInPtr(in_data->effect_ref, sizeof(movedSince), &movedSince));
-            if (!motion.layerToComp(now, A_u_long(in_data->time_scale), &data->layerToCompNow))
-                err = PF_Err_INTERNAL_STRUCT_DAMAGED;
         }
+        if (!err && data->canvas.compSpace && !motion.layerToComp(now, A_u_long(in_data->time_scale), &data->layerToCompNow))
+            err = PF_Err_INTERNAL_STRUCT_DAMAGED;
         if (!err && data->canvas.compSpace)
         {
             const PF_LRect output = LayerViewOfComp(AtResolution(data->layerToCompNow, in_data), area, data->currentInputRect);
@@ -2405,9 +2666,9 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             const SampleFacts& sample = betweenFacts.samples.back();
             SubstepCheckout sub{};
             sub.time = sample.time;
-            sub.updates = sample.updates;
+            sub.opacity = sample.opacity;
             sub.inputId = data->currentInputId;
-            if (sample.updates)
+            if (sample.opacity > 0.0f)
                 sub.inputRect = data->currentInputRect;
             ERR(CheckOutMaps(in_data, extra, request, fetchContext, mapArea, sample, &nextId, &sub));
             data->between = sub;
@@ -2428,17 +2689,19 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
         };
         for (FrameCheckout& frame : data->frames)
         {
-            if (err || !data->canvas.compSpace)
+            if (err)
                 break;
-            frame.motion = prints.at(frame.time);
-            for (SubstepCheckout& sub : frame.substeps)
-                place(sub);
+            if (data->fingerprinted)
+                frame.motion = prints.at(frame.time);
+            if (data->canvas.compSpace)
+                for (SubstepCheckout& sub : frame.substeps)
+                    place(sub);
         }
         if (!err && data->canvas.compSpace && data->between)
             place(*data->between);
 
         Log("prerender frame=%d window=%d samples=%d read=%d resume=%d checkouts=%d canvas=%dx%d at %d,%d layer=%dx%d "
-            "downsample=%.2f ms=%.2f time=%d step=%d scale=%u first=%d adjust=%d last=%d every=%d share=%.3f",
+            "downsample=%.2f ms=%.2f time=%d step=%d scale=%u first=%d adjust=%d last=%d every=%d share=%.3f expressions=%d stamp=%08x reused=%d print=%016llx",
             step > 0 ? now / step : 0,
             int(walk.window.size()) - 1,
             data->samplesPerStep,
@@ -2460,7 +2723,11 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             int(data->watchesComp),
             grid.last,
             grid.step,
-            grid.share);
+            grid.share,
+            expressions.count(),
+            expressions.stamp(),
+            int(expressions.reused()),
+            (unsigned long long)(data->fingerprinted ? prints.at(grid.last) : 0));
     }
 
     if (!err)
@@ -2635,12 +2902,13 @@ PF_Err ComputeSample(
     else if (!err)
         params = DivideIntoSteps(ReadFrameParams(in_data, sub.time, &err), share, frameEnd);
     params.filter = render.data.filter;
+    params.inputOpacity = sub.opacity;
     params.spreadWidest = render.data.spreadWidest;
     std::copy(render.data.sources.begin(), render.data.sources.end(), params.sources);
 
     auto fetchStart = std::chrono::steady_clock::now();
-    // With Update off, the layer adds nothing, as if it were empty.
-    PF_EffectWorld* inputWorld = isCurrent && sub.updates ? render.currentInput : nullptr;
+    // At Opacity 0, the layer adds nothing, as if it were empty.
+    PF_EffectWorld* inputWorld = isCurrent && sub.opacity > 0.0f ? render.currentInput : nullptr;
     FetchedPixels sharedInput{}, sharedMaps[SLOT_COUNT]{};
     const bool inputShared = !isCurrent && !IsEmpty(sub.inputRect) && render.found(sub.inputFetch, &sharedInput);
     bool mapShared[SLOT_COUNT] = {};
@@ -2860,7 +3128,7 @@ PF_Err ShowImage(GpuRender& render, id<MTLBuffer> image, PF_EffectWorld* output)
     // off, the layer isn't there to go on top.
     id<MTLBuffer> shown = image;
     bool shownIsScratch = false;
-    if ((render.data.samplesPerStep > 1 || render.data.between) && render.data.updates && render.currentInput)
+    if ((render.data.samplesPerStep > 1 || render.data.between) && render.data.opacity > 0.0f && render.currentInput)
     {
         ParamReader r{render.in_data, FrameSample(render.in_data, render.in_data->current_time)};
         const int mode = r.popup(PARAM_COMPOSITE);
@@ -2874,7 +3142,8 @@ PF_Err ShowImage(GpuRender& render, id<MTLBuffer> image, PF_EffectWorld* output)
                 err = PF_Err_INTERNAL_STRUCT_DAMAGED;
             if (!err)
             {
-                shown = renderer.compositeInput(render.queue, canvas, image, input, mode, render.data.filter);
+                shown = renderer.compositeInput(render.queue, canvas, image, input, mode, render.data.filter,
+                                                render.data.opacity);
                 shownIsScratch = shown != nil;
                 if (!shown)
                     err = PF_Err_INTERNAL_STRUCT_DAMAGED;
@@ -2942,9 +3211,10 @@ PF_Err RenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* 
         const int frameCount = int(data->frames.size());
         id<MTLBuffer> image = nil;
         CanvasKey imageCanvas = canvas;
-        // A comp-space image is only of use if the layer went where it did when PreRender looked.
+        // A fingerprinted image is only of use if the layer went where it did, and expressions gave what
+        // they did, when PreRender looked.
         MotionAt motionAt;
-        if (data->canvas.compSpace)
+        if (data->fingerprinted)
             motionAt = [data, step](A_long t)
             {
                 // [k] is k frames before the current one.

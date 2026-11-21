@@ -132,15 +132,20 @@
         dotComp("sampling_bicubic", 72, { "Alpha Max": 1, "Position": [0, 2.5], "Sub-steps": 5, "Pixel Sampling": 2 });
         dotComp("sampling_pixel", 72, { "Alpha Max": 1, "Position": [0, 2.5], "Sub-steps": 5, "Pixel Sampling": 3 });
 
-        // Update on only every 4th frame: the trail moves every frame, but takes in the dot only then.
+        // Opacity held at 1 only every 4th frame, and 0 between: the trail moves every frame, but takes in
+        // the dot only then.
         var stamp = stillDot("update_stamp", 16, [100, 180], 5, { "Alpha Max": 0.9, "Position": [20, 0] });
-        for (var f = 0; f < 16; f++) find(stamp, "Update").setValueAtTime(f / FPS, f % 4 === 0);
-        // Update off throughout leaves nothing, with sub-steps and Add, where the layer would go on top.
-        dotComp("update_off", 24, { "Alpha Max": 0.9, "Composite": 3, "Sub-steps": 1, "Update": false });
+        heldKeys(find(stamp, "Opacity"), 16, function (f) { return f % 4 === 0 ? 1 : 0; });
+        // The same, for live_session.jsx to drive Opacity by expressions added part way through.
+        stillDot("expression_stamp", 16, [100, 180], 5, { "Alpha Max": 0.9, "Position": [20, 0] });
+        // Opacity 0 throughout leaves nothing, with sub-steps and Add, where the layer would go on top.
+        dotComp("update_off", 24, { "Alpha Max": 0.9, "Composite": 3, "Sub-steps": 1, "Opacity": 0 });
+        // Opacity 0.5 lays each frame's dot in at half strength.
+        stillDot("opacity_half", 12, [200, 180], 5, { "Alpha Max": 0.9, "Position": [20, 0], "Opacity": 0.5 });
         // Scale 0 shrinks the trail to nothing each frame: a dot on Centre, stamped once, is gone by the
         // next frame, its very centre included.
         var zero = stillDot("transform_scale_zero", 4, [W / 2, H / 2], 5, { "Alpha Max": 0.9, "Scale Height": 0 });
-        for (var z = 0; z < 4; z++) find(zero, "Update").setValueAtTime(z / FPS, z === 0);
+        heldKeys(find(zero, "Opacity"), 4, function (f) { return f === 0 ? 1 : 0; });
 
         // Edges of a still dot, over its trail, in front of the dot itself: only its outline shows.
         stillDot("edge_luminance", 4, [W / 2, H / 2], 40,
@@ -355,7 +360,7 @@
         var drift = newComp("border_drift", 12);
         var sheet = drift.layers.addSolid(RED, "sheet", W + 400, H + 400, 1, drift.duration);
         var sheetFx = feedback(sheet, { "Alpha Max": 0.9, "Position": [8.5, 0] });
-        for (var sf = 0; sf < 12; sf++) find(sheetFx, "Update").setValueAtTime(sf / FPS, sf === 0);
+        heldKeys(find(sheetFx, "Opacity"), 12, function (f) { return f === 0 ? 1 : 0; });
 
         // A comp-space trail, rendered again by run_tests.py with the canvas held to a small machine's
         // worth: it keeps the part around the layer, as the full canvas has it.

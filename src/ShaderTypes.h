@@ -200,6 +200,7 @@ struct CompositeParams
     int inputWarped;
     float inputFromCanvas[9]; // row-major 3x3, to input pixel coordinates
     int filter; // SampleFilter: how the input is read, when warped
+    float inputOpacity; // Opacity: the input is laid in as if this transparent
 };
 
 struct StepParams

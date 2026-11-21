@@ -19,9 +19,10 @@ Feedback Effect for Adobe After Effects
   mask is read where it is in the comp, and the effect's own layer at Effects & Masks uses the
   trail. Left at None, the group applies everywhere. Where an Alpha mask is dark the trail doesn't
   fade, so jumping to a frame recalculates the trail from its start, or from Pre-Roll Limit.
-- Update, under Sampling, is on by default. Turned off, the layer stops adding to the trail, as if it
-  were empty, while the trail goes on moving, fading and changing as usual. Keyframe it on and off to
-  stamp the layer into a smoothly moving trail, in time with music for instance.
+- Opacity, under Composite, sets how much of the layer goes into the trail, from 1 (all of it, the
+  default) to 0 (none, as if the layer were empty, while the trail goes on moving, fading and changing
+  as usual). Keyframe it to fade the layer in and out of the trail, or use Hold keyframes between 1 and
+  0 to stamp the layer into a smoothly moving trail, in time with music for instance.
 - Transform's Scale goes down to 0, which shrinks the whole trail away in a single frame.
 - Pixel Sampling, under Sampling, sets how the trail is moved between pixels. Bilinear, the default,
   blends the four nearest pixels: a trail moved by fractions of a pixel (by Transform, displacement or

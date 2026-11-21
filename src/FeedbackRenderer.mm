@@ -209,6 +209,7 @@ CompositeParams MakeCompositeParams(const CanvasKey& canvas, const PlacedImage& 
     p.prevPitch = canvas.width;
     p.dstPitch = canvas.width;
     p.mode = mode;
+    p.inputOpacity = 1.0f;
     p.inputPitch = input.pitch;
     p.inputOffsetX = input.offsetX;
     p.inputOffsetY = input.offsetY;
@@ -611,6 +612,7 @@ id<MTLBuffer> FeedbackRenderer::step(
     grade.alphaOffset = f.alphaOffset;
     last.composite = MakeCompositeParams(canvas, input, f.compositeMode);
     last.composite.filter = f.filter;
+    last.composite.inputOpacity = f.inputOpacity;
     last.composite.splitsInput = f.splitsInput;
     last.composite.frameAlpha = f.frameAlpha;
     last.composite.stepAlpha = f.stepAlpha;
@@ -648,11 +650,13 @@ id<MTLBuffer> FeedbackRenderer::compositeInput(
     id<MTLBuffer> image,
     const PlacedImage& input,
     int compositeMode,
-    int filter)
+    int filter,
+    float opacity)
 {
     id<MTLBuffer> result = mCache->acquireScratch(canvas.bytes());
     CompositeParams p = MakeCompositeParams(canvas, input, compositeMode);
     p.filter = filter;
+    p.inputOpacity = opacity;
     if (!RunOnce(queue, mComposite, {image, input.buffer ? input.buffer : mEmpty, result}, p, canvas.width, canvas.height))
     {
         mCache->releaseScratch(result);
