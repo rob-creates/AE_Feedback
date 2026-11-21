@@ -1363,46 +1363,69 @@ PF_Err CheckoutOrShare(
 // and what expressions gave. Null when there's nothing to fingerprint.
 using MotionAt = std::function<uint64_t(A_long)>;
 
-// What else an image must match, beyond the effect's history, to be used: that fingerprint, and on an
-// adjustment layer, that nothing in the comp has changed since it was made.
-using StillCurrent = std::function<bool(const FeedbackCache::Candidate&, A_long time)>;
-
-// With `watch`, the comp is checked; one that couldn't be set up passes nothing.
-StillCurrent MakeStillCurrent(MotionAt motion, const CompWatch* watch, A_long step)
+// Works out what an image of a frame depends on now (ImageValidity), and whether one kept with an earlier
+// validity can stand for it. `prints` gives the fingerprint at a frame, and `watch`, on an adjustment
+// layer, tells whether anything in the comp has changed since an image was made; one that couldn't be set
+// up passes nothing. `made` is the project's timestamp when this render read its inputs.
+class ValidityCheck
 {
-    return [motion = std::move(motion), watch, step](const FeedbackCache::Candidate& candidate, A_long time)
+public:
+    ValidityCheck(PF_InData* in_data, const PF_ParamUtilsSuite3& utils, const CanvasKey& canvas, A_long step,
+                  MotionAt prints, const CompWatch* watch, const AEGP_TimeStamp& made)
+        : mInData(in_data), mUtils(utils), mFirstTime(canvas.firstTime), mStep(step), mPrints(std::move(prints)),
+          mWatch(watch), mMade(made)
     {
-        return candidate.motion == (motion ? motion(time) : 0) &&
-               (!watch || watch->unchangedSince(candidate.made, time + step));
-    };
-}
+    }
 
-// Finds the image for `time`, if one exists whose history is still current, for a render of `now`.
+    // What an image of the frame at `time` made now depends on. False if AE's history can't be read.
+    bool at(A_long time, ImageValidity* out) const
+    {
+        if (!ReadHistory(mInData, mUtils, HistoryEnd(time, mStep, mFirstTime), &out->history))
+            return false;
+        out->prints = mPrints ? mPrints(time) : 0;
+        out->made = mMade;
+        return true;
+    }
+
+    // Whether an image kept with `kept` can stand for the frame at `time`, which now depends on `now`.
+    bool same(const ImageValidity& kept, const ImageValidity& now, A_long time) const
+    {
+        A_Boolean same = 0;
+        mUtils.PF_AreStatesIdentical(mInData->effect_ref, &kept.history, &now.history, &same);
+        return same && kept.prints == now.prints && (!mWatch || mWatch->unchangedSince(kept.made, time + mStep));
+    }
+
+private:
+    PF_InData* mInData;
+    const PF_ParamUtilsSuite3& mUtils;
+    A_long mFirstTime, mStep;
+    MotionAt mPrints;
+    const CompWatch* mWatch;
+    AEGP_TimeStamp mMade;
+};
+
+// Finds the image for `time`, if one exists that's still valid, for a render of `now`.
 // An image drawn for a later frame sits on that frame's canvas, which follows the trail further on: a
 // canvas held below the trail's size leaves out the older end that this frame's canvas still has, so
 // such an image is used only if its canvas covers this one. An earlier frame's canvas is behind, where
 // the trail is, and is used as before. Later means further along `step`, which runs backwards in a
 // time-reversed layer. No buffer if there's none.
 TrailImage FindCached(
-    PF_InData* in_data,
-    const PF_ParamUtilsSuite3& utils,
     FeedbackCache& cache,
+    const ValidityCheck& validity,
     const CanvasKey& canvas,
     A_long now,
     A_long time,
-    A_long step,
-    const StillCurrent& current)
+    A_long step)
 {
     const auto candidates = cache.candidates(canvas, time);
-    PF_State history;
-    if (candidates.empty() || !ReadHistory(in_data, utils, HistoryEnd(time, step, canvas.firstTime), &history))
+    ImageValidity current;
+    if (candidates.empty() || !validity.at(time, &current))
         return {};
     for (const auto& candidate : candidates)
     {
-        A_Boolean same = 0;
-        utils.PF_AreStatesIdentical(in_data->effect_ref, &candidate.history, &history, &same);
         const bool drawnLater = (step > 0 && candidate.drawnFor > now) || (step < 0 && candidate.drawnFor < now);
-        if (same && current(candidate, time) && (!drawnLater || candidate.image.canvas.contains(canvas)))
+        if (validity.same(candidate.validity, current, time) && (!drawnLater || candidate.image.canvas.contains(canvas)))
         {
             cache.touch(candidate.image.buffer);
             return candidate.image;
@@ -1414,19 +1437,17 @@ TrailImage FindCached(
 // The newest image among the `frames` frames ending at `now`, or -1. Returns how many frames before
 // `now` it is.
 int FindResume(
-    PF_InData* in_data,
-    const PF_ParamUtilsSuite3& utils,
     FeedbackCache& cache,
+    const ValidityCheck& validity,
     const CanvasKey& canvas,
     A_long now,
     A_long step,
     int frames,
-    const StillCurrent& current,
     TrailImage* image)
 {
     for (int k = 0; k < frames; k++)
     {
-        *image = FindCached(in_data, utils, cache, canvas, now, now - k * step, step, current);
+        *image = FindCached(cache, validity, canvas, now, now - k * step, step);
         if (image->buffer)
             return k;
     }
@@ -2629,10 +2650,10 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
         int resumeK = -1;
         if (!err)
         {
-            const StillCurrent current = MakeStillCurrent(motionAt, data->watchesComp ? &watch : nullptr, grid.step);
-            resumeK = FindResume(
-                in_data, utils, metal->renderer->cache(), data->canvas, grid.last, grid.step, int(walk.window.size()),
-                current, &data->resume);
+            const ValidityCheck validity(in_data, utils, data->canvas, grid.step, motionAt,
+                                         data->watchesComp ? &watch : nullptr, data->made);
+            resumeK = FindResume(metal->renderer->cache(), validity, data->canvas, grid.last, grid.step,
+                                 int(walk.window.size()), &data->resume);
             ERR(CheckOutFrames(in_data, extra, request, fetchContext, mapArea, walk, resumeK >= 0 ? resumeK : int(walk.window.size()),
                                &nextId, data.get()));
         }
@@ -3177,9 +3198,9 @@ PF_Err RenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* 
         std::optional<CompWatch> watch;
         if (data->watchesComp)
             watch.emplace(in_data, out_data);
-        const StillCurrent current = MakeStillCurrent(motionAt, watch ? &*watch : nullptr, step);
+        const ValidityCheck validity(in_data, utils, canvas, step, motionAt, watch ? &*watch : nullptr, data->made);
         TrailImage resume;
-        int resumeK = err ? -1 : FindResume(in_data, utils, cache, canvas, data->grid.last, step, frameCount, current, &resume);
+        int resumeK = err ? -1 : FindResume(cache, validity, canvas, data->grid.last, step, frameCount, &resume);
         if (resumeK < 0)
         {
             resume = data->resume;
@@ -3254,14 +3275,13 @@ PF_Err RenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* 
 
             // Keep only the frames most likely to be asked for next; the rest of a long rebuild
             // would otherwise push useful images out of the cache.
-            PF_State history;
-            if (image && k < kRebuildFramesKept &&
-                ReadHistory(in_data, utils, HistoryEnd(frame.time, step, canvas.firstTime), &history))
+            ImageValidity kept;
+            if (image && k < kRebuildFramesKept && validity.at(frame.time, &kept))
             {
                 ERR(FlushSteps(render));
                 if (!err)
                 {
-                    cache.publish({{image, canvas, carry}, history, frame.motion, data->made, data->grid.last}, frame.time);
+                    cache.publish({{image, canvas, carry}, kept, data->grid.last}, frame.time);
                     imageIsScratch = false;
                 }
             }

@@ -72,6 +72,17 @@ struct TrailImage
     TrailCarry carry;
 };
 
+// What a trail's image depended on, all of which must be the same for it to stand for its frame again:
+// the effect's history, as AE records it; a fingerprint of what that doesn't show, where a comp-space
+// trail's layer went and what expressions gave (zero if nothing); and on an adjustment layer, whose input
+// AE's history doesn't follow, the project's timestamp when its inputs were read.
+struct ImageValidity
+{
+    PF_State history{};
+    uint64_t prints = 0;
+    AEGP_TimeStamp made{};
+};
+
 // A layer as one render fetched it from AE, kept so that other renders can use it rather than ask AE
 // for it again. AE renders several frames at once, and each reads layers at moments the others read too.
 struct FetchKey
@@ -114,15 +125,11 @@ struct FetchedPixels
 class FeedbackCache
 {
 public:
-    // `motion` fingerprints where the layer went while a comp-space trail was built, which AE's history
-    // doesn't cover. Zero for trails kept in the layer.
     struct Candidate
     {
         TrailImage image;
-        PF_State history;
-        uint64_t motion;
-        AEGP_TimeStamp made; // the project's timestamp when the image's inputs were read
-        A_long drawnFor;     // the frame whose canvas the image was drawn on, which may be later than its own
+        ImageValidity validity;
+        A_long drawnFor; // the frame whose canvas the image was drawn on, which may be later than its own
     };
 
     explicit FeedbackCache(id<MTLDevice> device);
