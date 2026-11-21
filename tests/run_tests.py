@@ -82,15 +82,20 @@ def render(project, comp, folder, start=None, end=None, extra_env=None):
            "-OMtemplate", "TIFF Sequence with Alpha", "-output", str(folder / "f_[#####].tif")]
     if start is not None:
         cmd += ["-s", str(start), "-e", str(end)]
-    # A logging build mixes this into its GUIDs, so AE's disk cache can't serve an earlier render's frames.
-    env = dict(os.environ, FEEDBACK_GUID_SALT=str(time.time_ns()), **(extra_env or {}))
-    began = time.time()
-    done = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=env)
-    took = time.time() - began
-    frames = len(list(folder.glob("f_*.tif")))
-    print(f"  {project} {comp} {start if start is not None else 'all'}: {took:.1f}s, {frames} files, exit {done.returncode}",
-          flush=True)
-    if done.returncode != 0 or frames == 0:
+    # aerender processes started together now and then fail to start, leaving nothing, so one that
+    # leaves nothing or fails is run again once.
+    for attempt in (1, 2):
+        # A logging build mixes this into its GUIDs, so AE's disk cache can't serve an earlier render's frames.
+        env = dict(os.environ, FEEDBACK_GUID_SALT=str(time.time_ns()), **(extra_env or {}))
+        began = time.time()
+        done = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=env)
+        took = time.time() - began
+        frames = len(list(folder.glob("f_*.tif")))
+        ok = done.returncode == 0 and frames > 0
+        print(f"  {project} {comp} {start if start is not None else 'all'}: {took:.1f}s, {frames} files, exit {done.returncode}"
+              + ("" if ok or attempt == 2 else ", trying again"), flush=True)
+        if ok:
+            break
         print(done.stdout[-1500:])
     return took
 
@@ -108,8 +113,12 @@ def cmd_render(label):
     jobs += [(f"{comp}_whole", "feedback_16.aep", comp, None, None, {"FEEDBACK_WHOLE_CANVAS": "1"}) for comp in WHOLE]
     jobs += [(f"{comp}_small", "feedback_16.aep", comp, None, None, {"FEEDBACK_CANVAS_PIXELS": str(SMALL_CANVAS)})
              for comp in ["canvas_limit", *STRETCHES]]
+    def run(index, job):
+        if index < JOBS:
+            time.sleep(2 * index)  # the first ones start a little apart
+        return render(job[1], job[2], base / job[0], job[3], job[4], extra_env=job[5])
     with ThreadPoolExecutor(max_workers=JOBS) as pool:
-        took = list(pool.map(lambda j: render(j[1], j[2], base / j[0], j[3], j[4], extra_env=j[5]), jobs))
+        took = list(pool.map(run, range(len(jobs)), jobs))
     timing = {j[0]: t for j, t in zip(jobs, took)}
     # Timed, so rendered alone.
     timing["deep_alpha1"] = render("feedback_16.aep", "deep_alpha1", base / "deep_alpha1", DEEP, DEEP)
