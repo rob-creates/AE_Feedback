@@ -543,21 +543,6 @@ NSString* MetallibPath()
     return [[contents stringByAppendingPathComponent:@"Resources"] stringByAppendingPathComponent:@"Feedback.metallib"];
 }
 
-inline bool IsEmpty(const PF_LRect& r)
-{
-    return r.left >= r.right || r.top >= r.bottom;
-}
-
-inline PF_LRect Intersect(const PF_LRect& a, const PF_LRect& b)
-{
-    PF_LRect r;
-    r.left = std::max(a.left, b.left);
-    r.top = std::max(a.top, b.top);
-    r.right = std::min(a.right, b.right);
-    r.bottom = std::min(a.bottom, b.bottom);
-    return r;
-}
-
 // `substepsBefore` of `substeps` spread over `step` before `frameTime`, expressed exactly. AE times are
 // integer fractions, so the scale grows when the step doesn't divide evenly. Each lasts no longer than
 // a frame, so layers render as they would at their own frame. Returns false if that would overflow
@@ -1230,16 +1215,6 @@ bool WholeCanvas()
 }
 #endif
 
-inline PF_LRect Union(const PF_LRect& a, const PF_LRect& b)
-{
-    PF_LRect r;
-    r.left = std::min(a.left, b.left);
-    r.top = std::min(a.top, b.top);
-    r.right = std::max(a.right, b.right);
-    r.bottom = std::max(a.bottom, b.bottom);
-    return r;
-}
-
 // Keeps `side` pixels of [lo, hi], staying as close to `focus` as possible.
 inline void TrimAxis(A_long* lo, A_long* hi, A_long focus, A_long side)
 {
@@ -1457,11 +1432,6 @@ int FindResume(
             return k;
     }
     return -1;
-}
-
-bool SameRect(const PF_LRect& a, const PF_LRect& b)
-{
-    return a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom;
 }
 
 // What a render may take from a run: frames before trustedEnd, which its own history matched.
@@ -2157,8 +2127,8 @@ PF_Err WalkTrail(
             if (!IsEmpty(sample.inputRect))
             {
                 const PF_LRect placed = toCanvas(sample);
-                frameArea = hasFrameArea ? Union(frameArea, placed) : placed;
-                frameInLayer = hasFrameArea ? Union(frameInLayer, sample.inputRect) : sample.inputRect;
+                frameArea = Union(frameArea, placed);
+                frameInLayer = Union(frameInLayer, sample.inputRect);
                 hasFrameArea = true;
                 if (!walk->hasProbe)
                 {
@@ -2211,7 +2181,7 @@ PF_Err WalkTrail(
                 walk->focusX = (frameArea.left + frameArea.right) / 2;
                 walk->focusY = (frameArea.top + frameArea.bottom) / 2;
             }
-            walk->area = walk->hasArea ? Union(walk->area, frameArea) : frameArea;
+            walk->area = Union(walk->area, frameArea);
             walk->hasArea = true;
         }
     }
@@ -2237,8 +2207,7 @@ PF_LRect LayerViewOfComp(const Projective& layerToComp, const PF_LRect& canvas, 
     PF_LRect seen;
     if (layerToComp.inverse(&compToLayer) && MovedBounds(compToLayer, canvas, &seen))
         view = seen;
-    if (!IsEmpty(layer))
-        view = IsEmpty(view) ? layer : Union(view, layer);
+    view = Union(view, layer);
     TrimAxis(&view.left, &view.right, focusX, kMaxCanvasSide);
     TrimAxis(&view.top, &view.bottom, focusY, kMaxCanvasSide);
     return view;
@@ -2521,7 +2490,7 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             const PF_LRect own = err ? PF_LRect{} : toCanvas(betweenFacts.samples.back());
             if (!walk.limited && !IsEmpty(own))
             {
-                walk.area = walk.hasArea ? Union(walk.area, own) : own;
+                walk.area = Union(walk.area, own);
                 walk.hasArea = true;
             }
         }

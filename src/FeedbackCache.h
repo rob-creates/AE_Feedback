@@ -12,6 +12,7 @@
 
 #include "AE_EffectSuites.h"
 #include "AE_GeneralPlug.h"
+#include "Rect.h"
 
 inline bool SameScale(const PF_RationalScale& a, const PF_RationalScale& b)
 {
@@ -98,8 +99,7 @@ struct FetchKey
     // What was fetched for `o` would do for this: all of what this asks for is in it.
     bool coveredBy(const FetchKey& o) const
     {
-        return sameSource(o) && o.area.left <= area.left && o.area.top <= area.top && o.area.right >= area.right &&
-               o.area.bottom >= area.bottom;
+        return sameSource(o) && Contains(o.area, area);
     }
 };
 
