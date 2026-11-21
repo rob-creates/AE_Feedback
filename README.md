@@ -75,4 +75,4 @@ With After Effects closed, and the build configured with `-DFEEDBACK_LOG=ON`:
 tests/run_all.sh LABEL [BASELINE]
 ```
 
-This rebuilds the test projects and runs a live session in After Effects, renders everything with `aerender` into `tests/out/LABEL`, and checks the results. With a `BASELINE` label, it also lists the frames that changed most since that run.
+This rebuilds the test projects and runs a live session in After Effects, renders everything with `aerender` into `tests/out/LABEL`, and checks the results. With a `BASELINE` label, it also lists the frames that changed most since that run. Renders run three at a time; set `FEEDBACK_TEST_JOBS` to change that. A render that fails or stops part way is tried again, up to three times.
