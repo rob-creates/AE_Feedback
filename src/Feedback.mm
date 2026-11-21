@@ -2990,12 +2990,43 @@ PF_Err FetchAhead(GpuRender& render, int frames, bool startsBlank)
         }
     }
 
-    const auto fetchOne = [&](const Need& need) -> PF_Err
+    // Copies are queued and run several at a time, rather than waited for one by one. Each layer stays
+    // checked out until its copy has run, so only a few are queued at once.
+    constexpr size_t kCopiesPerWait = 4;
+    struct Pending
     {
-        PF_Err e = PF_Err_NONE;
+        Need need;
+        PF_EffectWorld* world;
+        bool mine; // this render marked the fetch as its own, so it ends it
+        FetchedPixels pixels;
+    };
+    StepBatch copying{render.queue, nil, {}};
+    std::vector<Pending> pending;
+    // Runs the queued copies, keeps them for other renders, and hands the layers back to AE. A copy that
+    // failed isn't kept, and the step fetches it again.
+    const auto runCopies = [&]
+    {
+        const bool ok = pending.empty() || render.renderer.flush(copying);
+        for (const Pending& done : pending)
+        {
+            if (ok && done.pixels.buffer)
+            {
+                cache.publishFetch(done.need.tag->key, done.need.tag->state, done.pixels);
+                render.prefetched[done.need.tag] = done.pixels;
+            }
+            if (done.world)
+                render.extra->cb->checkin_layer_pixels(in_data->effect_ref, done.need.id);
+            if (done.mine)
+                cache.endFetch(done.need.tag->key);
+        }
+        pending.clear();
+    };
+
+    const auto fetchOne = [&](const Need& need, bool mine) -> PF_Err
+    {
         const auto started = std::chrono::steady_clock::now();
         PF_EffectWorld* world = nullptr;
-        e = render.extra->cb->checkout_layer_pixels(in_data->effect_ref, need.id, &world);
+        PF_Err e = render.extra->cb->checkout_layer_pixels(in_data->effect_ref, need.id, &world);
         const double ms = MsSince(started);
         render.fetchMs += ms;
         if (need.map)
@@ -3008,21 +3039,13 @@ PF_Err FetchAhead(GpuRender& render, int frames, bool startsBlank)
         PlacedImage placed{};
         if (!e && world)
             e = render.place(world, need.rect, &placed);
+        FetchedPixels pixels{};
         if (!e && placed.buffer)
-        {
-            StepBatch copying{render.queue, nil, {}};
-            id<MTLBuffer> copy = render.renderer.copyPixels(copying, placed.buffer, placed.pitch, placed.height);
-            if (copy && render.renderer.flush(copying))
-            {
-                const FetchedPixels pixels{copy, need.rect, placed.pitch, placed.width, placed.height};
-                cache.publishFetch(need.tag->key, need.tag->state, pixels);
-                render.prefetched[need.tag] = pixels;
-            }
-        }
-        // Copied, or not worth keeping: either way AE can have it back now. If the copy failed, the
-        // step fetches it again.
-        if (world)
-            render.extra->cb->checkin_layer_pixels(in_data->effect_ref, need.id);
+            if (id<MTLBuffer> copy = render.renderer.copyPixels(copying, placed.buffer, placed.pitch, placed.height))
+                pixels = FetchedPixels{copy, need.rect, placed.pitch, placed.width, placed.height};
+        pending.push_back({need, world, mine, pixels});
+        if (pending.size() >= kCopiesPerWait)
+            runCopies();
         return e;
     };
 
@@ -3044,23 +3067,23 @@ PF_Err FetchAhead(GpuRender& render, int frames, bool startsBlank)
             later->push_back(need);
             return PF_Err_NONE;
         }
-        const PF_Err e = fetchOne(need);
-        if (mine)
-            cache.endFetch(need.tag->key);
-        return e;
+        return fetchOne(need, mine);
     };
 
     std::vector<Need> later;
     for (const Need& need : needs)
         if ((err = tryFetch(need, &later)))
-            return err;
-    for (const Need& need : later)
-        if ((err = tryFetch(need, nullptr)))
-            return err;
+            break;
+    // What other renders were fetching, once theirs have had time to arrive.
+    if (!err)
+        runCopies();
+    for (size_t i = 0; !err && i < later.size(); i++)
+        err = tryFetch(later[i], nullptr);
+    runCopies();
     return err;
 }
 
-// Writes the image to AE's output.
+// Queues writing the image to AE's output, to run when the batch is next flushed.
 PF_Err ShowImage(GpuRender& render, id<MTLBuffer> image, PF_EffectWorld* output)
 {
     PF_Err err = PF_Err_NONE;
@@ -3080,7 +3103,7 @@ PF_Err ShowImage(GpuRender& render, id<MTLBuffer> image, PF_EffectWorld* output)
             err = PF_Err_INTERNAL_STRUCT_DAMAGED;
         if (!err)
         {
-            shown = renderer.compositeInput(render.queue, canvas, image, input, mode, render.data.filter,
+            shown = renderer.compositeInput(render.batch, canvas, image, input, mode, render.data.filter,
                                             render.data.opacity);
             shownIsScratch = shown != nil;
             if (!shown)
@@ -3096,11 +3119,12 @@ PF_Err ShowImage(GpuRender& render, id<MTLBuffer> image, PF_EffectWorld* output)
         Between(AtResolution(render.data.layerToCompNow, render.in_data), render.data.outputRect.left,
                 render.data.outputRect.top, canvas.left, canvas.top)
             .toFloats(canvasFromOutput);
-    if (!err && !renderer.copyOut(render.queue, canvas, shown, placedOutput,
+    if (!err && !renderer.copyOut(render.batch, canvas, shown, placedOutput,
                                   render.data.canvas.compSpace ? canvasFromOutput : nullptr, render.data.filter))
         err = PF_Err_INTERNAL_STRUCT_DAMAGED;
+    // Back to the pool once the batch has run.
     if (shownIsScratch)
-        renderer.cache().releaseScratch(shown);
+        render.batch.freeBuffers.push_back(shown);
     return err;
 }
 
@@ -3182,7 +3206,7 @@ PF_Err RenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* 
 
         if (image && !(resume.canvas == canvas))
         {
-            image = renderer.reframe(render.queue, resume.canvas, canvas, image);
+            image = renderer.reframe(render.batch, resume.canvas, canvas, image);
             imageIsScratch = image != nil;
             if (!image)
                 err = PF_Err_INTERNAL_STRUCT_DAMAGED;
@@ -3268,10 +3292,10 @@ PF_Err RenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* 
             }
         }
 
-        flush();
-
         if (!err && image && output)
             ERR(ShowImage(render, image, output));
+        // Everything queued, from the steps to the output, runs here and is waited for once.
+        flush();
 
         if (imageIsScratch)
             cache.releaseScratch(image);

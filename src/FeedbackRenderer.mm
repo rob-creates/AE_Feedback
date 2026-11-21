@@ -47,21 +47,22 @@ bool Succeeded(id<MTLCommandBuffer> commands)
     return commands.status == MTLCommandBufferStatusCompleted;
 }
 
-// One kernel on its own, waited for.
+// One kernel, queued in the batch.
 template <typename Params>
-bool RunOnce(
-    id<MTLCommandQueue> queue,
+bool EncodeInBatch(
+    StepBatch& batch,
     id<MTLComputePipelineState> pipeline,
     std::initializer_list<id<MTLBuffer>> buffers,
     const Params& params,
     int width,
     int height)
 {
-    id<MTLCommandBuffer> commands = [queue commandBuffer];
-    id<MTLComputeCommandEncoder> encoder = [commands computeCommandEncoder];
+    if (!batch.commands)
+        batch.commands = [batch.queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [batch.commands computeCommandEncoder];
     const bool encoded = Encode(encoder, pipeline, buffers, params, width, height);
     [encoder endEncoding];
-    return Succeeded(commands) && encoded;
+    return encoded;
 }
 
 void FillWeights(BlurAxisParams& p, float sigma)
@@ -628,23 +629,18 @@ id<MTLBuffer> FeedbackRenderer::step(
 }
 
 id<MTLBuffer> FeedbackRenderer::reframe(
-    id<MTLCommandQueue> queue,
+    StepBatch& batch,
     const CanvasKey& from,
     const CanvasKey& to,
     id<MTLBuffer> image)
 {
-    id<MTLBuffer> result = mCache->acquireScratch(to.bytes());
+    id<MTLBuffer> result = acquireForBatch(batch, to.bytes());
     ReframeParams p{from.width, to.width, from.width, from.height, to.left - from.left, to.top - from.top};
-    if (!RunOnce(queue, mReframe, {image, result}, p, to.width, to.height))
-    {
-        mCache->releaseScratch(result);
-        return nil;
-    }
-    return result;
+    return EncodeInBatch(batch, mReframe, {image, result}, p, to.width, to.height) ? result : nil;
 }
 
 id<MTLBuffer> FeedbackRenderer::compositeInput(
-    id<MTLCommandQueue> queue,
+    StepBatch& batch,
     const CanvasKey& canvas,
     id<MTLBuffer> image,
     const PlacedImage& input,
@@ -652,18 +648,16 @@ id<MTLBuffer> FeedbackRenderer::compositeInput(
     int filter,
     float opacity)
 {
-    id<MTLBuffer> result = mCache->acquireScratch(canvas.bytes());
+    id<MTLBuffer> result = acquireForBatch(batch, canvas.bytes());
     CompositeParams p = MakeCompositeParams(canvas, input, compositeMode, filter, opacity);
-    if (!RunOnce(queue, mComposite, {image, input.buffer ? input.buffer : mEmpty, result}, p, canvas.width, canvas.height))
-    {
-        mCache->releaseScratch(result);
-        return nil;
-    }
-    return result;
+    return EncodeInBatch(batch, mComposite, {image, input.buffer ? input.buffer : mEmpty, result}, p, canvas.width,
+                         canvas.height)
+               ? result
+               : nil;
 }
 
 bool FeedbackRenderer::copyOut(
-    id<MTLCommandQueue> queue,
+    StepBatch& batch,
     const CanvasKey& canvas,
     id<MTLBuffer> image,
     const PlacedImage& output,
@@ -688,5 +682,5 @@ bool FeedbackRenderer::copyOut(
     }
     if (width <= 0 || height <= 0)
         return true;
-    return RunOnce(queue, mCopyOut, {image, output.buffer}, p, width, height);
+    return EncodeInBatch(batch, mCopyOut, {image, output.buffer}, p, width, height);
 }

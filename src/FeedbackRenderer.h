@@ -168,16 +168,17 @@ public:
     // Runs what's queued and waits for it. Returns false if the GPU work failed.
     bool flush(StepBatch& batch);
 
-    // Each returns a new image from the scratch pool, or nil if the GPU work failed.
-    // reframe moves an image onto another canvas; compositeInput lays the input over an image.
+    // Each queues its work in the batch, to run with the rest when it's flushed, and returns a new image
+    // from the scratch pool, or nil if there's no memory for one. reframe moves an image onto another
+    // canvas; compositeInput lays the input over an image.
     id<MTLBuffer> reframe(
-        id<MTLCommandQueue> queue,
+        StepBatch& batch,
         const CanvasKey& from,
         const CanvasKey& to,
         id<MTLBuffer> image);
 
     id<MTLBuffer> compositeInput(
-        id<MTLCommandQueue> queue,
+        StepBatch& batch,
         const CanvasKey& canvas,
         id<MTLBuffer> image,
         const PlacedImage& input,
@@ -189,10 +190,10 @@ public:
     // AE's. Nil if there's no memory for it.
     id<MTLBuffer> copyPixels(StepBatch& batch, id<MTLBuffer> source, int pitch, int height);
 
-    // With canvasFromOutput, each output pixel is looked up through it rather than by offset: from the
-    // canvas with `filter`, a SampleFilter.
+    // Queues writing the image to AE's output. With canvasFromOutput, each output pixel is looked up
+    // through it rather than by offset: from the canvas with `filter`, a SampleFilter.
     bool copyOut(
-        id<MTLCommandQueue> queue,
+        StepBatch& batch,
         const CanvasKey& canvas,
         id<MTLBuffer> image,
         const PlacedImage& output,
