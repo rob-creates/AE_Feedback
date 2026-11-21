@@ -382,13 +382,14 @@ FeedbackRenderer::SmallBlur FeedbackRenderer::encodeSmallBlur(
     return result;
 }
 
-id<MTLBuffer> FeedbackRenderer::encodeSpread(
+FeedbackRenderer::SmallBlur FeedbackRenderer::encodeSpread(
     id<MTLComputeCommandEncoder> encoder,
     Pyramid& pyramid,
     const CanvasKey& canvas,
     float widestGiven,
     float widthX,
     float widthY,
+    bool fullSize,
     StepBatch& batch,
     std::vector<id<MTLBuffer>>& scratch)
 {
@@ -408,7 +409,7 @@ id<MTLBuffer> FeedbackRenderer::encodeSpread(
         bySize[small.factor].push_back({small, part.weight});
     }
     if (bySize.empty())
-        return pyramid.levels[0].buffer;
+        return pyramid.levels[0];
 
     // At each size, the sum so far scaled up, plus the parts of that size; then the next size up.
     SmallBlur sum{};
@@ -444,13 +445,13 @@ id<MTLBuffer> FeedbackRenderer::encodeSpread(
         sum = next;
         any = true;
     }
-    if (sum.factor > 1)
+    if (sum.factor > 1 && fullSize)
     {
         SmallBlur full = sized(1);
         addInto(full, sum, 1.0f, true);
         sum = full;
     }
-    return sum.buffer;
+    return sum;
 }
 
 id<MTLBuffer> FeedbackRenderer::step(
@@ -565,18 +566,27 @@ id<MTLBuffer> FeedbackRenderer::step(
     Pyramid pyramid{{SmallBlur{current, width, height, 1}}};
     // Sub-steps and reduced resolution divide the blur into widths far under a pixel, which only add up
     // over many steps, so any blur at all goes ahead. The spread leaves out its parts too narrow to matter.
-    auto blurBy = [&](float share)
+    auto blurBy = [&](float share, bool fullSize)
     {
         if (std::max(sigmaX, sigmaY) * share <= 0.0f)
-            return current;
-        return encodeSpread(encoder, pyramid, canvas, f.spreadWidest, sigmaX * share, sigmaY * share, batch, scratch);
+            return SmallBlur{current, width, height, 1};
+        return encodeSpread(encoder, pyramid, canvas, f.spreadWidest, sigmaX * share, sigmaY * share, fullSize, batch,
+                            scratch);
     };
+    // The trail as the grade reads it, which can be smaller than the canvas.
+    SmallBlur graded{current, width, height, 1};
     // A layer with nothing there blurs nothing, as black would.
     const bool blurMapMissing = blurSource == MAP_LAYER && !blurMap.buffer;
     if (std::max(sigmaX, sigmaY) > 0.0f && !blurMapMissing)
     {
         if (blurSource == MAP_NONE)
-            current = blurBy(1.0f);
+        {
+            // Only the grade reads the blurred trail, unless a mask is the trail itself, so it can stay at
+            // the blur's own size, and save scaling it up first.
+            const auto readsTrail = [&](int slot) { return f.sources[slot] == MAP_TRAIL; };
+            graded = blurBy(1.0f, readsTrail(SLOT_LEVELS_MASK) || readsTrail(SLOT_HSL_MASK) || readsTrail(SLOT_ALPHA_MASK));
+            current = graded.buffer;
+        }
         else
         {
             BlurMapParams p{};
@@ -586,10 +596,11 @@ id<MTLBuffer> FeedbackRenderer::step(
             id<MTLBuffer> mapBuffer = FillMap(p.map, blurMap, blurSource, current, width, height);
             id<MTLBuffer> next = acquire();
             Encode(encoder, mBlurByMap,
-                   {current, blurBy(0.125f), blurBy(0.25f), blurBy(0.5f), blurBy(1.0f),
-                    mapBuffer, next},
+                   {current, blurBy(0.125f, true).buffer, blurBy(0.25f, true).buffer, blurBy(0.5f, true).buffer,
+                    blurBy(1.0f, true).buffer, mapBuffer, next},
                    p, width, height);
             current = next;
+            graded = SmallBlur{current, width, height, 1};
         }
     }
 
@@ -597,7 +608,10 @@ id<MTLBuffer> FeedbackRenderer::step(
     // so they're exactly a no-op.
     StepParams last{};
     GradeParams& grade = last.grade;
-    grade.srcPitch = width;
+    grade.srcPitch = graded.width;
+    grade.srcWidth = graded.width;
+    grade.srcHeight = graded.height;
+    grade.srcFactor = graded.factor;
     grade.dstPitch = width;
     grade.applyLevels = !(f.inputBlack == 0.0f && f.inputWhite == 1.0f && f.gamma == 1.0f &&
                           f.outputBlack == 0.0f && f.outputWhite == 1.0f);

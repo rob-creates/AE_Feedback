@@ -164,6 +164,11 @@ struct BlurAxisParams
 struct GradeParams
 {
     int srcPitch;
+    // The trail can come smaller than the canvas, `srcFactor` times, from a wide blur, and is then
+    // sampled between its pixels as it would have been scaled up.
+    int srcWidth;
+    int srcHeight;
+    int srcFactor;
     int dstPitch;
     int applyLevels;
     int applyHSL;

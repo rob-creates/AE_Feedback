@@ -237,14 +237,16 @@ private:
     // The blur: Gaussians from far narrower to far wider than `width` mixed into a long-tailed blur
     // whose widths add, as a Cauchy distribution's do, so a copy spreads in step with its age rather
     // than its square root. Each is worked out at its own size and they're
-    // summed from the smallest up.
-    id<MTLBuffer> encodeSpread(
+    // summed from the smallest up. Without `fullSize`, the sum can come at a smaller size, for a kernel
+    // that samples it as addScaled would have scaled it up.
+    SmallBlur encodeSpread(
         id<MTLComputeCommandEncoder> encoder,
         Pyramid& pyramid,
         const CanvasKey& canvas,
         float widest,
         float widthX,
         float widthY,
+        bool fullSize,
         StepBatch& batch,
         std::vector<id<MTLBuffer>>& scratch);
 

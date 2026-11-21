@@ -499,7 +499,10 @@ kernel void gradeAndComposite(
     uint2 xy [[thread_position_in_grid]])
 {
     constant GradeParams& g = p.grade;
-    const float4 graded = applyGrade(src[xy.y * g.srcPitch + xy.x], g, maskAt(levelsMask, g.levelsMask, xy),
+    const float4 trail = g.srcFactor > 1
+                             ? bilinearClamped(src, g.srcPitch, g.srcWidth, g.srcHeight, toSmaller(float2(xy), g.srcFactor))
+                             : src[xy.y * g.srcPitch + xy.x];
+    const float4 graded = applyGrade(trail, g, maskAt(levelsMask, g.levelsMask, xy),
                                      maskAt(hslMask, g.hslMask, xy), maskAt(alphaMask, g.alphaMask, xy));
     dst[xy.y * p.composite.dstPitch + xy.x] = applyComposite(graded, input, int2(xy), p.composite);
 }
