@@ -16,6 +16,7 @@ import statistics
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -69,6 +70,9 @@ WHOLE = ["trail", "self_disp", "grade_blur", "screen_sub", "shape_trail", "shape
          "comp_space_parented", "layer_3d", "nest_30", "nest_solid_sub", "subframe_motion", "border_drift",
          "canvas_limit", "stretch_25", "footage_trail", "footage_stretch", "footage_reverse", "flash_spread"]
 DEEP = 3999  # deep_alpha1's last frame
+# Renders run this many aerender processes at once. Each is its own process with its own caches, and each
+# takes a fresh GUID salt, so none can serve another's frames.
+JOBS = int(os.environ.get("FEEDBACK_TEST_JOBS", "3"))
 SMALL_CANVAS = 300 * 300  # pixels
 
 
@@ -95,23 +99,19 @@ def cmd_render(label):
     base = OUT / label
     base.mkdir(parents=True, exist_ok=True)
     log_start = LOG.stat().st_size if LOG.exists() else 0
-    timing = {}
-    for comp in COMPS:
-        timing[comp] = render("feedback_16.aep", comp, base / comp)
-    for comp in ("software_trail", "software_plain"):
-        timing[comp] = render("feedback_software.aep", comp, base / comp, 0, 23)
-    for depth in (8, 32):
-        for comp in NEUTRAL:
-            timing[f"{comp}_{depth}"] = render(f"feedback_{depth}.aep", comp, base / f"{comp}_{depth}")
-    for comp, frame in COLD.items():
-        timing[f"{comp}_cold"] = render("feedback_16.aep", comp, base / f"{comp}_cold", frame, frame)
+    # (name, project, comp, start, end, env)
+    jobs = [(comp, "feedback_16.aep", comp, None, None, None) for comp in COMPS]
+    jobs += [(comp, "feedback_software.aep", comp, 0, 23, None) for comp in ("software_trail", "software_plain")]
+    jobs += [(f"{comp}_{depth}", f"feedback_{depth}.aep", comp, None, None, None) for depth in (8, 32) for comp in NEUTRAL]
+    jobs += [(f"{comp}_cold", "feedback_16.aep", comp, frame, frame, None) for comp, frame in COLD.items()]
     # A canvas held to what a machine with far less memory would allow.
-    for comp in WHOLE:
-        timing[f"{comp}_whole"] = render("feedback_16.aep", comp, base / f"{comp}_whole",
-                                         extra_env={"FEEDBACK_WHOLE_CANVAS": "1"})
-    for comp in ["canvas_limit", *STRETCHES]:
-        timing[f"{comp}_small"] = render("feedback_16.aep", comp, base / f"{comp}_small",
-                                         extra_env={"FEEDBACK_CANVAS_PIXELS": str(SMALL_CANVAS)})
+    jobs += [(f"{comp}_whole", "feedback_16.aep", comp, None, None, {"FEEDBACK_WHOLE_CANVAS": "1"}) for comp in WHOLE]
+    jobs += [(f"{comp}_small", "feedback_16.aep", comp, None, None, {"FEEDBACK_CANVAS_PIXELS": str(SMALL_CANVAS)})
+             for comp in ["canvas_limit", *STRETCHES]]
+    with ThreadPoolExecutor(max_workers=JOBS) as pool:
+        took = list(pool.map(lambda j: render(j[1], j[2], base / j[0], j[3], j[4], extra_env=j[5]), jobs))
+    timing = {j[0]: t for j, t in zip(jobs, took)}
+    # Timed, so rendered alone.
     timing["deep_alpha1"] = render("feedback_16.aep", "deep_alpha1", base / "deep_alpha1", DEEP, DEEP)
     (base / "timing.json").write_text(json.dumps(
         {"timing": timing, "log": [log_start, LOG.stat().st_size if LOG.exists() else 0]}, indent=1))
