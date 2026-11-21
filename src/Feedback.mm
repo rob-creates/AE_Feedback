@@ -341,6 +341,9 @@ struct PreRenderData
     TrailGrid grid;
     int samplesPerStep; // the frame's own moment plus any sub-steps
     float opacity = 1.0f; // how much of the layer goes into the trail at the moment shown
+    // With sub-steps, or between frames, all but In Front and Behind store only the trail, so the current
+    // frame goes on top when it's shown, with this composite mode, at its Opacity. Zero when it doesn't.
+    int overlayMode = 0;
 
     // FrameParams::spreadWidest: in comp space, half the longer side of the comp and its margin, as the
     // canvas was before it followed the trail. In the layer, from the canvas, as before.
@@ -2604,6 +2607,14 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
         if (!err)
         {
             data->opacity = own->opacity;
+            if ((data->samplesPerStep > 1 || grid.between()) && own->opacity > 0.0f)
+            {
+                ParamReader r{in_data, FrameSample(in_data, now)};
+                const int mode = r.popup(PARAM_COMPOSITE);
+                ERR(r.err);
+                if (BuildsUpInput(mode))
+                    data->overlayMode = mode;
+            }
             ERR(CheckoutWholeLayer(in_data, extra, request, PARAM_INPUT, own->time, data->currentInputId, &data->currentInputRect));
         }
 
@@ -3092,31 +3103,24 @@ PF_Err ShowImage(GpuRender& render, id<MTLBuffer> image, PF_EffectWorld* output)
     const CanvasKey& canvas = render.data.canvas;
     FeedbackRenderer& renderer = render.renderer;
 
-    // With sub-steps, or between frames, all but In Front and Behind store only the trail, so the current
-    // frame goes on top here, at its Opacity. It stays sharp, and isn't fed back in twice. At Opacity 0,
-    // the layer isn't there to go on top.
+    // The current frame goes on top here, as PreRender decided (overlayMode). It stays sharp, and isn't fed
+    // back in twice.
     id<MTLBuffer> shown = image;
     bool shownIsScratch = false;
-    if ((render.data.samplesPerStep > 1 || render.data.between) && render.data.opacity > 0.0f && render.currentInput)
+    if (const int mode = render.data.overlayMode; mode && render.currentInput)
     {
-        ParamReader r{render.in_data, FrameSample(render.in_data, render.in_data->current_time)};
-        const int mode = r.popup(PARAM_COMPOSITE);
-        ERR(r.err);
-        if (!err && BuildsUpInput(mode))
+        PlacedImage input{};
+        ERR(render.place(render.currentInput, render.data.currentInputRect, &input));
+        if (!err && render.data.canvas.compSpace &&
+            !WarpOntoCanvas(&input, render.data.layerToCompNow, render.data.currentInputRect, canvas, render.in_data))
+            err = PF_Err_INTERNAL_STRUCT_DAMAGED;
+        if (!err)
         {
-            PlacedImage input{};
-            ERR(render.place(render.currentInput, render.data.currentInputRect, &input));
-            if (!err && render.data.canvas.compSpace &&
-                !WarpOntoCanvas(&input, render.data.layerToCompNow, render.data.currentInputRect, canvas, render.in_data))
+            shown = renderer.compositeInput(render.queue, canvas, image, input, mode, render.data.filter,
+                                            render.data.opacity);
+            shownIsScratch = shown != nil;
+            if (!shown)
                 err = PF_Err_INTERNAL_STRUCT_DAMAGED;
-            if (!err)
-            {
-                shown = renderer.compositeInput(render.queue, canvas, image, input, mode, render.data.filter,
-                                                render.data.opacity);
-                shownIsScratch = shown != nil;
-                if (!shown)
-                    err = PF_Err_INTERNAL_STRUCT_DAMAGED;
-            }
         }
     }
 
