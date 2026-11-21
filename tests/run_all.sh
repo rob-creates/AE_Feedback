@@ -58,7 +58,7 @@ pgrep -x "After Effects" >/dev/null && { echo "After Effects would not quit"; ex
 failed=0
 report=$(mktemp)
 caffeinate -i python3 run_tests.py render "$LABEL" > "$report" 2>&1 || failed=1
-grep -E "exit [1-9]|Error|Traceback" "$report"
+grep -E "exit [1-9]|unfinished|Error|Traceback" "$report"
 python3 run_tests.py check "$LABEL" > "$report" 2>&1 || failed=1
 grep -E "^FAIL|failed|passed|Traceback|Error" "$report"
 python3 live_check.py "$LABEL" > "$report" 2>&1 || failed=1

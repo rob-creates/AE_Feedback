@@ -73,6 +73,7 @@ DEEP = 3999  # deep_alpha1's last frame
 # Renders run this many aerender processes at once. Each is its own process with its own caches, and each
 # takes a fresh GUID salt, so none can serve another's frames.
 JOBS = int(os.environ.get("FEEDBACK_TEST_JOBS", "3"))
+RENDER_ATTEMPTS = 3
 SMALL_CANVAS = 300 * 300  # pixels
 
 
@@ -82,18 +83,19 @@ def render(project, comp, folder, start=None, end=None, extra_env=None):
            "-OMtemplate", "TIFF Sequence with Alpha", "-output", str(folder / "f_[#####].tif")]
     if start is not None:
         cmd += ["-s", str(start), "-e", str(end)]
-    # aerender processes started together now and then fail to start, leaving nothing, so one that
-    # leaves nothing or fails is run again once.
-    for attempt in (1, 2):
+    # aerender processes started together now and then fail to start, and now and then one stops part way
+    # (Camera Raw, loaded by every one, can abort) while still exiting with 0. One that fails, leaves
+    # nothing or doesn't say it finished is run again, up to RENDER_ATTEMPTS times.
+    for attempt in range(1, RENDER_ATTEMPTS + 1):
         # A logging build mixes this into its GUIDs, so AE's disk cache can't serve an earlier render's frames.
         env = dict(os.environ, FEEDBACK_GUID_SALT=str(time.time_ns()), **(extra_env or {}))
         began = time.time()
         done = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=env)
         took = time.time() - began
         frames = len(list(folder.glob("f_*.tif")))
-        ok = done.returncode == 0 and frames > 0
+        ok = done.returncode == 0 and frames > 0 and "Finished composition" in done.stdout
         print(f"  {project} {comp} {start if start is not None else 'all'}: {took:.1f}s, {frames} files, exit {done.returncode}"
-              + ("" if ok or attempt == 2 else ", trying again"), flush=True)
+              + ("" if ok else ", unfinished" + (", trying again" if attempt < RENDER_ATTEMPTS else "")), flush=True)
         if ok:
             break
         print(done.stdout[-1500:])
