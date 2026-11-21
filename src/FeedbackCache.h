@@ -63,6 +63,14 @@ struct TrailCarry
     float x = 0.0f, y = 0.0f;
 };
 
+// A trail's image: the buffer, the canvas it was drawn on, and what Pixel Sampling still owes its move.
+struct TrailImage
+{
+    id<MTLBuffer> buffer = nil;
+    CanvasKey canvas{};
+    TrailCarry carry;
+};
+
 // A layer as one render fetched it from AE, kept so that other renders can use it rather than ask AE
 // for it again. AE renders several frames at once, and each reads layers at moments the others read too.
 struct FetchKey
@@ -110,13 +118,11 @@ public:
     // doesn't cover. Zero for trails kept in the layer.
     struct Candidate
     {
-        CanvasKey key;
+        TrailImage image;
         PF_State history;
         uint64_t motion;
         AEGP_TimeStamp made; // the project's timestamp when the image's inputs were read
         A_long drawnFor;     // the frame whose canvas the image was drawn on, which may be later than its own
-        id<MTLBuffer> buffer;
-        TrailCarry carry;
     };
 
     explicit FeedbackCache(id<MTLDevice> device);
@@ -144,10 +150,9 @@ public:
     void endFetch(const FetchKey& key);
     void touch(id<MTLBuffer> buffer);
 
-    // Takes ownership of the buffer. Evicted buffers are dropped rather than recycled, because
-    // a render further up the stack may still be reading them.
-    void publish(const CanvasKey& key, A_long time, const PF_State& history, uint64_t motion, const AEGP_TimeStamp& made,
-                 A_long drawnFor, id<MTLBuffer> buffer, TrailCarry carry);
+    // Keeps the image of the frame at `time`, taking ownership of its buffer. Evicted buffers are dropped
+    // rather than recycled, because a render further up the stack may still be reading them.
+    void publish(const Candidate& kept, A_long time);
 
     id<MTLBuffer> acquireScratch(size_t bytes);
     void releaseScratch(id<MTLBuffer> buffer);
@@ -155,14 +160,8 @@ public:
 private:
     struct Entry
     {
-        CanvasKey key;
+        Candidate kept;
         A_long time;
-        PF_State history;
-        uint64_t motion;
-        AEGP_TimeStamp made;
-        A_long drawnFor;
-        id<MTLBuffer> buffer;
-        TrailCarry carry;
         uint64_t lastUsed;
     };
 

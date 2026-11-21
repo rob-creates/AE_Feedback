@@ -363,9 +363,7 @@ struct PreRenderData
 
     // The cached image from just before those frames, held here so it can't be evicted before the
     // render. Nil means they start from blank.
-    id<MTLBuffer> resumeImage;
-    CanvasKey resumeCanvas;
-    TrailCarry resumeCarry;
+    TrailImage resume;
 
     // With the trail in comp space (canvas.compSpace), the canvas is the comp, and the output is the
     // layer's view of it.
@@ -1418,8 +1416,8 @@ StillCurrent MakeStillCurrent(MotionAt motion, const CompWatch* watch, A_long st
 // canvas held below the trail's size leaves out the older end that this frame's canvas still has, so
 // such an image is used only if its canvas covers this one. An earlier frame's canvas is behind, where
 // the trail is, and is used as before. Later means further along `step`, which runs backwards in a
-// time-reversed layer.
-id<MTLBuffer> FindCached(
+// time-reversed layer. No buffer if there's none.
+TrailImage FindCached(
     PF_InData* in_data,
     const PF_ParamUtilsSuite3& utils,
     FeedbackCache& cache,
@@ -1427,28 +1425,24 @@ id<MTLBuffer> FindCached(
     A_long now,
     A_long time,
     A_long step,
-    const StillCurrent& current,
-    CanvasKey* imageCanvas,
-    TrailCarry* carry)
+    const StillCurrent& current)
 {
     const auto candidates = cache.candidates(canvas, time);
     PF_State history;
     if (candidates.empty() || !ReadHistory(in_data, utils, HistoryEnd(time, step, canvas.firstTime), &history))
-        return nil;
+        return {};
     for (const auto& candidate : candidates)
     {
         A_Boolean same = 0;
         utils.PF_AreStatesIdentical(in_data->effect_ref, &candidate.history, &history, &same);
         const bool drawnLater = (step > 0 && candidate.drawnFor > now) || (step < 0 && candidate.drawnFor < now);
-        if (same && current(candidate, time) && (!drawnLater || candidate.key.contains(canvas)))
+        if (same && current(candidate, time) && (!drawnLater || candidate.image.canvas.contains(canvas)))
         {
-            cache.touch(candidate.buffer);
-            *imageCanvas = candidate.key;
-            *carry = candidate.carry;
-            return candidate.buffer;
+            cache.touch(candidate.image.buffer);
+            return candidate.image;
         }
     }
-    return nil;
+    return {};
 }
 
 // The newest image among the `frames` frames ending at `now`, or -1. Returns how many frames before
@@ -1462,14 +1456,12 @@ int FindResume(
     A_long step,
     int frames,
     const StillCurrent& current,
-    __strong id<MTLBuffer>* image,
-    CanvasKey* imageCanvas,
-    TrailCarry* carry)
+    TrailImage* image)
 {
     for (int k = 0; k < frames; k++)
     {
-        *image = FindCached(in_data, utils, cache, canvas, now, now - k * step, step, current, imageCanvas, carry);
-        if (*image)
+        *image = FindCached(in_data, utils, cache, canvas, now, now - k * step, step, current);
+        if (image->buffer)
             return k;
     }
     return -1;
@@ -2335,7 +2327,7 @@ PF_Err CheckOutFrames(
     PreRenderData* data)
 {
     PF_Err err = PF_Err_NONE;
-    const bool startsBlank = !data->resumeImage;
+    const bool startsBlank = !data->resume.buffer;
     for (int k = 0; !err && k < frames; k++)
     {
         const FrameFacts& facts = *walk.window[k];
@@ -2660,7 +2652,7 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             const StillCurrent current = MakeStillCurrent(motionAt, data->watchesComp ? &watch : nullptr, grid.step);
             resumeK = FindResume(
                 in_data, utils, metal->renderer->cache(), data->canvas, grid.last, grid.step, int(walk.window.size()),
-                current, &data->resumeImage, &data->resumeCanvas, &data->resumeCarry);
+                current, &data->resume);
             ERR(CheckOutFrames(in_data, extra, request, fetchContext, mapArea, walk, resumeK >= 0 ? resumeK : int(walk.window.size()),
                                &nextId, data.get()));
         }
@@ -3182,8 +3174,6 @@ PF_Err RenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* 
         // A newer image than PreRender found can have appeared since, from a rebuild that kept its
         // last few frames. Otherwise, what it found is the place to start.
         const int frameCount = int(data->frames.size());
-        id<MTLBuffer> image = nil;
-        CanvasKey imageCanvas = canvas;
         // A fingerprinted image is only of use if the layer went where it did, and expressions gave what
         // they did, when PreRender looked.
         MotionAt motionAt;
@@ -3204,25 +3194,23 @@ PF_Err RenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* 
         if (data->watchesComp)
             watch.emplace(in_data, out_data);
         const StillCurrent current = MakeStillCurrent(motionAt, watch ? &*watch : nullptr, step);
-        TrailCarry carry{};
-        int resumeK = err ? -1
-                          : FindResume(in_data, utils, cache, canvas, data->grid.last, step, frameCount, current,
-                                       &image, &imageCanvas, &carry);
+        TrailImage resume;
+        int resumeK = err ? -1 : FindResume(in_data, utils, cache, canvas, data->grid.last, step, frameCount, current, &resume);
         if (resumeK < 0)
         {
-            image = data->resumeImage;
-            imageCanvas = data->resumeCanvas;
-            carry = data->resumeCarry;
+            resume = data->resume;
             resumeK = frameCount;
         }
         framesComputed = resumeK;
+        id<MTLBuffer> image = resume.buffer;
+        TrailCarry carry = resume.carry;
 
         // Set while `image` is a scratch buffer of ours rather than one the cache owns.
         bool imageIsScratch = false;
 
-        if (image && !(imageCanvas == canvas))
+        if (image && !(resume.canvas == canvas))
         {
-            image = renderer.reframe(render.queue, imageCanvas, canvas, image);
+            image = renderer.reframe(render.queue, resume.canvas, canvas, image);
             imageIsScratch = image != nil;
             if (!image)
                 err = PF_Err_INTERNAL_STRUCT_DAMAGED;
@@ -3289,7 +3277,7 @@ PF_Err RenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* 
                 ERR(FlushSteps(render));
                 if (!err)
                 {
-                    cache.publish(canvas, frame.time, history, frame.motion, data->made, data->grid.last, image, carry);
+                    cache.publish({{image, canvas, carry}, history, frame.motion, data->made, data->grid.last}, frame.time);
                     imageIsScratch = false;
                 }
             }

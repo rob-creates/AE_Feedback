@@ -44,8 +44,8 @@ std::vector<FeedbackCache::Candidate> FeedbackCache::candidates(const CanvasKey&
     std::lock_guard<std::mutex> lock(mMutex);
     std::vector<Candidate> out;
     for (const Entry& e : mEntries)
-        if (e.time == time && e.key.compatible(key))
-            out.push_back({e.key, e.history, e.motion, e.made, e.drawnFor, e.buffer, e.carry});
+        if (e.time == time && e.kept.image.canvas.compatible(key))
+            out.push_back(e.kept);
     return out;
 }
 
@@ -53,17 +53,15 @@ void FeedbackCache::touch(id<MTLBuffer> buffer)
 {
     std::lock_guard<std::mutex> lock(mMutex);
     for (Entry& e : mEntries)
-        if (e.buffer == buffer)
+        if (e.kept.image.buffer == buffer)
             e.lastUsed = ++mClock;
 }
 
-void FeedbackCache::publish(
-    const CanvasKey& key, A_long time, const PF_State& history, uint64_t motion, const AEGP_TimeStamp& made,
-    A_long drawnFor, id<MTLBuffer> buffer, TrailCarry carry)
+void FeedbackCache::publish(const Candidate& kept, A_long time)
 {
     std::lock_guard<std::mutex> lock(mMutex);
-    mEntries.push_back({key, time, history, motion, made, drawnFor, buffer, carry, ++mClock});
-    mEntryBytes += buffer.length;
+    mEntries.push_back({kept, time, ++mClock});
+    mEntryBytes += kept.image.buffer.length;
     evictLocked();
 }
 
@@ -74,7 +72,7 @@ void FeedbackCache::evictLocked()
     {
         auto oldest = std::min_element(
             mEntries.begin(), mEntries.end(), [](const Entry& a, const Entry& b) { return a.lastUsed < b.lastUsed; });
-        mEntryBytes -= oldest->buffer.length;
+        mEntryBytes -= oldest->kept.image.buffer.length;
         mEntries.erase(oldest);
     }
 }
