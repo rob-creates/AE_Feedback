@@ -12,3 +12,7 @@
 
 # Python
 __pycache__/
+
+# Release build and distributable disk image (scripts/package.sh)
+/Build-Release/
+/dist/

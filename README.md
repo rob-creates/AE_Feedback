@@ -67,6 +67,16 @@ Requires macOS on Apple silicon, Xcode and CMake.
    scripts/install.sh
    ```
 
+## Distributing
+
+To make a disk image for other Apple silicon Macs, signed with your Developer ID and notarized by Apple:
+
+```sh
+scripts/package.sh NOTARY_PROFILE
+```
+
+It needs a "Developer ID Application" certificate in your keychain, and a notarytool profile made once with `xcrun notarytool store-credentials NOTARY_PROFILE --apple-id YOUR_APPLE_ID --team-id YOUR_TEAM_ID`. It builds a release without logging in `Build-Release/`, signs, notarizes and staples the plugin, and writes `dist/Feedback-VERSION-arm64.dmg`, itself signed, notarized and stapled. Without a profile it stops after signing.
+
 ## Testing
 
 With After Effects closed, and the build configured with `-DFEEDBACK_LOG=ON`:
