@@ -48,6 +48,7 @@
 
 #include "BuildStamp.h"
 #include "FeedbackRenderer.h"
+#include "Hash.h"
 #include "LayerMotion.h"
 #include "ShaderTypes.h"
 
@@ -418,16 +419,6 @@ inline bool Before(A_long a, A_long b, A_long step)
     return step > 0 ? a < b : a > b;
 }
 
-// splitmix64's finaliser: every bit of the result depends on every bit of `x`.
-inline uint64_t Scramble(uint64_t x)
-{
-    x ^= x >> 30;
-    x *= 0xBF58476D1CE4E5B9ull;
-    x ^= x >> 27;
-    x *= 0x94D049BB133111EBull;
-    return x ^ x >> 31;
-}
-
 class MotionPrints
 {
 public:
@@ -486,21 +477,22 @@ private:
         auto found = mFrames.find(t);
         if (found == mFrames.end())
         {
-            uint64_t print = 0;
+            uint64_t print = kHashStart;
             for (int before = mSamplesPerStep - 1; before >= 0; before--)
             {
                 SampleTime at{t, mStep, A_u_long(mInData->time_scale)};
                 if (before > 0 && !MakeSampleTime(mInData, t, mStep, before, mSamplesPerStep, &at))
                     continue;
-                print = print * 0xD6E8FEB86659FD93ull + mMotion.fingerprint(at.value, at.scale);
+                Mix(print, mMotion.fingerprint(at.value, at.scale));
                 for (LayerMotion* map : mMaps)
-                    print = print * 0xC2B2AE3D27D4EB4Full + map->fingerprint(at.value, at.scale);
+                    Mix(print, map->fingerprint(at.value, at.scale));
                 if (mExpressions)
-                    print = print * 0x165667B19E3779F9ull + mExpressions(at);
+                    Mix(print, mExpressions(at));
             }
             // Scrambled together with its time: the frames are summed, and a reading merely offset by its
             // time would let two histories with the same readings at different frames sum alike.
-            found = mFrames.emplace(t, Scramble(print ^ uint64_t(t) * 0x9E3779B97F4A7C15ull)).first;
+            Mix(print, t);
+            found = mFrames.emplace(t, Scramble(print)).first;
         }
         return found->second;
     }
@@ -1698,13 +1690,7 @@ std::vector<int> FindExpressions(PF_InData* in_data, PF_OutData* out_data)
 // Mixes what a control holds into `h`. Layer controls hold no value of their own and are left out.
 void MixValue(uint64_t& h, const PF_ParamDef& d)
 {
-    const auto mix = [&](double v)
-    {
-        uint64_t bits;
-        std::memcpy(&bits, &v, sizeof(bits));
-        h = (h ^ bits) * 0x100000001B3ull;
-        h ^= h >> 29;
-    };
+    const auto mix = [&](double v) { Mix(h, v); };
     switch (d.param_type)
     {
     case PF_Param_FLOAT_SLIDER:
@@ -1829,7 +1815,7 @@ public:
                 return found->second;
         if (auto found = mNew.find(moment); found != mNew.end())
             return found->second;
-        uint64_t print = 0xCBF29CE484222325ull;
+        uint64_t print = kHashStart;
         ParamReader r{mInData, t};
         for (int index : mParams)
             r.read(index, [&](const PF_ParamDef& def) { MixValue(print, def); return 0; });

@@ -1,5 +1,7 @@
 #include "LayerMotion.h"
 
+#include "Hash.h"
+
 #include <cmath>
 #include <cstring>
 
@@ -117,11 +119,8 @@ uint64_t LayerMotion::fingerprint(A_long value, A_u_long scale)
     Projective p;
     if (!layerToComp(value, scale, &p))
         return 0;
-    uint64_t hash = 1469598103934665603ull; // FNV-1a
-    unsigned char bytes[sizeof(p.m)];
-    std::memcpy(bytes, p.m, sizeof(p.m));
-    for (unsigned char b : bytes)
-        hash = (hash ^ b) * 1099511628211ull;
+    uint64_t hash = kHashStart;
+    Mix(hash, p.m);
     return hash;
 }
 
