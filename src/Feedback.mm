@@ -2855,65 +2855,71 @@ PF_Err ComputeSample(
     params.spreadWidest = render.data.spreadWidest;
     std::copy(render.data.sources.begin(), render.data.sources.end(), params.sources);
 
-    auto fetchStart = std::chrono::steady_clock::now();
-    // At Opacity 0, the layer adds nothing, as if it were empty.
-    PF_EffectWorld* inputWorld = isCurrent && sub.opacity > 0.0f ? render.currentInput : nullptr;
-    FetchedPixels sharedInput{}, sharedMaps[SLOT_COUNT]{};
-    const bool inputShared = !isCurrent && !IsEmpty(sub.inputRect) && render.found(sub.inputFetch, &sharedInput);
-    bool mapShared[SLOT_COUNT] = {};
-    for (int slot = 0; slot < SLOT_COUNT; slot++)
-        mapShared[slot] = !IsEmpty(sub.maps[slot].rect) && render.found(sub.maps[slot].fetch, &sharedMaps[slot]);
-    if (!err && !isCurrent && !IsEmpty(sub.inputRect) && !inputShared)
+    // The input, then each map: what it is, how another render may have fetched it, and where its layer
+    // is in the comp. The current input is the one AE already gave.
+    struct Source
     {
-        ERR(extra->cb->checkout_layer_pixels(in_data->effect_ref, sub.inputId, &inputWorld));
-        render.fetched++;
-    }
-    PF_EffectWorld* mapWorlds[SLOT_COUNT] = {};
-    auto mapStart = std::chrono::steady_clock::now();
-    for (int slot = 0; !err && slot < SLOT_COUNT; slot++)
-        if (!IsEmpty(sub.maps[slot].rect) && !mapShared[slot])
+        A_long id;
+        PF_LRect rect;
+        const FetchTag* fetch;
+        const Projective* toComp;
+        PlacedImage* placed;
+        PF_EffectWorld* world = nullptr; // checked out from AE, or the current input
+        bool shared = false;            // or another render's, in `pixels`
+        FetchedPixels pixels{};
+    };
+    PlacedImage input{}, maps[SLOT_COUNT]{};
+    Source sources[1 + SLOT_COUNT] = {
+        {sub.inputId, sub.inputRect, isCurrent ? &render.data.currentInputFetch : &sub.inputFetch, &sub.layerToComp, &input}};
+    for (int slot = 0; slot < SLOT_COUNT; slot++)
+        sources[1 + slot] = {sub.maps[slot].id, sub.maps[slot].rect, &sub.maps[slot].fetch, &sub.maps[slot].toComp, &maps[slot]};
+    const auto checkedOut = [&](int i) { return sources[i].world && !(i == 0 && isCurrent); };
+
+    auto fetchStart = std::chrono::steady_clock::now();
+    for (int i = 0; !err && i < 1 + SLOT_COUNT; i++)
+    {
+        Source& source = sources[i];
+        // At Opacity 0, the layer adds nothing, as if it were empty.
+        if (i == 0 && isCurrent)
+            source.world = sub.opacity > 0.0f ? render.currentInput : nullptr;
+        else if (!IsEmpty(source.rect) && !(source.shared = render.found(*source.fetch, &source.pixels)))
         {
-            ERR(extra->cb->checkout_layer_pixels(in_data->effect_ref, sub.maps[slot].id, &mapWorlds[slot]));
-            render.mapsFetched++;
+            const auto started = std::chrono::steady_clock::now();
+            ERR(extra->cb->checkout_layer_pixels(in_data->effect_ref, source.id, &source.world));
+            if (i == 0)
+                render.fetched++;
+            else
+            {
+                render.mapsFetched++;
+                render.mapMs += MsSince(started);
+            }
         }
-    render.mapMs += MsSince(mapStart);
+    }
     render.fetchMs += MsSince(fetchStart);
 
-    PlacedImage input{}, maps[SLOT_COUNT]{};
-    if (!err && inputShared)
-        input = render.placeShared(sharedInput);
-    else if (!err)
+    for (Source& source : sources)
     {
-        ERR(render.place(inputWorld, sub.inputRect, &input));
-        if (!err)
-            render.keepFetched(isCurrent ? render.data.currentInputFetch : sub.inputFetch, sub.inputRect, &input);
-    }
-    for (int slot = 0; !err && slot < SLOT_COUNT; slot++)
-    {
-        if (mapShared[slot])
+        if (err)
+            break;
+        if (source.shared)
         {
-            maps[slot] = render.placeShared(sharedMaps[slot]);
+            *source.placed = render.placeShared(source.pixels);
             continue;
         }
-        ERR(render.place(mapWorlds[slot], sub.maps[slot].rect, &maps[slot]));
+        ERR(render.place(source.world, source.rect, source.placed));
         if (!err)
-            render.keepFetched(sub.maps[slot].fetch, sub.maps[slot].rect, &maps[slot]);
+            render.keepFetched(*source.fetch, source.rect, source.placed);
     }
 
     // In comp space, the input and maps are where their layers are at this moment, and Centre goes with it.
     // Pixels another render fetched cover what it asked for, which can be more than this one did.
     if (!err && render.data.canvas.compSpace)
     {
-        const CanvasKey& canvas = render.data.canvas;
-        const PF_LRect& inputRect = inputShared ? sharedInput.rect : sub.inputRect;
-        if (input.buffer && !WarpOntoCanvas(&input, sub.layerToComp, inputRect, canvas, in_data))
-            err = PF_Err_INTERNAL_STRUCT_DAMAGED;
-        for (int slot = 0; !err && slot < SLOT_COUNT; slot++)
-        {
-            const PF_LRect& mapRect = mapShared[slot] ? sharedMaps[slot].rect : sub.maps[slot].rect;
-            if (maps[slot].buffer && !WarpOntoCanvas(&maps[slot], sub.maps[slot].toComp, mapRect, canvas, in_data))
+        for (const Source& source : sources)
+            if (!err && source.placed->buffer &&
+                !WarpOntoCanvas(source.placed, *source.toComp, source.shared ? source.pixels.rect : source.rect,
+                                render.data.canvas, in_data))
                 err = PF_Err_INTERNAL_STRUCT_DAMAGED;
-        }
 
         const Projective toComp = AtResolution(sub.layerToComp, in_data);
         double centreX, centreY;
@@ -2932,11 +2938,9 @@ PF_Err ComputeSample(
         render.queuedSteps++;
     }
 
-    if (!isCurrent && inputWorld)
-        render.checkedOut.push_back(sub.inputId);
-    for (int slot = 0; slot < SLOT_COUNT; slot++)
-        if (mapWorlds[slot])
-            render.checkedOut.push_back(sub.maps[slot].id);
+    for (int i = 0; i < 1 + SLOT_COUNT; i++)
+        if (checkedOut(i))
+            render.checkedOut.push_back(sources[i].id);
     return err;
 }
 
