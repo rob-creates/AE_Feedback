@@ -51,7 +51,8 @@ void Projective::toFloats(float out[9]) const
         out[i] = float(m[i]);
 }
 
-LayerMotion::LayerMotion(PF_InData* in_data, PF_OutData* out_data, AEGP_LayerIDVal other)
+LayerMotion::LayerMotion(PF_InData* in_data, PF_OutData* out_data, AEGP_LayerIDVal other,
+                         MomentReadings<Projective>* shared, uint64_t instance)
     : mInData(in_data)
     , mOutData(out_data)
     , mSuites(in_data->pica_basicP)
@@ -81,11 +82,27 @@ LayerMotion::LayerMotion(PF_InData* in_data, PF_OutData* out_data, AEGP_LayerIDV
         mDrawnInComp =
             type == AEGP_ObjectType_TEXT || type == AEGP_ObjectType_VECTOR || (flags & AEGP_LayerFlag_COLLAPSE) != 0;
         mUsable = mCompWidth > 0 && mCompHeight > 0 && (flags & AEGP_LayerFlag_LAYER_IS_3D) == 0;
+        if (mUsable && !mDrawnInComp && shared && instance &&
+            mSuites.RenderSuite5()->AEGP_GetCurrentTimestamp(&mMade) == A_Err_NONE)
+        {
+            mShared = shared;
+            mKey = Scramble(instance ^ uint64_t(uint32_t(other)) * 0x9E3779B97F4A7C15ull);
+            mKnown = shared->find(mKey, mMade);
+        }
     }
     catch (...)
     {
         mUsable = false;
     }
+}
+
+LayerMotion::~LayerMotion()
+{
+    if (!mShared || mRead.empty())
+        return;
+    // Let go first, so the kept readings can be added to in place if no other call holds them.
+    mKnown.reset();
+    mShared->add(mKey, mMade, mRead);
 }
 
 bool LayerMotion::layerToComp(A_long value, A_u_long scale, Projective* out)
@@ -97,7 +114,13 @@ bool LayerMotion::layerToComp(A_long value, A_u_long scale, Projective* out)
         *out = Projective{};
         return true;
     }
-    const auto key = std::make_pair(value, scale);
+    const uint64_t key = MomentKey(value, scale);
+    if (mKnown)
+        if (auto found = mKnown->find(key); found != mKnown->end())
+        {
+            *out = found->second;
+            return true;
+        }
     if (auto found = mRead.find(key); found != mRead.end())
     {
         *out = found->second;

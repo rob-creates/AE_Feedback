@@ -507,20 +507,12 @@ private:
     std::unordered_map<A_long, uint64_t> mFrames, mSums;
 };
 
-// The values expressions gave, read by ExpressionPrints and kept for each instance of the effect until
-// anything in the project changes, as the project's timestamp tells. A moment is a time and its scale.
+// What ExpressionPrints reads, for each instance of the effect: which controls an expression drives, as
+// one reading at moment 0, and what they give at each moment.
 struct ExpressionReadings
 {
-    using Values = std::unordered_map<uint64_t, uint64_t>; // by ExpressionPrints::Moment
-    struct Instance
-    {
-        AEGP_TimeStamp made{};
-        std::vector<int> params; // the controls an expression drives
-        // Shared with each call reading it, and copied before a change only while one is.
-        std::shared_ptr<Values> readings;
-    };
-    std::mutex lock;
-    std::unordered_map<uint64_t, Instance> instances;
+    MomentReadings<std::vector<int>> params;
+    MomentReadings<uint64_t> values;
 };
 
 struct MetalData
@@ -528,6 +520,7 @@ struct MetalData
     std::unique_ptr<FeedbackRenderer> renderer;
     FrameFactsMemo memo;
     ExpressionReadings expressions;
+    MomentReadings<Projective> motions; // LayerMotion's, for each layer it follows
 };
 
 void DisposePreRenderData(void* p)
@@ -1753,38 +1746,27 @@ public:
             mHaveMade = false;
         }
         if (mHaveMade && mInstance)
-        {
-            std::lock_guard<std::mutex> guard(shared.lock);
-            auto found = shared.instances.find(mInstance);
-            if (found != shared.instances.end() && SameStamp(found->second.made, mMade))
-            {
-                mParams = found->second.params;
-                mKnown = found->second.readings;
-                mFound = true;
-            }
-        }
+            if (const auto params = shared.params.find(mInstance, mMade))
+                if (auto found = params->find(0); found != params->end())
+                {
+                    mParams = found->second;
+                    mKnown = shared.values.find(mInstance, mMade);
+                    mFound = true;
+                }
         if (!mFound)
             mParams = FindExpressions(in_data, out_data);
     }
 
     ~ExpressionPrints()
     {
-        if (!mHaveMade || !mInstance || (mFound && mNew.empty()))
+        if (!mHaveMade || !mInstance)
             return;
+        if (!mFound)
+            mShared.params.add(mInstance, mMade, {{0, mParams}});
         // Let go first, so the kept readings can be added to in place if no other call holds them.
         mKnown.reset();
-        std::lock_guard<std::mutex> guard(mShared.lock);
-        ExpressionReadings::Instance& kept = mShared.instances[mInstance];
-        if (!SameStamp(kept.made, mMade) || !kept.readings)
-            kept.readings = std::make_shared<ExpressionReadings::Values>();
-        else if (kept.readings.use_count() > 1)
-            kept.readings = std::make_shared<ExpressionReadings::Values>(*kept.readings);
-        // Long sessions on one project mustn't grow this without end.
-        if (kept.readings->size() > 1000000)
-            kept.readings->clear();
-        kept.readings->insert(mNew.begin(), mNew.end());
-        kept.made = mMade;
-        kept.params = mParams;
+        if (!mNew.empty())
+            mShared.values.add(mInstance, mMade, mNew);
     }
 
     bool active() const { return !mParams.empty(); }
@@ -1809,7 +1791,7 @@ public:
     {
         if (mParams.empty())
             return 0;
-        const uint64_t moment = Moment(t);
+        const uint64_t moment = MomentKey(t.value, t.scale);
         if (mKnown)
             if (auto found = mKnown->find(moment); found != mKnown->end())
                 return found->second;
@@ -1827,14 +1809,6 @@ public:
     }
 
 private:
-    static bool SameStamp(const AEGP_TimeStamp& a, const AEGP_TimeStamp& b)
-    {
-        return std::memcmp(&a, &b, sizeof(a)) == 0;
-    }
-
-    // A moment as one key: its time and that time's scale.
-    static uint64_t Moment(const SampleTime& t) { return uint64_t(uint32_t(t.value)) << 32 | uint32_t(t.scale); }
-
     // A different value each time, which no reading can equal.
     static uint64_t Unmatched()
     {
@@ -1849,8 +1823,8 @@ private:
     bool mHaveMade = false;
     bool mFound = false;
     std::vector<int> mParams;
-    std::shared_ptr<const ExpressionReadings::Values> mKnown;
-    ExpressionReadings::Values mNew;
+    std::shared_ptr<const MomentReadings<uint64_t>::Values> mKnown;
+    MomentReadings<uint64_t>::Values mNew;
 };
 
 // Both map layer controls, read through one effect reference. `fallback` is each one's source if it
@@ -2443,10 +2417,10 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
         // reports their bounds at full scale, and a canvas built around those can miss the comp
         // altogether. A 3D layer's trail stays with the layer, which AE puts through the camera after
         // this effect.
-        LayerMotion motion(in_data, out_data);
-        const CompWatch watch(in_data, out_data);
         // Which instance of the effect this is, which AEGP takes a while to tell.
         const uint64_t instance = EffectInstance(in_data, out_data);
+        LayerMotion motion(in_data, out_data, AEGP_LayerIDVal_NONE, &metal->motions, instance);
+        const CompWatch watch(in_data, out_data);
         ExpressionPrints expressions(in_data, out_data, instance, metal->expressions);
         data->watchesComp = watch.active();
         if (data->watchesComp)
@@ -2466,7 +2440,7 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             data->sources[slot] = choices[slot].source;
             if (data->canvas.compSpace && choices[slot].layer != AEGP_LayerIDVal_NONE)
             {
-                mapMotions[slot].emplace(in_data, out_data, choices[slot].layer);
+                mapMotions[slot].emplace(in_data, out_data, choices[slot].layer, &metal->motions, instance);
                 if (!mapMotions[slot]->usable())
                     mapMotions[slot].reset();
             }

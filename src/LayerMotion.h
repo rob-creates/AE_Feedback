@@ -3,11 +3,10 @@
 #pragma once
 
 #include <cstdint>
-#include <map>
 #include <optional>
-#include <utility>
 
 #include "AEGP_SuiteHandler.h"
+#include "Readings.h"
 #include "AE_Effect.h"
 #include "AE_GeneralPlug.h"
 
@@ -33,8 +32,12 @@ public:
     // Reads what doesn't change from moment to moment. If any of it can't be read, `usable` is false.
     // It's false for a 3D layer too: AE puts that through the camera after its effects, so its pixels
     // have no fixed place in the comp. To work on what a 3D layer looks like, precompose it.
-    // The layer the effect is on, or with `other`, that layer in the same comp.
-    LayerMotion(PF_InData* in_data, PF_OutData* out_data, AEGP_LayerIDVal other = AEGP_LayerIDVal_NONE);
+    // The layer the effect is on, or with `other`, that layer in the same comp. With `shared`, where the
+    // layer was is kept there between calls, for each `instance` of the effect and layer, until anything
+    // in the project changes.
+    LayerMotion(PF_InData* in_data, PF_OutData* out_data, AEGP_LayerIDVal other = AEGP_LayerIDVal_NONE,
+                MomentReadings<Projective>* shared = nullptr, uint64_t instance = 0);
+    ~LayerMotion();
 
     bool usable() const { return mUsable; }
     // Shape and text layers, and collapsed precomps. At reduced resolution AE sometimes gives their
@@ -45,7 +48,7 @@ public:
 
     // Layer pixels to comp pixels, both at full resolution, at a time in the effect's own units. A
     // layer drawn in comp space already has its pixels where they are in the comp. Each moment is
-    // read from AE once.
+    // read from AE once, and with `shared`, once until the project changes.
     bool layerToComp(A_long value, A_u_long scale, Projective* out);
 
     // Changes whenever where the layer is at `time`, in the effect's time scale, changes. Zero if it
@@ -67,7 +70,12 @@ private:
     AEGP_SuiteHandler mSuites;
     AEGP_PFInterfaceSuite1* mFace = nullptr;
     AEGP_LayerSuite9* mLayers = nullptr;
-    std::map<std::pair<A_long, A_u_long>, Projective> mRead;
+    // Kept between calls, as of this timestamp, under this key, and what this call read on top.
+    MomentReadings<Projective>* mShared = nullptr;
+    AEGP_TimeStamp mMade{};
+    uint64_t mKey = 0;
+    std::shared_ptr<const MomentReadings<Projective>::Values> mKnown;
+    MomentReadings<Projective>::Values mRead;
 };
 
 // An adjustment layer's input is whatever is beneath it, and AE's history of the effect's inputs
