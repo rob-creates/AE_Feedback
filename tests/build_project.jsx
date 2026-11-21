@@ -262,11 +262,6 @@
         feedback(movingDot(deep, "dot", RED, 1920, 1080, [100, 100], [1800, 980], 60),
                  { "Alpha Max": 1, "Sub-steps": 7, "Limit Pre-Roll": true });
 
-        // The same with Limit Pre-Roll off, as it is by default. Not in the suite: rendered by hand, to see
-        // whether rebuilding the whole of it at once is something AE copes with.
-        var deepOff = newComp("deep_unlimited", 4000, 1920, 1080);
-        feedback(movingDot(deepOff, "dot", RED, 1920, 1080, [100, 100], [1800, 980], 60), { "Alpha Max": 1, "Sub-steps": 7 });
-
         // A dot seen only on the first frame, so the trail after it is that one copy spreading out, on its
         // own and split into sub-steps. Masks apply before effects, so the mask's
         // opacity hides the dot from the effect.
