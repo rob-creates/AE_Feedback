@@ -847,12 +847,9 @@ bool BuildsUpInput(int compositeMode)
 // Each control describes what happens per frame. A step that makes `share` of that, one of n sub-steps
 // or part of the way to a moment between frames, applies that much of each, so neither changes the
 // trail's overall look, only how smoothly it gets there. `frameEnd` is the sub-step at the frame's own
-// moment, which is where Levels that can't be divided goes.
-FrameParams DivideIntoSteps(FrameParams f, float share, bool frameEnd)
+// moment, which is where Levels that can't be divided goes. For a share under 1.
+void DivideShares(FrameParams& f, float share, bool frameEnd)
 {
-    if (share >= 1.0f)
-        return f;
-
     if (f.alphaSlope > 0.0f)
     {
         const float subSlope = std::pow(f.alphaSlope, share);
@@ -902,23 +899,28 @@ FrameParams DivideIntoSteps(FrameParams f, float share, bool frameEnd)
         f.frameAlpha = std::min(f.alpha, 0.999f);
         f.stepAlpha = std::pow(f.frameAlpha, share);
     }
-    return f;
 }
 
-// A step at Pixel Sampling's Pixel, as DivideIntoSteps divides it except for the trail's move, which takes
-// whole pixels only. Resampling by a fraction of a pixel mixes neighbours, and fed back step after step
-// that softens the trail. `resolutionX` and `resolutionY` are the canvas's, as its pixels are the ones
-// that count.
+// Pixel Sampling at Pixel moves the trail by whole pixels of the canvas, whose resolution this is, and
+// `carry` keeps what's left over from one step to the next.
+struct WholePixels
+{
+    float resolutionX, resolutionY;
+    TrailCarry* carry;
+};
+
+// Replaces the move DivideShares made with one of whole pixels only. Resampling by a fraction of a pixel
+// mixes neighbours, and fed back step after step that softens the trail. `whole` is the frame undivided.
 //
 // The frame's move, x -> L (x - centre) + centre + move, is the same as moving by u = L^-1 move and then
 // applying L about the centre. Each step takes its share of u, rounded to whole pixels, and `carry` keeps
 // what rounding left over for the next, so the steps still add up to the frame's move. L, and
 // displacement, which move each pixel differently and can't be carried, apply once a frame, at the
 // frame's own moment, as with no sub-steps. The fraction still owed is turned with the trail.
-FrameParams PixelSteps(const FrameParams& whole, float share, bool frameEnd, float resolutionX, float resolutionY,
-                       TrailCarry* carry)
+void SnapMove(const FrameParams& whole, float share, bool frameEnd, const WholePixels& pixels, FrameParams& f)
 {
-    FrameParams f = DivideIntoSteps(whole, share, frameEnd);
+    const float resolutionX = pixels.resolutionX, resolutionY = pixels.resolutionY;
+    TrailCarry* carry = pixels.carry;
     // In canvas pixels, as TrailTransform has it.
     const double a = whole.linear[0], b = double(whole.linear[1]) * resolutionX / resolutionY,
                  c = double(whole.linear[2]) * resolutionY / resolutionX, d = whole.linear[3];
@@ -926,7 +928,7 @@ FrameParams PixelSteps(const FrameParams& whole, float share, bool frameEnd, flo
     if (CollapsesTrail(whole) || std::abs(det) < 1e-12)
     {
         *carry = {};
-        return f;
+        return;
     }
     const double moveX = double(whole.moveX) * resolutionX, moveY = double(whole.moveY) * resolutionY;
     const double wantX = carry->x + share * (d * moveX - b * moveY) / det;
@@ -957,6 +959,17 @@ FrameParams PixelSteps(const FrameParams& whole, float share, bool frameEnd, flo
 
     f.amountX = frameEnd ? whole.amountX : 0.0f;
     f.amountY = frameEnd ? whole.amountY : 0.0f;
+}
+
+// One step's worth of a frame's controls, `share` of it, as DivideShares has it. With `pixels`, the
+// trail's move is by whole pixels, as SnapMove has it, at any share.
+FrameParams DivideIntoSteps(const FrameParams& frame, float share, bool frameEnd, const WholePixels* pixels = nullptr)
+{
+    FrameParams f = frame;
+    if (share < 1.0f)
+        DivideShares(f, share, frameEnd);
+    if (pixels)
+        SnapMove(frame, share, frameEnd, *pixels, f);
     return f;
 }
 
@@ -2862,11 +2875,10 @@ PF_Err ComputeSample(
         ERR(PF_ABORT(in_data));
 
     FrameParams params{};
-    if (!err && render.data.filter == FILTER_NEAREST)
-        params = PixelSteps(ReadFrameParams(in_data, sub.time, &err), share, frameEnd,
-                            ScaleValue(render.data.canvas.downsampleX), ScaleValue(render.data.canvas.downsampleY), carry);
-    else if (!err)
-        params = DivideIntoSteps(ReadFrameParams(in_data, sub.time, &err), share, frameEnd);
+    const WholePixels pixels{ScaleValue(render.data.canvas.downsampleX), ScaleValue(render.data.canvas.downsampleY), carry};
+    if (!err)
+        params = DivideIntoSteps(ReadFrameParams(in_data, sub.time, &err), share, frameEnd,
+                                 render.data.filter == FILTER_NEAREST ? &pixels : nullptr);
     params.filter = render.data.filter;
     params.inputOpacity = sub.opacity;
     params.spreadWidest = render.data.spreadWidest;
