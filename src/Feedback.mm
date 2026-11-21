@@ -1572,13 +1572,37 @@ AEGP_PluginID FeedbackPluginId(PF_InData* in_data, PF_OutData* out_data)
 {
     static const AEGP_PluginID id = [&]
     {
-        AEFX_SuiteScoper<AEGP_UtilitySuite6> util(in_data, kAEGPUtilitySuite, kAEGPUtilitySuiteVersion6, out_data);
+        AEGP_SuiteHandler suites(in_data->pica_basicP);
+        auto* util = suites.UtilitySuite6();
         AEGP_PluginID registered = 0;
         util->AEGP_RegisterWithAEGP(nullptr, "Feedback", &registered);
         return registered;
     }();
     return id;
 }
+
+// AEGP effect and stream handles, each disposed of when it goes out of scope, error or not.
+struct EffectRef
+{
+    AEGP_SuiteHandler& suites;
+    AEGP_EffectRefH ref = nullptr;
+    ~EffectRef()
+    {
+        if (ref)
+            suites.EffectSuite5()->AEGP_DisposeEffect(ref);
+    }
+};
+
+struct StreamRef
+{
+    AEGP_SuiteHandler& suites;
+    AEGP_StreamRefH ref = nullptr;
+    ~StreamRef()
+    {
+        if (ref)
+            suites.StreamSuite7()->AEGP_DisposeStream(ref);
+    }
+};
 
 // Which instance of the effect this is: its layer, and where it is among that layer's effects. AE's
 // history of an adjustment layer's inputs is the same for every one with the same settings, so their
@@ -1588,33 +1612,23 @@ uint64_t EffectInstance(PF_InData* in_data, PF_OutData* out_data)
     try
     {
         const AEGP_PluginID plugin = FeedbackPluginId(in_data, out_data);
-        AEFX_SuiteScoper<AEGP_PFInterfaceSuite1> face(in_data, kAEGPPFInterfaceSuite, kAEGPPFInterfaceSuiteVersion1, out_data);
-        AEFX_SuiteScoper<AEGP_LayerSuite9> layers(in_data, kAEGPLayerSuite, kAEGPLayerSuiteVersion9, out_data);
-        AEFX_SuiteScoper<AEGP_EffectSuite5> effects(in_data, kAEGPEffectSuite, kAEGPEffectSuiteVersion5, out_data);
-        AEFX_SuiteScoper<AEGP_StreamSuite7> streams(in_data, kAEGPStreamSuite, kAEGPStreamSuiteVersion7, out_data);
-        AEFX_SuiteScoper<AEGP_DynamicStreamSuite4> dynamic(in_data, kAEGPDynamicStreamSuite, kAEGPDynamicStreamSuiteVersion4,
-                                                           out_data);
+        AEGP_SuiteHandler suites(in_data->pica_basicP);
+        auto* face = suites.PFInterfaceSuite1();
+        auto* layers = suites.LayerSuite9();
+        auto* streams = suites.StreamSuite7();
+        auto* dynamic = suites.DynamicStreamSuite4();
         AEGP_LayerH layer = nullptr;
         AEGP_LayerIDVal id = AEGP_LayerIDVal_NONE;
         if (!plugin || face->AEGP_GetEffectLayer(in_data->effect_ref, &layer) || !layer || layers->AEGP_GetLayerID(layer, &id))
             return 0;
         // The first control's parent is the effect itself, whose place among the layer's effects is its index.
         A_long index = -1;
-        AEGP_EffectRefH effect = nullptr;
-        if (!face->AEGP_GetNewEffectForEffect(plugin, in_data->effect_ref, &effect))
-        {
-            AEGP_StreamRefH control = nullptr, parent = nullptr;
-            if (!streams->AEGP_GetNewEffectStreamByIndex(plugin, effect, 1, &control))
-            {
-                if (!dynamic->AEGP_GetNewParentStreamRef(plugin, control, &parent))
-                {
-                    dynamic->AEGP_GetStreamIndexInParent(parent, &index);
-                    streams->AEGP_DisposeStream(parent);
-                }
-                streams->AEGP_DisposeStream(control);
-            }
-            effects->AEGP_DisposeEffect(effect);
-        }
+        EffectRef effect{suites};
+        StreamRef control{suites}, parent{suites};
+        if (!face->AEGP_GetNewEffectForEffect(plugin, in_data->effect_ref, &effect.ref) &&
+            !streams->AEGP_GetNewEffectStreamByIndex(plugin, effect.ref, 1, &control.ref) &&
+            !dynamic->AEGP_GetNewParentStreamRef(plugin, control.ref, &parent.ref))
+            dynamic->AEGP_GetStreamIndexInParent(parent.ref, &index);
         return uint64_t(uint32_t(id)) << 32 | uint32_t(index + 2);
     }
     catch (...)
@@ -1630,26 +1644,24 @@ std::vector<int> FindExpressions(PF_InData* in_data, PF_OutData* out_data)
     try
     {
         const AEGP_PluginID plugin = FeedbackPluginId(in_data, out_data);
-        AEFX_SuiteScoper<AEGP_PFInterfaceSuite1> face(in_data, kAEGPPFInterfaceSuite, kAEGPPFInterfaceSuiteVersion1, out_data);
-        AEFX_SuiteScoper<AEGP_EffectSuite5> effects(in_data, kAEGPEffectSuite, kAEGPEffectSuiteVersion5, out_data);
-        AEFX_SuiteScoper<AEGP_StreamSuite7> streams(in_data, kAEGPStreamSuite, kAEGPStreamSuiteVersion7, out_data);
-        AEGP_EffectRefH effect = nullptr;
-        if (!plugin || face->AEGP_GetNewEffectForEffect(plugin, in_data->effect_ref, &effect) || !effect)
+        AEGP_SuiteHandler suites(in_data->pica_basicP);
+        auto* face = suites.PFInterfaceSuite1();
+        auto* streams = suites.StreamSuite7();
+        EffectRef effect{suites};
+        if (!plugin || face->AEGP_GetNewEffectForEffect(plugin, in_data->effect_ref, &effect.ref) || !effect.ref)
             return found;
         for (int index = 1; index < PARAM_COUNT; index++)
         {
-            AEGP_StreamRefH stream = nullptr;
-            if (streams->AEGP_GetNewEffectStreamByIndex(plugin, effect, index, &stream) || !stream)
+            StreamRef stream{suites};
+            if (streams->AEGP_GetNewEffectStreamByIndex(plugin, effect.ref, index, &stream.ref) || !stream.ref)
                 continue;
             // Only a control that can vary over time can have an expression, and AE stops with an error
             // if asked about any other: group headings, layer controls and those that can't be keyframed.
             A_Boolean canVary = false, enabled = false;
-            if (!streams->AEGP_CanVaryOverTime(stream, &canVary) && canVary &&
-                !streams->AEGP_GetExpressionState(plugin, stream, &enabled) && enabled)
+            if (!streams->AEGP_CanVaryOverTime(stream.ref, &canVary) && canVary &&
+                !streams->AEGP_GetExpressionState(plugin, stream.ref, &enabled) && enabled)
                 found.push_back(index);
-            streams->AEGP_DisposeStream(stream);
         }
-        effects->AEGP_DisposeEffect(effect);
     }
     catch (...)
     {
@@ -1716,7 +1728,8 @@ public:
     {
         try
         {
-            AEFX_SuiteScoper<AEGP_RenderSuite5> render(in_data, kAEGPRenderSuite, kAEGPRenderSuiteVersion5, out_data);
+            AEGP_SuiteHandler suites(in_data->pica_basicP);
+            auto* render = suites.RenderSuite5();
             mHaveMade = render->AEGP_GetCurrentTimestamp(&mMade) == A_Err_NONE;
         }
         catch (...)
@@ -1839,35 +1852,33 @@ std::array<MapChoice, SLOT_COUNT> ReadMapChoices(PF_InData* in_data, PF_OutData*
     AEGP_LayerIDVal own = AEGP_LayerIDVal_NONE;
     try
     {
-        AEFX_SuiteScoper<AEGP_PFInterfaceSuite1> face(in_data, kAEGPPFInterfaceSuite, kAEGPPFInterfaceSuiteVersion1, out_data);
-        AEFX_SuiteScoper<AEGP_EffectSuite5> effects(in_data, kAEGPEffectSuite, kAEGPEffectSuiteVersion5, out_data);
-        AEFX_SuiteScoper<AEGP_StreamSuite7> streams(in_data, kAEGPStreamSuite, kAEGPStreamSuiteVersion7, out_data);
-        AEFX_SuiteScoper<AEGP_LayerSuite9> layers(in_data, kAEGPLayerSuite, kAEGPLayerSuiteVersion9, out_data);
+        AEGP_SuiteHandler suites(in_data->pica_basicP);
+        auto* face = suites.PFInterfaceSuite1();
+        auto* streams = suites.StreamSuite7();
+        auto* layers = suites.LayerSuite9();
 
         const AEGP_PluginID pluginId = FeedbackPluginId(in_data, out_data);
         if (!pluginId)
             return choices;
 
-        AEGP_EffectRefH effect = nullptr;
-        if (face->AEGP_GetNewEffectForEffect(pluginId, in_data->effect_ref, &effect))
+        EffectRef effect{suites};
+        if (face->AEGP_GetNewEffectForEffect(pluginId, in_data->effect_ref, &effect.ref))
             return choices;
         for (int slot = 0; slot < SLOT_COUNT; slot++)
         {
-            AEGP_StreamRefH stream = nullptr;
-            if (streams->AEGP_GetNewEffectStreamByIndex(pluginId, effect, kMapParams[slot], &stream))
+            StreamRef stream{suites};
+            if (streams->AEGP_GetNewEffectStreamByIndex(pluginId, effect.ref, kMapParams[slot], &stream.ref))
                 continue;
             AEGP_StreamValue2 value{};
             A_Time time = {in_data->current_time, static_cast<A_u_long>(in_data->time_scale)};
-            if (!streams->AEGP_GetNewStreamValue(pluginId, stream, AEGP_LTimeMode_CompTime, &time, TRUE, &value))
+            if (!streams->AEGP_GetNewStreamValue(pluginId, stream.ref, AEGP_LTimeMode_CompTime, &time, TRUE, &value))
             {
                 picked[slot] = value.val.layer_id;
                 readPicked[slot] = true;
                 streams->AEGP_DisposeStreamValue(&value);
             }
-            streams->AEGP_GetStreamLayerParamStageValue(pluginId, stream, &stage[slot]);
-            streams->AEGP_DisposeStream(stream);
+            streams->AEGP_GetStreamLayerParamStageValue(pluginId, stream.ref, &stage[slot]);
         }
-        effects->AEGP_DisposeEffect(effect);
 
         AEGP_LayerH layer = nullptr;
         if (!face->AEGP_GetEffectLayer(in_data->effect_ref, &layer) && layer)
@@ -1898,8 +1909,9 @@ A_long TrailStart(PF_InData* in_data, PF_OutData* out_data)
 {
     try
     {
-        AEFX_SuiteScoper<AEGP_PFInterfaceSuite1> face(in_data, kAEGPPFInterfaceSuite, kAEGPPFInterfaceSuiteVersion1, out_data);
-        AEFX_SuiteScoper<AEGP_LayerSuite9> layers(in_data, kAEGPLayerSuite, kAEGPLayerSuiteVersion9, out_data);
+        AEGP_SuiteHandler suites(in_data->pica_basicP);
+        auto* face = suites.PFInterfaceSuite1();
+        auto* layers = suites.LayerSuite9();
 
         AEGP_LayerH layer = nullptr;
         A_Time inPoint{};
@@ -1937,9 +1949,10 @@ TrailGrid FindGrid(PF_InData* in_data, PF_OutData* out_data)
     TrailGrid grid{now, now, in_data->time_step, 0.0f};
     try
     {
-        AEFX_SuiteScoper<AEGP_PFInterfaceSuite1> face(in_data, kAEGPPFInterfaceSuite, kAEGPPFInterfaceSuiteVersion1, out_data);
-        AEFX_SuiteScoper<AEGP_LayerSuite9> layers(in_data, kAEGPLayerSuite, kAEGPLayerSuiteVersion9, out_data);
-        AEFX_SuiteScoper<AEGP_CompSuite13> comps(in_data, kAEGPCompSuite, kAEGPCompSuiteVersion13, out_data);
+        AEGP_SuiteHandler suites(in_data->pica_basicP);
+        auto* face = suites.PFInterfaceSuite1();
+        auto* layers = suites.LayerSuite9();
+        auto* comps = suites.CompSuite13();
         AEGP_LayerH layer = nullptr;
         AEGP_CompH comp = nullptr;
         A_Time frame{}, at{}, later{};

@@ -54,6 +54,8 @@ add_library(Feedback MODULE
     src/FeedbackRenderer.mm
     src/LayerMotion.mm
     "${SDK}/Util/AEFX_SuiteHelper.c"
+    "${SDK}/Util/AEGP_SuiteHandler.cpp"
+    "${SDK}/Util/MissingSuiteError.cpp"
     "${PIPL_RSRC}"
     "${METALLIB}"
     "${BUILD_STAMP}")

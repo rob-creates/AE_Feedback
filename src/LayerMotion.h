@@ -7,7 +7,7 @@
 #include <optional>
 #include <utility>
 
-#include "AEFX_SuiteHelper.h"
+#include "AEGP_SuiteHandler.h"
 #include "AE_Effect.h"
 #include "AE_GeneralPlug.h"
 
@@ -63,9 +63,10 @@ private:
     // layer-to-comp transform is the identity.
     bool mDrawnInComp = false;
     A_long mCompWidth = 0, mCompHeight = 0;
-    // Held for the life of this object, which lasts one call.
-    std::optional<AEFX_SuiteScoper<AEGP_PFInterfaceSuite1>> mFace;
-    std::optional<AEFX_SuiteScoper<AEGP_LayerSuite9>> mLayers;
+    // Held for the life of this object, which lasts one call. Null if they couldn't be had.
+    AEGP_SuiteHandler mSuites;
+    AEGP_PFInterfaceSuite1* mFace = nullptr;
+    AEGP_LayerSuite9* mLayers = nullptr;
     std::map<std::pair<A_long, A_u_long>, Projective> mRead;
 };
 
@@ -88,8 +89,9 @@ public:
 private:
     PF_InData* mInData;
     AEGP_ItemH mCompItem = nullptr;
-    std::optional<AEFX_SuiteScoper<AEGP_PFInterfaceSuite1>> mFace;
-    std::optional<AEFX_SuiteScoper<AEGP_RenderSuite5>> mRender;
+    AEGP_SuiteHandler mSuites;
+    AEGP_PFInterfaceSuite1* mFace = nullptr;
+    AEGP_RenderSuite5* mRender = nullptr;
     AEGP_TimeStamp mNow{}; // nothing made at this timestamp can have been changed since
     bool mHaveNow = false;
 };

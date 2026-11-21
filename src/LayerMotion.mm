@@ -54,15 +54,16 @@ void Projective::toFloats(float out[9]) const
 LayerMotion::LayerMotion(PF_InData* in_data, PF_OutData* out_data, AEGP_LayerIDVal other)
     : mInData(in_data)
     , mOutData(out_data)
+    , mSuites(in_data->pica_basicP)
 {
     try
     {
-        mFace.emplace(in_data, kAEGPPFInterfaceSuite, kAEGPPFInterfaceSuiteVersion1, out_data);
-        mLayers.emplace(in_data, kAEGPLayerSuite, kAEGPLayerSuiteVersion9, out_data);
-        auto& face = *mFace;
-        auto& layers = *mLayers;
-        AEFX_SuiteScoper<AEGP_CompSuite13> comps(in_data, kAEGPCompSuite, kAEGPCompSuiteVersion13, out_data);
-        AEFX_SuiteScoper<AEGP_ItemSuite9> items(in_data, kAEGPItemSuite, kAEGPItemSuiteVersion9, out_data);
+        mFace = mSuites.PFInterfaceSuite1();
+        mLayers = mSuites.LayerSuite9();
+        auto* face = mFace;
+        auto* layers = mLayers;
+        auto* comps = mSuites.CompSuite13();
+        auto* items = mSuites.ItemSuite9();
 
         AEGP_CompH comp = nullptr;
         AEGP_ItemH item = nullptr;
@@ -104,8 +105,8 @@ bool LayerMotion::layerToComp(A_long value, A_u_long scale, Projective* out)
     }
     A_Time compTime{};
     A_Matrix4 world{};
-    if ((*mFace)->AEGP_ConvertEffectToCompTime(mInData->effect_ref, value, scale, &compTime) ||
-        (*mLayers)->AEGP_GetLayerToWorldXform(mLayer, &compTime, &world))
+    if (mFace->AEGP_ConvertEffectToCompTime(mInData->effect_ref, value, scale, &compTime) ||
+        mLayers->AEGP_GetLayerToWorldXform(mLayer, &compTime, &world))
         return false;
     // A 2D layer's world is the comp itself. AE's matrices act on row vectors, (x, y, z, 1) * M.
     *out = Projective{{world.mat[0][0], world.mat[1][0], world.mat[3][0], world.mat[0][1], world.mat[1][1],
@@ -124,24 +125,25 @@ uint64_t LayerMotion::fingerprint(A_long value, A_u_long scale)
     return hash;
 }
 
-CompWatch::CompWatch(PF_InData* in_data, PF_OutData* out_data)
+CompWatch::CompWatch(PF_InData* in_data, PF_OutData*)
     : mInData(in_data)
+    , mSuites(in_data->pica_basicP)
 {
     try
     {
-        mFace.emplace(in_data, kAEGPPFInterfaceSuite, kAEGPPFInterfaceSuiteVersion1, out_data);
-        AEFX_SuiteScoper<AEGP_LayerSuite9> layers(in_data, kAEGPLayerSuite, kAEGPLayerSuiteVersion9, out_data);
-        AEFX_SuiteScoper<AEGP_CompSuite13> comps(in_data, kAEGPCompSuite, kAEGPCompSuiteVersion13, out_data);
+        mFace = mSuites.PFInterfaceSuite1();
+        auto* layers = mSuites.LayerSuite9();
+        auto* comps = mSuites.CompSuite13();
         AEGP_LayerH layer = nullptr;
         AEGP_LayerFlags flags = 0;
         AEGP_CompH comp = nullptr;
         AEGP_ItemH item = nullptr;
-        if ((*mFace)->AEGP_GetEffectLayer(in_data->effect_ref, &layer) || !layer ||
+        if (mFace->AEGP_GetEffectLayer(in_data->effect_ref, &layer) || !layer ||
             layers->AEGP_GetLayerFlags(layer, &flags) || (flags & AEGP_LayerFlag_ADJUSTMENT_LAYER) == 0 ||
             layers->AEGP_GetLayerParentComp(layer, &comp) || comps->AEGP_GetItemFromComp(comp, &item))
             return;
-        mRender.emplace(in_data, kAEGPRenderSuite, kAEGPRenderSuiteVersion5, out_data);
-        mHaveNow = (*mRender)->AEGP_GetCurrentTimestamp(&mNow) == A_Err_NONE;
+        mRender = mSuites.RenderSuite5();
+        mHaveNow = mRender->AEGP_GetCurrentTimestamp(&mNow) == A_Err_NONE;
         mCompItem = item;
     }
     catch (...)
@@ -165,12 +167,12 @@ bool CompWatch::unchangedSince(const AEGP_TimeStamp& made, A_long endExclusive) 
     if (mHaveNow && std::memcmp(&made, &mNow, sizeof(made)) == 0)
         return true;
     A_Time end{};
-    if ((*mFace)->AEGP_ConvertEffectToCompTime(mInData->effect_ref, endExclusive, A_u_long(mInData->time_scale), &end))
+    if (mFace->AEGP_ConvertEffectToCompTime(mInData->effect_ref, endExclusive, A_u_long(mInData->time_scale), &end))
         return false;
     // From the comp's start, which takes in any time before the layer's.
     const A_Time start{0, end.scale};
     A_Boolean changed = true;
-    if ((*mRender)->AEGP_HasItemChangedSinceTimestamp(mCompItem, &start, &end, &made, &changed))
+    if (mRender->AEGP_HasItemChangedSinceTimestamp(mCompItem, &start, &end, &made, &changed))
         return false;
     return !changed;
 }
