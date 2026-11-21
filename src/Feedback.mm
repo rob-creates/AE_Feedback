@@ -233,6 +233,9 @@ struct FrameFacts
     float edgeSize; // 0 when edges are off
     bool moves; // Transform moves the trail
     std::vector<SampleFacts> samples; // oldest first; the last one is at the frame's own time
+    // What the effect's expressions gave over the frame's moments when these were read
+    // (ExpressionPrints::frame), which AE's history doesn't show. Zero without expressions.
+    uint64_t expressions = 0;
 };
 
 // Remembered frame facts, trusted only while AE reports the same history as when they were read and
@@ -253,15 +256,11 @@ public:
         PF_RationalScale downsampleX, downsampleY;
         int samplesPerStep;
         uint64_t owner; // as CanvasKey::owner
-        // With expressions, AE's history can't vouch for the facts, so a run lasts only until anything in
-        // the project changes: ExpressionPrints::epoch. Zero without.
-        uint64_t expressionEpoch;
 
         bool operator==(const Key& o) const
         {
             return step == o.step && scale == o.scale && SameScale(downsampleX, o.downsampleX) &&
-                   SameScale(downsampleY, o.downsampleY) && samplesPerStep == o.samplesPerStep && owner == o.owner &&
-                   expressionEpoch == o.expressionEpoch;
+                   SameScale(downsampleY, o.downsampleY) && samplesPerStep == o.samplesPerStep && owner == o.owner;
         }
     };
 
@@ -1774,17 +1773,18 @@ public:
     bool active() const { return !mParams.empty(); }
     int count() const { return int(mParams.size()); }
 
-    // For FrameFactsMemo::Key: changes with anything in the project while there are expressions. A
-    // timestamp that can't be read never matches.
-    uint64_t epoch() const
+    // What the expressions give over a frame's moments, as ReadFrameFacts samples them.
+    uint64_t frame(A_long time, A_long step, int samplesPerStep)
     {
-        if (!active())
-            return 0;
-        if (!mHaveMade)
-            return Unmatched();
-        uint32_t stamp;
-        std::memcpy(&stamp, mMade.a, sizeof(stamp));
-        return uint64_t(stamp) + 1;
+        uint64_t print = kHashStart;
+        for (int before = samplesPerStep - 1; before >= 0; before--)
+        {
+            SampleTime t;
+            if (!MakeSampleTime(mInData, time, step, before, samplesPerStep, &t))
+                t = FrameSample(mInData, time - before * step / samplesPerStep);
+            Mix(print, at(t));
+        }
+        return print;
     }
 
     // What the expressions give at a moment.
@@ -2004,6 +2004,8 @@ struct TrailWalk
     std::unordered_map<A_long, FrameFacts> read;
     bool hasProbe = false;
     SampleFacts probe{};
+    // A remembered frame's expressions gave something else when it was read, so the run is out of date.
+    bool stale = false;
 };
 
 // Adds what a walk read to its run, under a history read afterwards that covers it. If another render
@@ -2033,9 +2035,10 @@ void KeepFacts(
 
     std::lock_guard<std::mutex> guard(memo.lock);
     const bool unchanged = run.version == view.version;
-    if (!readable)
+    if (!readable || walk.stale)
     {
-        // Never matches again, so the next call starts a new run.
+        // A history that can't be read never matches again, and an out-of-date run mustn't: either way,
+        // the next call starts a new run.
         if (unchanged)
         {
             run.endExclusive = 0;
@@ -2077,6 +2080,7 @@ PF_Err WalkTrail(
     const std::function<PF_LRect(const SampleFacts&)>& toCanvas,
     bool capSpread,
     float spreadWidest,
+    ExpressionPrints* expressions,
     A_long* nextId,
     TrailWalk* walk)
 {
@@ -2111,12 +2115,20 @@ PF_Err WalkTrail(
             if (found != view.run->frames.end())
                 known = &found->second;
         }
+        // With expressions, a remembered frame is only of use if they still give what they did.
+        const uint64_t expressed = expressions ? expressions->frame(time, step, samplesPerStep) : 0;
+        if (known && known->expressions != expressed)
+        {
+            known = nullptr;
+            walk->stale = true;
+        }
         if (!known)
         {
             FrameFacts read{};
             ERR(ReadFrameFacts(in_data, extra, request, time, step, samplesPerStep, sources, nextId, &read));
             if (err)
                 break;
+            read.expressions = expressed;
             known = &walk->read.emplace(time, std::move(read)).first->second;
         }
         // Nothing changes a frame's facts once they're in, and the maps keep them in place.
@@ -2449,8 +2461,7 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             in_data->downsample_x,
             in_data->downsample_y,
             data->samplesPerStep,
-            data->canvas.owner,
-            expressions.epoch()};
+            data->canvas.owner};
         RunView view;
         if (!err)
             view = FindFacts(in_data, extra, request, utils, metal->memo, factsKey, &nextId, &err);
@@ -2489,7 +2500,8 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
         TrailWalk walk;
         if (!err)
             ERR(WalkTrail(in_data, extra, request, metal->memo, view, grid, data->samplesPerStep, preRollLimit, invisible,
-                          data->sources, firstTime, toCanvas, !data->canvas.compSpace, data->spreadWidest, &nextId, &walk));
+                          data->sources, firstTime, toCanvas, !data->canvas.compSpace, data->spreadWidest,
+                          expressions.active() ? &expressions : nullptr, &nextId, &walk));
 
         // A failed walk keeps nothing, as what it read may not match any history.
         if (!err)
