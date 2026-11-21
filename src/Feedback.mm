@@ -222,7 +222,9 @@ using MapSources = std::array<int, SLOT_COUNT>;
 struct SampleFacts
 {
     SampleTime time;
-    float opacity; // Opacity: how much of the layer goes into the trail at this moment
+    // Every control at this moment, as each step reads them. Opacity, inputOpacity, is how much of the
+    // layer goes into the trail.
+    FrameParams params;
     PF_LRect inputRect; // empty when none does
     PF_LRect mapRects[SLOT_COUNT]; // each map layer's bounds, if it's read
 };
@@ -297,7 +299,7 @@ struct FetchTag
 struct SubstepCheckout
 {
     SampleTime time;
-    float opacity; // how much of the layer goes into the trail at this moment
+    FrameParams params; // every control at this moment, as SampleFacts has them
     A_long inputId;
     PF_LRect inputRect; // empty if there's no input to use
     FetchTag inputFetch;
@@ -810,6 +812,7 @@ FrameParams ReadFrameParams(PF_InData* in_data, const SampleTime& time, PF_Err* 
     f.edgeSmoothing = std::clamp(r.slider(PARAM_EDGE_SMOOTHING) / 100.0f, 0.0f, 1.0f);
     f.edgeStrength = r.slider(PARAM_EDGE_STRENGTH);
     f.edgeBlend = r.popup(PARAM_EDGE_BLEND);
+    f.inputOpacity = std::clamp(r.slider(PARAM_OPACITY), 0.0f, 1.0f);
     *err = r.err;
     return f;
 }
@@ -1552,18 +1555,11 @@ PF_Err ReadFrameFacts(
         SampleFacts sample{};
         if (!MakeSampleTime(in_data, time, step, before, samplesPerStep, &sample.time))
             sample.time = FrameSample(in_data, time - before * step / samplesPerStep);
-        ParamReader at{in_data, sample.time};
-        // Each sub-step moves by Transform at its own moment, which can differ from the frame's.
-        if (!facts->moves)
-        {
-            FrameParams f{};
-            ReadMove(at, &f.moveX, &f.moveY, &f.scaleX, &f.scaleY, &f.rotationDegrees);
-            SetLinear(f.rotationDegrees, f.scaleX, f.scaleY, f.linear);
-            facts->moves = MovesTrail(f);
-        }
-        sample.opacity = std::clamp(at.slider(PARAM_OPACITY), 0.0f, 1.0f);
-        ERR(at.err);
-        if (sample.opacity > 0.0f)
+        // Read once here and kept with the facts, so each step of each rebuild needn't ask AE again. Each
+        // sub-step moves by Transform at its own moment, which can differ from the frame's.
+        sample.params = ReadFrameParams(in_data, sample.time, &err);
+        facts->moves = facts->moves || MovesTrail(sample.params);
+        if (!err && sample.params.inputOpacity > 0.0f)
             ERR(LayerBounds(in_data, extra, request, PARAM_INPUT, sample.time, nextId, &sample.inputRect));
         for (int slot = 0; !err && slot < SLOT_COUNT; slot++)
             if (sources[slot] == MAP_LAYER)
@@ -2342,12 +2338,12 @@ PF_Err CheckOutFrames(
             const SampleFacts& sample = facts.samples[i];
             SubstepCheckout sub{};
             sub.time = sample.time;
-            sub.opacity = sample.opacity;
+            sub.params = sample.params;
             if (k == 0 && i + 1 == facts.samples.size() && !data->grid.between())
             {
                 // Checked out either way, as AE needs, but only used while some of the layer goes in.
                 sub.inputId = data->currentInputId;
-                if (sample.opacity > 0.0f)
+                if (sample.params.inputOpacity > 0.0f)
                     sub.inputRect = data->currentInputRect;
             }
             else if (!IsEmpty(sample.inputRect))
@@ -2599,8 +2595,8 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
         const SampleFacts* own = err ? nullptr : grid.between() ? &betweenFacts.samples.back() : &walk.window[0]->samples.back();
         if (!err)
         {
-            data->opacity = own->opacity;
-            if ((data->samplesPerStep > 1 || grid.between()) && own->opacity > 0.0f)
+            data->opacity = own->params.inputOpacity;
+            if ((data->samplesPerStep > 1 || grid.between()) && data->opacity > 0.0f)
             {
                 ParamReader r{in_data, FrameSample(in_data, now)};
                 const int mode = r.popup(PARAM_COMPOSITE);
@@ -2662,9 +2658,9 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             const SampleFacts& sample = betweenFacts.samples.back();
             SubstepCheckout sub{};
             sub.time = sample.time;
-            sub.opacity = sample.opacity;
+            sub.params = sample.params;
             sub.inputId = data->currentInputId;
-            if (sample.opacity > 0.0f)
+            if (sample.params.inputOpacity > 0.0f)
                 sub.inputRect = data->currentInputRect;
             ERR(CheckOutMaps(in_data, extra, request, fetchContext, mapArea, sample, &nextId, &sub));
             data->between = sub;
@@ -2878,13 +2874,10 @@ PF_Err ComputeSample(
     if (!isCurrent)
         ERR(PF_ABORT(in_data));
 
-    FrameParams params{};
     const WholePixels pixels{ScaleValue(render.data.canvas.downsampleX), ScaleValue(render.data.canvas.downsampleY), carry};
-    if (!err)
-        params = DivideIntoSteps(ReadFrameParams(in_data, sub.time, &err), share, frameEnd,
-                                 render.data.filter == FILTER_NEAREST ? &pixels : nullptr);
+    FrameParams params =
+        DivideIntoSteps(sub.params, share, frameEnd, render.data.filter == FILTER_NEAREST ? &pixels : nullptr);
     params.filter = render.data.filter;
-    params.inputOpacity = sub.opacity;
     params.spreadWidest = render.data.spreadWidest;
     std::copy(render.data.sources.begin(), render.data.sources.end(), params.sources);
 
@@ -2914,7 +2907,7 @@ PF_Err ComputeSample(
         Source& source = sources[i];
         // At Opacity 0, the layer adds nothing, as if it were empty.
         if (i == 0 && isCurrent)
-            source.world = sub.opacity > 0.0f ? render.currentInput : nullptr;
+            source.world = sub.params.inputOpacity > 0.0f ? render.currentInput : nullptr;
         else if (!IsEmpty(source.rect) && !(source.shared = render.found(*source.fetch, &source.pixels)))
         {
             const auto started = std::chrono::steady_clock::now();
