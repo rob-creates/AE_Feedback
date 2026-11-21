@@ -154,10 +154,50 @@ inline float4 nearestPremultiplied(device const float4* src, int pitch, int w, i
     return tap(src, pitch, w, h, int2(floor(pos + 0.5f)), straight);
 }
 
-inline float4 resample(device const float4* src, int pitch, int w, int h, float2 pos, bool straight, bool nearest)
+// Catmull-Rom's weights for the pixels at -1, 0, 1 and 2 from the one before `t`. At t = 0 it's the
+// pixel alone, so a move by whole pixels copies the image exactly, as bilinear does.
+inline float4 catmullRom(float t)
 {
-    return nearest ? nearestPremultiplied(src, pitch, w, h, pos, straight)
-                   : bilinearPremultiplied(src, pitch, w, h, pos, straight);
+    const float t2 = t * t, t3 = t2 * t;
+    return float4(-0.5f * t + t2 - 0.5f * t3, 1.0f - 2.5f * t2 + 1.5f * t3, 0.5f * t + 2.0f * t2 - 1.5f * t3,
+                  -0.5f * t2 + 0.5f * t3);
+}
+
+// Catmull-Rom over the 4x4 pixels around `pos`, kept within the range of the four nearest. Its
+// negative weights sharpen, which keeps a trail moved by fractions of a pixel far crisper than
+// bilinear, but they also overshoot at edges, and fed back step after step that would build up into
+// bright and dark fringes. Held to what the nearest pixels span, it can't add any.
+inline float4 bicubicPremultiplied(device const float4* src, int pitch, int w, int h, float2 pos, bool straight)
+{
+    const int2 i0 = int2(floor(pos));
+    const float2 f = pos - float2(i0);
+    const float4 wx = catmullRom(f.x), wy = catmullRom(f.y);
+    float4 sum = float4(0.0), lo = float4(INFINITY), hi = float4(-INFINITY);
+    for (int j = 0; j < 4; j++)
+    {
+        float4 row = float4(0.0);
+        for (int k = 0; k < 4; k++)
+        {
+            const float4 v = tap(src, pitch, w, h, i0 + int2(k - 1, j - 1), straight);
+            row += wx[k] * v;
+            if ((k == 1 || k == 2) && (j == 1 || j == 2))
+            {
+                lo = min(lo, v);
+                hi = max(hi, v);
+            }
+        }
+        sum += wy[j] * row;
+    }
+    return clamp(sum, lo, hi);
+}
+
+inline float4 resample(device const float4* src, int pitch, int w, int h, float2 pos, bool straight, int filter)
+{
+    if (filter == FILTER_NEAREST)
+        return nearestPremultiplied(src, pitch, w, h, pos, straight);
+    if (filter == FILTER_BICUBIC)
+        return bicubicPremultiplied(src, pitch, w, h, pos, straight);
+    return bilinearPremultiplied(src, pitch, w, h, pos, straight);
 }
 
 // Where a canvas pixel falls in a map. False where it has no place in it.
@@ -177,10 +217,10 @@ inline float2 toSmaller(float2 pos, int factor)
 
 // Transparent beyond the image, rather than repeating its edge: a position part way past the border
 // blends the border pixel with transparency, so a sub-pixel move carries the border away.
-inline float4 sampleOrClear(device const float4* src, int pitch, int w, int h, float2 pos, bool nearest)
+inline float4 sampleOrClear(device const float4* src, int pitch, int w, int h, float2 pos, int filter)
 {
     if (pos.x > -1.0f && pos.y > -1.0f && pos.x < float(w) && pos.y < float(h))
-        return resample(src, pitch, w, h, pos, false, nearest);
+        return resample(src, pitch, w, h, pos, false, filter);
     return float4(0.0);
 }
 // How much of a group a pixel gets: its mask's luminance, premultiplied so transparent parts of the
@@ -225,7 +265,7 @@ kernel void displace(
         p.inverse[2] * shifted.x + p.inverse[3] * shifted.y + p.offsetY);
     const float2 pos = mix(shifted, moved, maskAt(transformMask, p.transformMask, xy));
     // Anything brought in from beyond the canvas is transparent.
-    dst[xy.y * p.dstPitch + xy.x] = sampleOrClear(src, p.srcPitch, p.width, p.height, pos, p.nearest != 0);
+    dst[xy.y * p.dstPitch + xy.x] = sampleOrClear(src, p.srcPitch, p.width, p.height, pos, p.filter);
 }
 
 // Finds edges with a Sobel filter whose taps are `distance` apart, and puts them over the image.
@@ -430,7 +470,7 @@ inline float4 applyComposite(float4 f, device const float4* input, int2 xy, cons
     {
         float2 at;
         if (project(p.inputFromCanvas, float2(xy), at))
-            i = resample(input, p.inputPitch, p.inputWidth, p.inputHeight, at, true, p.nearest != 0);
+            i = resample(input, p.inputPitch, p.inputWidth, p.inputHeight, at, true, p.filter);
     }
     else if (m.x >= 0 && m.y >= 0 && m.x < p.inputWidth && m.y < p.inputHeight)
     {
@@ -498,7 +538,7 @@ kernel void copyOut(
     {
         float2 at;
         v = project(p.canvasFromOutput, float2(xy), at)
-                ? resample(src, p.srcPitch, p.srcPitch, p.canvasHeight, at, false, p.nearest != 0)
+                ? resample(src, p.srcPitch, p.srcPitch, p.canvasHeight, at, false, p.filter)
                 : float4(0.0);
     }
     else

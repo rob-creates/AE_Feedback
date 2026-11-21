@@ -511,7 +511,7 @@ id<MTLBuffer> FeedbackRenderer::step(
         p.amountX = amountX;
         p.amountY = amountY;
         p.inverse[0] = p.inverse[3] = 1.0f;
-        p.nearest = f.nearest;
+        p.filter = f.filter;
         if (MovesTrail(f))
             InvertTransform(f, canvas, &p);
         // No map: zero size, so nothing shifts.
@@ -610,7 +610,7 @@ id<MTLBuffer> FeedbackRenderer::step(
     grade.alphaSlope = f.alphaSlope;
     grade.alphaOffset = f.alphaOffset;
     last.composite = MakeCompositeParams(canvas, input, f.compositeMode);
-    last.composite.nearest = f.nearest;
+    last.composite.filter = f.filter;
     last.composite.splitsInput = f.splitsInput;
     last.composite.frameAlpha = f.frameAlpha;
     last.composite.stepAlpha = f.stepAlpha;
@@ -648,11 +648,11 @@ id<MTLBuffer> FeedbackRenderer::compositeInput(
     id<MTLBuffer> image,
     const PlacedImage& input,
     int compositeMode,
-    bool nearest)
+    int filter)
 {
     id<MTLBuffer> result = mCache->acquireScratch(canvas.bytes());
     CompositeParams p = MakeCompositeParams(canvas, input, compositeMode);
-    p.nearest = nearest;
+    p.filter = filter;
     if (!RunOnce(queue, mComposite, {image, input.buffer ? input.buffer : mEmpty, result}, p, canvas.width, canvas.height))
     {
         mCache->releaseScratch(result);
@@ -667,10 +667,10 @@ bool FeedbackRenderer::copyOut(
     id<MTLBuffer> image,
     const PlacedImage& output,
     const float* canvasFromOutput,
-    bool nearest)
+    int filter)
 {
     CopyOutParams p{};
-    p.nearest = nearest;
+    p.filter = filter;
     p.srcPitch = canvas.width;
     p.dstPitch = output.pitch;
     p.offsetX = output.offsetX;

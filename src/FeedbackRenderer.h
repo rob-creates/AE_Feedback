@@ -7,6 +7,7 @@
 #include <memory>
 
 #include "FeedbackCache.h"
+#include "ShaderTypes.h"
 
 // The layers a step reads besides its input: Map Layer for displacement, and each group's mask.
 enum MapSlot
@@ -52,9 +53,9 @@ struct FrameParams
     // canvas's longer side. It mustn't follow a canvas that follows the trail, or the blur would change
     // with it.
     float spreadWidest;
-    // Pixel Sampling at Pixel: the trail's move and the input's placement copy whole pixels rather than
-    // mixing neighbours, so nothing softens however often the trail is moved.
-    int nearest;
+    // Pixel Sampling, as a SampleFilter: how the trail's move and the input's placement read between
+    // pixels. At Pixel they copy whole pixels, so nothing softens however often the trail is moved.
+    int filter;
 };
 
 // x' = a x + b y + tx, y' = c x + d y + ty.
@@ -180,21 +181,21 @@ public:
         id<MTLBuffer> image,
         const PlacedImage& input,
         int compositeMode,
-        bool nearest);
+        int filter);
 
     // Queues a copy of a layer AE gave, `pitch` pixels a row, into a buffer of its own that outlives
     // AE's. Nil if there's no memory for it.
     id<MTLBuffer> copyPixels(StepBatch& batch, id<MTLBuffer> source, int pitch, int height);
 
     // With canvasFromOutput, each output pixel is looked up through it rather than by offset: from the
-    // nearest canvas pixel with `nearest`, and otherwise between them.
+    // canvas with `filter`, a SampleFilter.
     bool copyOut(
         id<MTLCommandQueue> queue,
         const CanvasKey& canvas,
         id<MTLBuffer> image,
         const PlacedImage& output,
         const float* canvasFromOutput = nullptr,
-        bool nearest = false);
+        int filter = FILTER_BILINEAR);
 
 private:
     FeedbackRenderer() = default;

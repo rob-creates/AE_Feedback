@@ -40,7 +40,7 @@ COMPS = ["trail", "behind", "screen_sub", "add_sub", "grade_blur", "self_disp", 
          *[f"blend_{m}{v}" for m in ("multiply", "lighten", "darken", "overlay", "add_subtract", "difference")
            for v in ("", "_sub", "_fade")],
          "transform_position", "transform_scale", "transform_scale_xy", "transform_rotate", "transform_sub",
-         "transform_sub_scale", "transform_sub_skew", "sampling_smooth", "sampling_pixel", "edge_multiply", "square_path", "square_path_plain",
+         "transform_sub_scale", "transform_sub_skew", "sampling_smooth", "sampling_bicubic", "sampling_pixel", "edge_multiply", "square_path", "square_path_plain",
          "map_offset",
          *[f"comp_space_{v}{p}" for v in ("2d", "parented") for p in ("", "_plain")], "layer_3d", "layer_3d_plain",
          "edge_luminance", "edge_colour", "edge_unsmoothed", "edge_trail", "update_stamp", "update_off", "transform_scale_zero",
@@ -445,11 +445,14 @@ def cmd_check(label):
         rows = np.arange(len(column))
         return soft, float((column * rows).sum() / column.sum())
     smooth_soft, smooth_centre = edge_and_centre("sampling_smooth")
+    bicubic_soft, bicubic_centre = edge_and_centre("sampling_bicubic")
     pixel_soft, pixel_centre = edge_and_centre("sampling_pixel")
     report(pixel_soft <= 4, f"Pixel keeps the trail's edges as sharp as the dot's: {pixel_soft} soft pixels across both")
-    report(smooth_soft >= pixel_soft + 6, f"Smooth softens them, as before: {smooth_soft} soft pixels")
-    report(abs(pixel_centre - smooth_centre) <= 1,
-           f"Pixel moves the trail as far as Smooth: centred at row {pixel_centre:.1f} against {smooth_centre:.1f}")
+    report(smooth_soft >= pixel_soft + 6, f"Bilinear softens them, as before: {smooth_soft} soft pixels")
+    report(bicubic_soft <= 0.6 * smooth_soft, f"Bicubic softens them far less: {bicubic_soft} soft pixels")
+    for name, centre in (("Pixel", pixel_centre), ("Bicubic", bicubic_centre)):
+        report(abs(centre - smooth_centre) <= 1,
+               f"{name} moves the trail as far as Bilinear: centred at row {centre:.1f} against {smooth_centre:.1f}")
 
     print("Update on every 4th frame, with Position 20 a frame:")
     for frame, newest in ((12, 0), (13, 1)):

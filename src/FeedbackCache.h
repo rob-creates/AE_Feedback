@@ -57,7 +57,7 @@ struct CanvasKey
 
 // Pixel Sampling at Pixel moves the trail by whole pixels and owes what's left over: how far, in canvas
 // pixels, the image still has to move to be where the trail should be. Kept with each image, so a trail
-// resumed from it moves on exactly as one that never stopped. Always zero at Smooth.
+// resumed from it moves on exactly as one that never stopped. Always zero at Bilinear.
 struct TrailCarry
 {
     float x = 0.0f, y = 0.0f;

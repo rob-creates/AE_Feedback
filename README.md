@@ -23,10 +23,11 @@ Feedback Effect for Adobe After Effects
   were empty, while the trail goes on moving, fading and changing as usual. Keyframe it on and off to
   stamp the layer into a smoothly moving trail, in time with music for instance.
 - Transform's Scale goes down to 0, which shrinks the whole trail away in a single frame.
-- Pixel Sampling, under Sampling, sets how the trail is moved between pixels. Smooth, the default, blends
-  neighbouring pixels: a trail moved by fractions of a pixel (by Transform, displacement or
+- Pixel Sampling, under Sampling, sets how the trail is moved between pixels. Bilinear, the default,
+  blends the four nearest pixels: a trail moved by fractions of a pixel (by Transform, displacement or
   Sub-steps, which divide each frame's move) softens a little with every move, like motion blur.
-  Pixel moves the trail by whole pixels and carries the fraction left over on to the next move, so it
+  Bicubic (Catmull-Rom, held to the range of the nearest pixels so it can't add fringes) keeps such a
+  trail about three times crisper, and suits detail moved by Scale or Rotation. Pixel moves the trail by whole pixels and carries the fraction left over on to the next move, so it
   stays exactly as sharp as it went in while moving just as far: for pixel art and hard-edged
   graphics. At Pixel, Scale, Rotation and displacement apply once a frame, as with no sub-steps, and
   near Centre a gentle Scale can leave pixels in place, as copying whole pixels does. At reduced

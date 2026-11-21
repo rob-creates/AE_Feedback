@@ -155,14 +155,10 @@ enum
     PRECISION_32_BIT_FLOAT,
 };
 
-// Pixel Sampling: how the trail is moved, and the input placed, between pixels. Smooth mixes the neighbours,
-// which softens a little with every move that isn't by whole pixels. Pixel moves by whole pixels and
-// carries the fraction left over on to the next move, so the trail stays exactly as sharp as it went in.
-enum
-{
-    SAMPLING_SMOOTH = 1,
-    SAMPLING_PIXEL,
-};
+// Pixel Sampling's choices are the SampleFilter values: how the trail is moved, and the input placed,
+// between pixels. Bilinear mixes the four nearest, which softens a little with every move that isn't by
+// whole pixels. Bicubic softens far less, without fringes. Pixel moves by whole pixels and carries the
+// fraction left over on to the next move, so the trail stays exactly as sharp as it went in.
 
 double InvisibleContribution(int precision)
 {
@@ -343,7 +339,7 @@ struct PreRenderData
     // canvas was before it followed the trail. In the layer, from the canvas, as before.
     float spreadWidest = 0.0f;
 
-    bool pixelSampling = false; // Pixel Sampling at Pixel
+    int filter = FILTER_BILINEAR; // Pixel Sampling
 
     // AE only hands out the output after an input has been checked out, so this always is, even
     // when the layer is empty or the frame needs no computing.
@@ -917,7 +913,7 @@ FrameParams PixelSteps(const FrameParams& whole, float share, bool frameEnd, flo
 
     f.amountX = frameEnd ? whole.amountX : 0.0f;
     f.amountY = frameEnd ? whole.amountY : 0.0f;
-    f.nearest = 1;
+    f.filter = FILTER_NEAREST;
     return f;
 }
 
@@ -1088,11 +1084,11 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
     AEFX_CLR_STRUCT(def);
     def.flags = PF_ParamFlag_CANNOT_TIME_VARY;
     PF_ADD_POPUP("Cut-off Precision", 3, PRECISION_8_BIT, "8 bit|16 bit|32 bit float", DiskId(PARAM_PRECISION));
-    // Smooth softens a trail moved by fractions of a pixel, a little more with every step; Pixel keeps
-    // it exactly as sharp, for pixel art and hard-edged graphics.
+    // Bilinear softens a trail moved by fractions of a pixel, a little more with every step; Bicubic
+    // keeps it far crisper; Pixel keeps it exactly as sharp, for pixel art and hard-edged graphics.
     AEFX_CLR_STRUCT(def);
     def.flags = PF_ParamFlag_CANNOT_TIME_VARY;
-    PF_ADD_POPUP("Pixel Sampling", 2, SAMPLING_SMOOTH, "Smooth|Pixel", DiskId(PARAM_SAMPLING));
+    PF_ADD_POPUP("Pixel Sampling", 3, FILTER_BILINEAR, "Bilinear|Bicubic|Pixel", DiskId(PARAM_SAMPLING));
     // Off, jumping to a frame recalculates the whole trail before it, however long that takes. On, only
     // the last Pre-Roll Limit frames are, which is quicker but can show a shorter trail.
     AEFX_CLR_STRUCT(def);
@@ -2194,7 +2190,7 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             ParamReader r{in_data, FrameSample(in_data, now)};
             data->samplesPerStep = r.integer(PARAM_SUBSTEPS) + 1;
             invisible = InvisibleContribution(r.popup(PARAM_PRECISION));
-            data->pixelSampling = r.popup(PARAM_SAMPLING) == SAMPLING_PIXEL;
+            data->filter = std::clamp(r.popup(PARAM_SAMPLING), int(FILTER_BILINEAR), int(FILTER_NEAREST));
             if (r.checkbox(PARAM_LIMIT_PREROLL))
                 preRollLimit = r.integer(PARAM_PREROLL_LIMIT);
             ERR(r.err);
@@ -2633,12 +2629,12 @@ PF_Err ComputeSample(
         ERR(PF_ABORT(in_data));
 
     FrameParams params{};
-    if (!err && render.data.pixelSampling)
+    if (!err && render.data.filter == FILTER_NEAREST)
         params = PixelSteps(ReadFrameParams(in_data, sub.time, &err), share, frameEnd,
                             ScaleValue(render.data.canvas.downsampleX), ScaleValue(render.data.canvas.downsampleY), carry);
     else if (!err)
         params = DivideIntoSteps(ReadFrameParams(in_data, sub.time, &err), share, frameEnd);
-    params.nearest = render.data.pixelSampling;
+    params.filter = render.data.filter;
     params.spreadWidest = render.data.spreadWidest;
     std::copy(render.data.sources.begin(), render.data.sources.end(), params.sources);
 
@@ -2878,7 +2874,7 @@ PF_Err ShowImage(GpuRender& render, id<MTLBuffer> image, PF_EffectWorld* output)
                 err = PF_Err_INTERNAL_STRUCT_DAMAGED;
             if (!err)
             {
-                shown = renderer.compositeInput(render.queue, canvas, image, input, mode, render.data.pixelSampling);
+                shown = renderer.compositeInput(render.queue, canvas, image, input, mode, render.data.filter);
                 shownIsScratch = shown != nil;
                 if (!shown)
                     err = PF_Err_INTERNAL_STRUCT_DAMAGED;
@@ -2895,7 +2891,7 @@ PF_Err ShowImage(GpuRender& render, id<MTLBuffer> image, PF_EffectWorld* output)
                 render.data.outputRect.top, canvas.left, canvas.top)
             .toFloats(canvasFromOutput);
     if (!err && !renderer.copyOut(render.queue, canvas, shown, placedOutput,
-                                  render.data.canvas.compSpace ? canvasFromOutput : nullptr, render.data.pixelSampling))
+                                  render.data.canvas.compSpace ? canvasFromOutput : nullptr, render.data.filter))
         err = PF_Err_INTERNAL_STRUCT_DAMAGED;
     if (shownIsScratch)
         renderer.cache().releaseScratch(shown);

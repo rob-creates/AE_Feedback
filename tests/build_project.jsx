@@ -126,10 +126,11 @@
         // Moving, turning and drifting with sub-steps, for rebuilds.
         dotComp("transform_sub", 72, { "Alpha Max": 0.9, "Rotation": 10, "Scale Height": 98, "Position": [0, 2], "Sub-steps": 3 });
         // Moved down a fraction of a pixel each sub-step, with nothing fading, so only edges are in between.
-        // Smooth softens the trail with every move, and Pixel keeps it as sharp as the dot while moving it
-        // just as far.
+        // Bilinear softens the trail with every move, Bicubic far less, and Pixel keeps it as sharp as the
+        // dot, while each moves it just as far.
         dotComp("sampling_smooth", 72, { "Alpha Max": 1, "Position": [0, 2.5], "Sub-steps": 5 });
-        dotComp("sampling_pixel", 72, { "Alpha Max": 1, "Position": [0, 2.5], "Sub-steps": 5, "Pixel Sampling": 2 });
+        dotComp("sampling_bicubic", 72, { "Alpha Max": 1, "Position": [0, 2.5], "Sub-steps": 5, "Pixel Sampling": 2 });
+        dotComp("sampling_pixel", 72, { "Alpha Max": 1, "Position": [0, 2.5], "Sub-steps": 5, "Pixel Sampling": 3 });
 
         // Update on only every 4th frame: the trail moves every frame, but takes in the dot only then.
         var stamp = stillDot("update_stamp", 16, [100, 180], 5, { "Alpha Max": 0.9, "Position": [20, 0] });
